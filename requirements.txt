@@ -1,0 +1,66 @@
+# LangChain Core
+langchain
+langchain-core
+
+
+
+# Google Gemini (PaLM) Integration
+langchain-google-genai
+google-generativeai
+
+
+
+# Environment Variable Management
+python-dotenv
+
+# Machine Learning Utilities
+numpy
+scikit-learn
+
+#database
+sqlite-utils 
+
+
+# Web Interface
+streamlit
+
+# Structured Output
+pydantic
+typing-extensions
+
+# Visualize LangChain Chains
+grandalf
+
+# Document Loaders
+langchain-community
+
+# PDF and HTML Parsing
+pypdf
+beautifulsoup4
+requests
+
+# Experimental LangChain Features
+langchain-experimental
+
+# Vector Store Backends
+
+faiss-cpu
+ipykernel
+
+
+
+# Web Search
+duckduckgo-search
+
+#  Training
+datasets
+# Additional LangChain Integrations
+langchain-groq 
+langchain_tavily
+
+langgraph
+
+langsmith
+langgraph-cli[inmem]
+
+
