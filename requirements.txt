@@ -63,4 +63,7 @@ langgraph
 langsmith
 langgraph-cli[inmem]
 
+#test
+pytest
+
 
