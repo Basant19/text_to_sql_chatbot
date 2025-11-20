@@ -1,143 +1,121 @@
 import os
+import sys
+import csv
 import json
-import tempfile
-import shutil
-import threading
-from typing import Dict, List, Optional, Any
+from typing import List, Dict, Any, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
 from app import config
 
 logger = get_logger("schema_store")
-_lock = threading.Lock()
 
 
-def _default_store_path() -> str:
-    """
-    Default path for schema store JSON.
-    Uses the same directory as DATABASE_PATH (config), fallback to ./data/schemas.json
-    """
-    try:
-        db_path = getattr(config, "DATABASE_PATH", None)
-        if db_path:
-            base_dir = os.path.dirname(db_path) or "."
-        else:
-            base_dir = os.path.join(os.getcwd(), "data")
-        os.makedirs(base_dir, exist_ok=True)
-        return os.path.join(base_dir, "schemas.json")
-    except Exception as e:
-        logger.exception("Failed to determine default schema store path")
-        raise CustomException(e, __import__("sys"))
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
 class SchemaStore:
     """
-    Simple JSON-backed schema store.
-    Each schema is stored under its table_name key.
+    Manages CSV metadata: schemas, sample rows, and column info.
+    Stores metadata in JSON files under config.DATA_DIR/schema_store.json
     """
 
-    def __init__(self, store_path: Optional[str] = None):
+    def __init__(self, store_path: Optional[str] = None, sample_limit: int = 5):
         try:
-            self.store_path = store_path or getattr(config, "SCHEMA_STORE_PATH", None) or _default_store_path()
-            # ensure dir exists
-            os.makedirs(os.path.dirname(self.store_path), exist_ok=True)
-            # initialize file if missing
-            if not os.path.exists(self.store_path):
-                with open(self.store_path, "w", encoding="utf-8") as f:
-                    json.dump({}, f)
+            self.store_path = store_path or os.path.join(getattr(config, "DATA_DIR", "./data"), "schema_store.json")
+            _ensure_dir(os.path.dirname(self.store_path))
+            self.sample_limit = sample_limit
+            self._store: Dict[str, Dict[str, Any]] = {}
+            self._load_store()
             logger.info(f"SchemaStore initialized at {self.store_path}")
         except Exception as e:
             logger.exception("Failed to initialize SchemaStore")
-            raise CustomException(e, __import__("sys"))
+            raise CustomException(e, sys)
 
-    def _read_all(self) -> Dict[str, Any]:
-        with _lock:
-            try:
+    # ---------------------------
+    # Persistence
+    # ---------------------------
+    def _load_store(self) -> None:
+        try:
+            if os.path.exists(self.store_path):
                 with open(self.store_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return data if isinstance(data, dict) else {}
-            except json.JSONDecodeError:
-                # corrupted file — treat as empty and overwrite on next write
-                logger.warning("Schema store JSON corrupted; treating as empty")
-                return {}
-            except Exception as e:
-                logger.exception("Failed to read schema store")
-                raise CustomException(e, __import__("sys"))
+                    self._store = json.load(f)
+            else:
+                self._store = {}
+        except Exception as e:
+            logger.exception("Failed to load schema store")
+            raise CustomException(e, sys)
 
-    def _write_all(self, data: Dict[str, Any]) -> None:
-        with _lock:
-            try:
-                # atomic write: write to temp file then replace
-                dirpath = os.path.dirname(self.store_path)
-                fd, tmp_path = tempfile.mkstemp(dir=dirpath)
-                with os.fdopen(fd, "w", encoding="utf-8") as tmpf:
-                    json.dump(data, tmpf, indent=2, ensure_ascii=False)
-                    tmpf.flush()
-                    os.fsync(tmpf.fileno())
-                shutil.move(tmp_path, self.store_path)
-            except Exception as e:
-                logger.exception("Failed to write schema store atomically")
-                raise CustomException(e, __import__("sys"))
+    def _save_store(self) -> None:
+        try:
+            with open(self.store_path, "w", encoding="utf-8") as f:
+                json.dump(self._store, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.exception("Failed to save schema store")
+            raise CustomException(e, sys)
 
-    def add_schema(self, metadata: Dict[str, Any]) -> None:
+    # ---------------------------
+    # Public API
+    # ---------------------------
+    def add_csv(self, csv_path: str, csv_name: Optional[str] = None) -> None:
         """
-        Add or update a schema metadata dict.
-        metadata must include 'table_name' key.
+        Read CSV file, store columns and sample rows
         """
         try:
-            if "table_name" not in metadata:
-                raise ValueError("metadata must include 'table_name'")
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-            data = self._read_all()
-            data[metadata["table_name"]] = metadata
-            self._write_all(data)
-            logger.info(f"Added/updated schema: {metadata['table_name']}")
+            csv_name = csv_name or os.path.basename(csv_path)
+            columns: List[str] = []
+            samples: List[Dict[str, Any]] = []
+
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                columns = reader.fieldnames or []
+                for i, row in enumerate(reader):
+                    if i >= self.sample_limit:
+                        break
+                    samples.append(row)
+
+            self._store[csv_name] = {
+                "path": csv_path,
+                "columns": columns,
+                "sample_rows": samples,
+            }
+            self._save_store()
+            logger.info(f"CSV schema stored for {csv_name}")
         except Exception as e:
-            logger.exception("Failed to add schema")
-            raise CustomException(e, __import__("sys"))
+            logger.exception(f"Failed to add CSV: {csv_path}")
+            raise CustomException(e, sys)
 
-    def get_schema(self, table_name: str) -> Optional[Dict[str, Any]]:
-        """Return metadata dict for the given table_name, or None if missing."""
-        try:
-            data = self._read_all()
-            return data.get(table_name)
-        except Exception as e:
-            logger.exception("Failed to get schema")
-            raise CustomException(e, __import__("sys"))
-
-    def list_schemas(self) -> List[Dict[str, Any]]:
-        """Return a list of all schema metadata dicts."""
-        try:
-            data = self._read_all()
-            return list(data.values())
-        except Exception as e:
-            logger.exception("Failed to list schemas")
-            raise CustomException(e, __import__("sys"))
-
-    def remove_schema(self, table_name: str) -> bool:
+    def get_schema(self, csv_name: str) -> Optional[List[str]]:
         """
-        Remove schema for table_name.
-        Returns True if removed, False if it did not exist.
+        Return list of column names
         """
-        try:
-            data = self._read_all()
-            if table_name in data:
-                del data[table_name]
-                self._write_all(data)
-                logger.info(f"Removed schema: {table_name}")
-                return True
-            logger.info(f"Schema not found for removal: {table_name}")
-            return False
-        except Exception as e:
-            logger.exception("Failed to remove schema")
-            raise CustomException(e, __import__("sys"))
+        return self._store.get(csv_name, {}).get("columns")
+
+    def get_sample_rows(self, csv_name: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Return sample rows
+        """
+        return self._store.get(csv_name, {}).get("sample_rows")
+
+    def list_csvs(self) -> List[str]:
+        """
+        List all CSVs in the store
+        """
+        return list(self._store.keys())
 
     def clear(self) -> None:
-        """Remove all schemas."""
+        """
+        Clear store in memory and on disk
+        """
         try:
-            self._write_all({})
-            logger.info("Cleared all schemas from store")
+            self._store = {}
+            if os.path.exists(self.store_path):
+                os.remove(self.store_path)
+            logger.info("Schema store cleared")
         except Exception as e:
             logger.exception("Failed to clear schema store")
-            raise CustomException(e, __import__("sys"))
+            raise CustomException(e, sys)
