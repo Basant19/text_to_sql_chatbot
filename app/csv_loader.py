@@ -1,8 +1,6 @@
 import os
 import io
 import csv
-import time
-import sys
 import uuid
 from typing import Dict, List, Any, Union, TextIO
 
@@ -22,73 +20,45 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _unique_path(dest_dir: str, filename: str) -> str:
-    """
-    Return a unique path under dest_dir for filename.
-    If filename exists, append a UUID to guarantee uniqueness.
-    """
     base, ext = os.path.splitext(filename)
     candidate = os.path.join(dest_dir, filename)
     if not os.path.exists(candidate):
         return candidate
-
-    # Use UUID to ensure uniqueness even when called multiple times quickly
     unique_name = f"{base}_{uuid.uuid4().hex}{ext}"
     return os.path.join(dest_dir, unique_name)
 
 
 def save_uploaded_csv(fileobj: Union[bytes, TextIO, io.StringIO, io.BytesIO], filename: str) -> str:
-    """
-    Save an uploaded CSV-like object to config.UPLOAD_DIR.
-    Accepts bytes or file-like objects. Returns the saved file path.
-    """
     try:
-        upload_dir = getattr(config, "UPLOAD_DIR", None)
-        if not upload_dir:
-            # fallback to cwd/uploads
-            upload_dir = os.path.join(os.getcwd(), "uploads")
-
+        upload_dir = getattr(config, "UPLOAD_DIR", os.path.join(os.getcwd(), "uploads"))
         os.makedirs(upload_dir, exist_ok=True)
+
         safe_name = _sanitize_filename(filename)
         dest_path = _unique_path(upload_dir, safe_name)
 
-        # If bytes provided
         if isinstance(fileobj, (bytes, bytearray)):
             with open(dest_path, "wb") as f:
                 f.write(fileobj)
+        elif isinstance(fileobj, io.BytesIO):
+            with open(dest_path, "wb") as f:
+                f.write(fileobj.getvalue())
+        elif hasattr(fileobj, "read"):
+            with open(dest_path, "w", newline="", encoding="utf-8") as f:
+                content = fileobj.read()
+                if isinstance(content, bytes):
+                    content = content.decode("utf-8", errors="replace")
+                f.write(content)
         else:
-            # For BytesIO
-            if isinstance(fileobj, io.BytesIO):
-                with open(dest_path, "wb") as f:
-                    f.write(fileobj.getvalue())
-            else:
-                # Text stream or StringIO
-                if hasattr(fileobj, "read"):
-                    with open(dest_path, "w", newline="", encoding="utf-8") as f:
-                        content = fileobj.read()
-                        if isinstance(content, bytes):
-                            content = content.decode("utf-8", errors="replace")
-                        f.write(content)
-                else:
-                    raise ValueError("Unsupported file object provided to save_uploaded_csv")
+            raise ValueError("Unsupported file object provided to save_uploaded_csv")
 
         logger.info(f"Saved uploaded CSV to {dest_path}")
         return dest_path
     except Exception as e:
         logger.exception("Failed to save uploaded CSV")
-        raise CustomException(e, sys)
+        raise CustomException(e)
 
 
 def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
-    """
-    Read a CSV file and return basic metadata:
-    {
-      "table_name": <safe base filename>,
-      "path": <path>,
-      "columns": [col1, col2, ...],
-      "sample_rows": [ [row values], ... ],
-      "row_count": int
-    }
-    """
     try:
         if not os.path.exists(path):
             raise FileNotFoundError(f"CSV file not found: {path}")
@@ -98,17 +68,12 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
             try:
                 header = next(reader)
             except StopIteration:
-                # empty file
-                header = []
-                samples = []
-                row_count = 0
-                table_name = _sanitize_filename(os.path.basename(path))
                 return {
-                    "table_name": table_name,
+                    "table_name": _sanitize_filename(os.path.basename(path)),
                     "path": path,
-                    "columns": header,
-                    "sample_rows": samples,
-                    "row_count": row_count,
+                    "columns": [],
+                    "sample_rows": [],
+                    "row_count": 0,
                 }
 
             samples: List[List[str]] = []
@@ -130,4 +95,26 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
         return metadata
     except Exception as e:
         logger.exception("Failed to load CSV metadata")
-        raise CustomException(e, sys)
+        raise CustomException(e)
+
+
+class CSVLoader:
+    """Wrapper class to manage uploaded CSVs."""
+
+    def __init__(self):
+        self.uploaded_files: List[str] = []
+
+    def save_csv(self, file):
+        path = save_uploaded_csv(file, file.name)
+        self.uploaded_files.append(path)
+        return path
+
+    def list_uploaded_csvs(self) -> List[str]:
+        return self.uploaded_files
+
+    def load_and_extract(self, file_paths: List[str]) -> List[Dict[str, Any]]:
+        schemas = []
+        for path in file_paths:
+            metadata = load_csv_metadata(path)
+            schemas.append(metadata)
+        return schemas
