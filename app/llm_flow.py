@@ -1,3 +1,5 @@
+# app/llm_flow.py
+
 import sys
 import time
 from typing import List, Dict, Any, Optional
@@ -6,9 +8,8 @@ from app.logger import get_logger
 from app.exception import CustomException
 from app import schema_store, vector_search, sql_executor
 from app.langsmith_client import LangSmithClient
-
-# LangGraph imports
-from app.graph.agent import LangGraphAgent
+from app.utils import build_prompt
+from app.graph.agent import LangGraphAgent  # updated
 
 logger = get_logger("llm_flow")
 
@@ -22,17 +23,6 @@ def generate_sql_from_query(
     use_langgraph: bool = True,
     few_shot: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
-    """
-    Main SQL generation flow.
-
-    Steps:
-      1. Gather schemas from SchemaStore
-      2. Retrieve relevant docs via VectorSearch
-      3. Generate SQL via LangGraph agent (if enabled) or direct LLM call
-      4. Validate SQL and optionally execute
-    Returns dict with:
-      prompt, sql, valid, execution result, error, raw LLM response
-    """
     start = time.time()
     try:
         client = client or LangSmithClient()
@@ -41,11 +31,11 @@ def generate_sql_from_query(
         ss = schema_store.SchemaStore()
         schemas_map: Dict[str, Dict[str, Any]] = {}
         for name in csv_names:
-            cols = ss.get_schema(name)
-            samples = ss.get_sample_rows(name)
-            schemas_map[name] = {"columns": cols or [], "sample_rows": samples or []}
+            cols = ss.get_schema(name) or []
+            samples = ss.get_sample_rows(name) or []
+            schemas_map[name] = {"columns": cols, "sample_rows": samples}
             if not cols:
-                logger.warning(f"Schema not found for {name}")
+                logger.warning(f"Schema not found for CSV/table '{name}'")
 
         # --- Retrieve relevant documents ---
         retrieved_docs: List[Dict[str, Any]] = []
@@ -62,15 +52,14 @@ def generate_sql_from_query(
                 ]
                 retrieved_docs = filtered if filtered else docs
         except Exception:
-            logger.exception("Vector search retrieval failed; proceeding without docs")
+            logger.exception("Vector search retrieval failed; proceeding without retrieved docs")
 
         # --- Generate SQL ---
-        raw_response: Any
-        sql: str
-        prompt_text: str
+        sql: str = ""
+        prompt_text: str = ""
+        raw_response: Any = None
 
         if use_langgraph:
-            # Use LangGraph agent
             agent = LangGraphAgent(
                 schema_map=schemas_map,
                 retrieved_docs=retrieved_docs,
@@ -79,20 +68,15 @@ def generate_sql_from_query(
             )
             sql, prompt_text, raw_response = agent.run(user_query)
         else:
-            # Direct LLM call
-            from app.utils import build_prompt
             prompt_text = build_prompt(user_query, schemas_map, retrieved_docs, few_shot=few_shot)
             resp = client.generate(prompt_text, model="gemini-1.5-flash", max_tokens=512)
             raw_response = resp
             sql = resp.get("text", "").strip() if isinstance(resp, dict) else str(resp)
 
         # --- Validate SQL ---
-        valid = True
-        if not sql:
-            valid = False
-
-        execution_result = None
-        error_msg = None
+        valid = bool(sql)
+        execution_result: Optional[Any] = None
+        error_msg: Optional[str] = None
 
         if run_query and valid:
             try:
@@ -100,9 +84,10 @@ def generate_sql_from_query(
             except CustomException as ce:
                 valid = False
                 error_msg = str(ce)
+                logger.warning(f"SQL execution failed: {error_msg}")
 
         runtime = time.time() - start
-        logger.info(f"llm_flow: generated SQL in {runtime:.3f}s (valid={valid})")
+        logger.info(f"llm_flow: SQL generated in {runtime:.3f}s (valid={valid})")
 
         return {
             "prompt": prompt_text,
@@ -116,5 +101,5 @@ def generate_sql_from_query(
     except CustomException:
         raise
     except Exception as e:
-        logger.exception("LLM flow failed")
+        logger.exception("LLM flow failed unexpectedly")
         raise CustomException(e, sys)
