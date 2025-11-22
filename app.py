@@ -4,7 +4,8 @@ import os
 from app.csv_loader import CSVLoader
 from app.schema_store import SchemaStore
 from app.vector_search import VectorSearch
-from app.database import DuckDBManager
+from app.database import get_connection, execute_query, load_csv_table, table_exists, list_tables
+
 from app.graph.agent import AgentGraph
 from app.logger import get_logger
 from app.config import Config
