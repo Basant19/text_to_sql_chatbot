@@ -1,12 +1,13 @@
-# app.py
+# app.py (relevant parts)
 import streamlit as st
 import os
+from typing import List, Dict, Any
+
 from app.csv_loader import CSVLoader
 from app.schema_store import SchemaStore
 from app.vector_search import VectorSearch
-from app.database import get_connection, execute_query, load_csv_table, table_exists, list_tables
-
-from app.graph.agent import AgentGraph
+from app.graph.builder import GraphBuilder
+from app.history_sql import HistoryStore
 from app.logger import get_logger
 from app.config import Config
 
@@ -17,20 +18,28 @@ config = Config()
 csv_loader = CSVLoader()
 schema_store = SchemaStore()
 vector_search = VectorSearch()
-db_manager = DuckDBManager()
-agent = AgentGraph()  # wraps GraphBuilder internally
 
-# Initialize Streamlit session state for chat history
+# Build the default agent graph
+try:
+    graph = GraphBuilder.build_default()
+except Exception as e:
+    logger.exception("Failed to build default GraphBuilder. Ensure graph nodes are implemented.")
+    graph = None
+
+# Initialize persistent history store (choose backend via config if you want)
+# By default this uses JSON file under data/history.json; pass backend="sqlite" to use sqlite.
+history_store = HistoryStore(backend=getattr(config, "HISTORY_BACKEND", "json"))
+
+# Initialize Streamlit session state for chat history (in-memory view)
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    st.session_state.chat_history = []  # each item: { "id", "name", "query", "result" }
 
-# Streamlit app
 st.set_page_config(page_title="Text-to-SQL Bot", layout="wide")
 st.title("📊 Text-to-SQL Bot")
 
-# ================================
-# Sidebar - CSV Upload & Selection
-# ================================
+# ---------------------------
+# Sidebar - CSV Management
+# ---------------------------
 st.sidebar.header("CSV Management")
 
 uploaded_files = st.sidebar.file_uploader(
@@ -39,11 +48,21 @@ uploaded_files = st.sidebar.file_uploader(
 
 if uploaded_files:
     for file in uploaded_files:
-        csv_loader.save_csv(file)
-        st.sidebar.success(f"Uploaded {file.name}")
+        try:
+            saved_path = csv_loader.save_csv(file)
+            st.sidebar.success(f"Uploaded {file.name}")
+            logger.info(f"Saved upload {file.name} -> {saved_path}")
+        except Exception as e:
+            st.sidebar.error(f"Failed to save {file.name}: {e}")
+            logger.exception("CSV upload failed")
 
 # List uploaded CSVs
-all_csvs = csv_loader.list_uploaded_csvs()
+try:
+    all_csvs: List[str] = csv_loader.list_uploaded_csvs()
+except Exception:
+    logger.exception("Failed to list uploaded CSVs")
+    all_csvs = []
+
 selected_csvs = st.sidebar.multiselect(
     "Select CSVs for context", options=all_csvs, default=all_csvs
 )
@@ -51,76 +70,169 @@ selected_csvs = st.sidebar.multiselect(
 load_button = st.sidebar.button("Load Selected CSVs")
 
 if load_button and selected_csvs:
-    # 1) Extract schemas
-    schemas = csv_loader.load_and_extract(selected_csvs)
-    schema_store.save_schemas(schemas)
-    # 2) Update FAISS embeddings for RAG retrieval
-    vector_search.index_schemas(schemas)
-    st.sidebar.success("Schemas loaded and vector index updated!")
+    try:
+        schemas = csv_loader.load_and_extract(selected_csvs)
+        for meta in schemas:
+            path = meta.get("path")
+            name = meta.get("table_name") or os.path.basename(path)
+            schema_store.add_csv(path, csv_name=name)
+        if hasattr(vector_search, "index_schemas"):
+            try:
+                vector_search.index_schemas(schemas)
+            except Exception:
+                logger.exception("vector_search.index_schemas failed; continuing")
+        st.sidebar.success("Schemas loaded and vector index updated!")
+    except Exception as e:
+        st.sidebar.error(f"Failed to load selected CSVs: {e}")
+        logger.exception("Load selected CSVs failed")
 
-# ======================
-# Main Area - Query Input
-# ======================
+# ---------------------------
+# Main area - Query input
+# ---------------------------
 st.header("Ask a Question in Natural Language")
-user_query = st.text_area("Enter your question here:")
+user_query = st.text_area("Enter your question here:", height=120)
 
-# Optional rename for this query
-query_name = st.text_input("Optional: Give this query a name", value=f"Query {len(st.session_state.chat_history)+1}")
+default_name = f"Query {len(st.session_state.chat_history) + 1}"
+query_name = st.text_input("Optional: Give this query a name", value=default_name)
 
 run_query = st.checkbox("Execute SQL if valid?", value=True)
 execute_button = st.button("Run Query")
 
-# ======================
-# Query Execution
-# ======================
-if execute_button and user_query and selected_csvs:
-    with st.spinner("Generating SQL..."):
+# ---------------------------
+# Execute / generate SQL
+# ---------------------------
+if execute_button and user_query:
+    if not selected_csvs:
+        st.error("Please select at least one CSV in the sidebar to provide context.")
+    elif graph is None:
+        st.error("Agent pipeline is not available. Check server logs for details.")
+    else:
+        with st.spinner("Generating SQL..."):
+            try:
+                result = graph.run(user_query, selected_csvs, run_query=run_query)
+            except Exception as e:
+                st.error(f"Error running agent: {e}")
+                logger.exception("Agent run failed")
+                result = {"error": str(e)}
+
+        # persist to history store and also keep in session state
         try:
-            # Run agent graph
-            result = agent.run(user_query, selected_csvs, run_query=run_query)
-        except Exception as e:
-            st.error(f"Error running agent: {e}")
-            logger.exception("Agent run failed")
-            result = {"error": str(e)}
+            entry = history_store.add_entry(name=query_name, query=user_query, result=result)
+            # store id so we can update/delete later
+            st.session_state.chat_history.append({
+                "id": entry["id"],
+                "name": entry["name"],
+                "query": entry["query"],
+                "result": entry["result"],
+                "created_at": entry.get("created_at"),
+                "updated_at": entry.get("updated_at"),
+            })
+        except Exception:
+            # if persistence fails, still keep in session memory (without id)
+            logger.exception("Failed to persist history entry; falling back to session-only storage")
+            st.session_state.chat_history.append({
+                "id": None,
+                "name": query_name,
+                "query": user_query,
+                "result": result,
+            })
 
-    # Save query and results in chat history
-    st.session_state.chat_history.append({
-        "name": query_name,
-        "query": user_query,
-        "result": result
-    })
-
-# ======================
-# Display Chat History
-# ======================
+# ---------------------------
+# Chat history management UI
+# ---------------------------
 if st.session_state.chat_history:
     st.subheader("💬 Query History")
-    for i, chat in enumerate(reversed(st.session_state.chat_history)):
-        with st.expander(f"{chat['name']}"):
-            st.markdown(f"**User Query:** {chat['query']}")
-            res = chat["result"]
-            if res:
-                st.markdown("**Generated SQL:**")
-                st.code(res.get("sql") or "No SQL generated.", language="sql")
-                st.write(f"Valid SQL: {res.get('valid')}")
-                if res.get("execution"):
-                    st.markdown("**Execution Results:**")
-                    st.dataframe(res["execution"].get("rows", []))
-                    st.write("Metadata:", res["execution"].get("meta", {}))
-                if res.get("formatted"):
-                    st.markdown("**Formatted Output / Explanation:**")
-                    st.json(res["formatted"])
-                if res.get("raw"):
-                    with st.expander("Raw LLM Output"):
-                        st.json(res["raw"])
-                if res.get("error"):
-                    st.error(f"Error: {res['error']}")
-                if res.get("timings"):
-                    with st.expander("Execution Timings"):
-                        st.json(res["timings"])
 
-# ======================
-# Footer / Notes
-# ======================
+    # controls
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    with col_a:
+        if st.button("Clear History (memory only)"):
+            st.session_state.chat_history = []
+            st.experimental_rerun()
+    with col_b:
+        if st.button("Export History JSON (persisted)"):
+            try:
+                path = history_store.export_json()
+                st.success(f"Exported history to {path}")
+            except Exception:
+                st.exception("Failed to export history")
+
+    with col_c:
+        st.info(f"{len(st.session_state.chat_history)} queries stored in this session")
+
+    # show newest first (reversed)
+    for display_idx, chat in enumerate(reversed(st.session_state.chat_history)):
+        real_index = len(st.session_state.chat_history) - 1 - display_idx
+        disp_name = chat.get("name", f"Query {display_idx+1}")
+        expander_key = f"expander_{real_index}"
+
+        with st.expander(f"{disp_name}", expanded=False, key=expander_key):
+            # rename input (stable key uses real_index)
+            rename_key = f"rename_{real_index}"
+            new_name = st.text_input("Rename query", value=disp_name, key=rename_key)
+            if new_name and new_name != disp_name:
+                # update session-state immediately
+                st.session_state.chat_history[real_index]["name"] = new_name
+
+                # if persisted id present, update persistent store as well
+                entry_id = st.session_state.chat_history[real_index].get("id")
+                if entry_id:
+                    try:
+                        updated = history_store.update_entry(entry_id, name=new_name)
+                        # optionally sync updated metadata
+                        if updated:
+                            st.session_state.chat_history[real_index].update({
+                                "updated_at": updated.get("updated_at")
+                            })
+                    except Exception:
+                        logger.exception("Failed to update persisted history entry (rename)")
+
+            st.markdown(f"**User Query:** {chat.get('query')}")
+            res = chat.get("result") or {}
+            if not res:
+                st.info("No result stored for this query.")
+                continue
+
+            st.markdown("**Generated SQL:**")
+            st.code(res.get("sql") or "No SQL generated.", language="sql")
+            st.write(f"Valid SQL: {res.get('valid')}")
+
+            if res.get("execution"):
+                st.markdown("**Execution Results:**")
+                exec_res = res["execution"]
+                rows = exec_res.get("rows") if isinstance(exec_res, dict) else exec_res
+                try:
+                    st.dataframe(rows)
+                except Exception:
+                    st.write(rows)
+                st.write("Metadata:", exec_res.get("meta", {}))
+
+            if res.get("formatted"):
+                st.markdown("**Formatted Output / Explanation:**")
+                st.json(res["formatted"])
+
+            if res.get("raw"):
+                with st.expander("Raw LLM / Agent Output"):
+                    st.json(res["raw"])
+
+            if res.get("error"):
+                st.error(f"Error: {res['error']}")
+
+            if res.get("timings"):
+                with st.expander("Execution Timings"):
+                    st.json(res["timings"])
+
+            # delete entry (persisted + session)
+            if st.button("Delete entry (persisted + session)", key=f"del_{real_index}"):
+                entry_id = st.session_state.chat_history[real_index].get("id")
+                if entry_id:
+                    try:
+                        history_store.delete_entry(entry_id)
+                    except Exception:
+                        logger.exception("Failed to delete persisted history entry")
+                st.session_state.chat_history.pop(real_index)
+                st.experimental_rerun()
+
+# Footer
 st.sidebar.markdown("---")
 st.sidebar.markdown("Developed by Text-to-SQL Bot Team")
