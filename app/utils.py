@@ -32,7 +32,6 @@ def extract_sql_from_text(text: str) -> str:
     m = re.search(r"```\s*(.*?)```", text, re.DOTALL)
     if m:
         cand = m.group(1).strip()
-        # if it contains SELECT, use it; else fallback
         if re.search(r"\bSELECT\b", cand, re.IGNORECASE):
             logger.debug("extract_sql_from_text: found fenced block with SELECT")
             return cand
@@ -51,12 +50,15 @@ def extract_sql_from_text(text: str) -> str:
 
 def is_safe_sql(sql: str) -> bool:
     """
-    Very small heuristic to disallow destructive SQL statements.
-    Returns False if any unsafe keyword is present as a whole word.
+    Disallow destructive SQL statements.
+    Returns False if unsafe keyword present as a whole word.
     """
     if not sql:
         return True
-    unsafe_keywords = ["DROP", "DELETE", "ALTER", "TRUNCATE", "UPDATE", "INSERT", "CREATE", "ATTACH", "DETACH"]
+    unsafe_keywords = [
+        "DROP", "DELETE", "ALTER", "TRUNCATE",
+        "UPDATE", "INSERT", "CREATE", "ATTACH", "DETACH"
+    ]
     for kw in unsafe_keywords:
         if re.search(rf"\b{kw}\b", sql, re.IGNORECASE):
             logger.warning(f"Unsafe SQL detected: {kw}")
@@ -67,40 +69,30 @@ def is_safe_sql(sql: str) -> bool:
 def limit_sql_rows(sql: str, limit: int = 100) -> str:
     """
     Wrap SQL so that returned rows are limited.
-    Preserves original SQL but nests it in a subquery.
     """
     sql = sql.strip().rstrip(";")
     return f"SELECT * FROM ({sql}) AS _sub LIMIT {int(limit)}"
 
 
-# -------------------------------
-# SQL Validation Helpers
-# -------------------------------
-
 def is_select_query(sql: str) -> bool:
     """
     Return True if SQL starts with SELECT (ignoring whitespace/comments).
-    Very small heuristic suitable for our usage.
     """
     if not sql:
         return False
-    # remove leading SQL comments
     s = sql.strip()
-    # Consider leading parens (subqueries)
     return bool(re.match(r"^\s*\(?\s*SELECT\b", s, re.IGNORECASE))
 
 
 def _normalize_identifier(name: str) -> str:
     """
-    Normalize table name token: strip quotes/backticks and schema prefixes.
+    Normalize table name: strip quotes/backticks and schema prefixes.
     """
     name = name.strip()
-    # remove surrounding quotes/backticks
     if (name.startswith('"') and name.endswith('"')) or (name.startswith("'") and name.endswith("'")):
         name = name[1:-1]
     if name.startswith("`") and name.endswith("`"):
         name = name[1:-1]
-    # drop schema prefix like schema.table
     if "." in name:
         name = name.split(".")[-1]
     return name
@@ -109,21 +101,15 @@ def _normalize_identifier(name: str) -> str:
 def validate_tables_in_sql(sql: str, schemas: Dict[str, Dict[str, Any]]) -> List[str]:
     """
     Return list of table names referenced in SQL that are NOT present in schemas.
-    Very lightweight: finds identifiers after FROM and JOIN tokens.
     """
     if not sql:
         return []
 
-    # build set of known tables (normalized to lowercase)
     known = {t.lower() for t in schemas.keys()}
-
-    # regex to capture identifiers after FROM / JOIN / INTO / UPDATE (basic)
     tokens = re.findall(r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([^\s,;()]+)", sql, re.IGNORECASE)
     missing = []
     for tok in tokens:
-        nm = _normalize_identifier(tok).lower()
-        # strip possible alias like "users u"
-        nm = nm.split()[0]
+        nm = _normalize_identifier(tok).lower().split()[0]
         if nm and nm not in known and nm not in missing:
             missing.append(nm)
     return missing
@@ -136,7 +122,6 @@ def validate_tables_in_sql(sql: str, schemas: Dict[str, Dict[str, Any]]) -> List
 def format_few_shot_examples(examples: Optional[List[Dict[str, str]]]) -> str:
     """
     Convert few-shot examples into prompt-ready text.
-    Each example: {"query": "...", "sql": "..."} or {"question": "...", "sql": "..."}
     """
     if not examples:
         return ""
@@ -150,7 +135,7 @@ def format_few_shot_examples(examples: Optional[List[Dict[str, str]]]) -> str:
 
 def format_retrieved_docs(docs: Optional[List[Dict[str, Any]]]) -> str:
     """
-    Format retrieved documents (RAG) for inclusion in the prompt.
+    Format retrieved documents (RAG) for prompt.
     Expected doc shape: {"id":..., "score":..., "text":..., "meta": {...}}
     """
     if not docs:
@@ -167,6 +152,42 @@ def format_retrieved_docs(docs: Optional[List[Dict[str, Any]]]) -> str:
     return "\n\n".join(parts)
 
 
+def flatten_schema(schema: Dict[str, Any]) -> str:
+    """
+    Convert schema mapping into readable text.
+    """
+    if not schema:
+        return ""
+    parts = []
+    for table, meta in schema.items():
+        if isinstance(meta, dict):
+            cols = meta.get("columns") or []
+        else:
+            cols = meta or []
+        col_text = ", ".join(map(str, cols))
+        parts.append(f"Table: {table} | Columns: {col_text}")
+        if isinstance(meta, dict):
+            sample_rows = meta.get("sample_rows") or []
+            if sample_rows:
+                preview = preview_sample_rows(sample_rows, max_preview=2)
+                parts.append(f"  sample rows: {preview}")
+    return "\n".join(parts)
+
+
+def preview_sample_rows(rows: List[Dict[str, Any]], max_preview: int = 3) -> str:
+    """
+    Render a small human-friendly preview of sample rows.
+    """
+    if not rows:
+        return ""
+    preview = rows[:max_preview]
+    lines = []
+    for r in preview:
+        kvs = ", ".join(f"{k}={v}" for k, v in r.items())
+        lines.append(kvs)
+    return " | ".join(lines)
+
+
 def build_prompt(
     user_query: str,
     schemas: Dict[str, Any],
@@ -174,11 +195,11 @@ def build_prompt(
     few_shot: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """
-    Build a prompt that includes:
-      - Few-shot examples (optional)
-      - Flattened schema
-      - Retrieved docs (optional)
-      - User query
+    Build prompt with:
+      - few-shot examples
+      - flattened schema
+      - retrieved documents
+      - user query
     """
     parts = []
 
@@ -197,47 +218,3 @@ def build_prompt(
     parts.append(f"User Query: {user_query}\nSQL:")
     prompt = "\n\n".join(parts)
     return prompt
-
-
-# -------------------------------
-# CSV / Schema Helpers
-# -------------------------------
-
-def flatten_schema(schema: Dict[str, Any]) -> str:
-    """
-    Convert schema mapping into readable text.
-    Accepts schema: { "table": {"columns": [...], ...}, or "table": [col1, col2] }
-    """
-    if not schema:
-        return ""
-    parts = []
-    for table, meta in schema.items():
-        # handle both forms: list-of-columns or dict with 'columns'
-        if isinstance(meta, dict):
-            cols = meta.get("columns") or []
-        else:
-            cols = meta or []
-        col_text = ", ".join(map(str, cols))
-        parts.append(f"Table: {table} | Columns: {col_text}")
-        # include a brief sample preview if present
-        if isinstance(meta, dict):
-            sample_rows = meta.get("sample_rows") or []
-            if sample_rows:
-                preview = preview_sample_rows(sample_rows, max_preview=2)
-                parts.append(f"  sample rows: {preview}")
-    return "\n".join(parts)
-
-
-def preview_sample_rows(rows: List[Dict[str, Any]], max_preview: int = 3) -> str:
-    """
-    Render a small human-friendly preview of sample rows.
-    """
-    if not rows:
-        return ""
-    preview = rows[:max_preview]
-    lines = []
-    for r in preview:
-        # stable ordering
-        kvs = ", ".join(f"{k}={v}" for k, v in r.items())
-        lines.append(kvs)
-    return " | ".join(lines)

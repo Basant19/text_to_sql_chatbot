@@ -7,7 +7,7 @@ import uuid
 import tempfile
 import shutil
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -17,13 +17,15 @@ logger = get_logger("history_store")
 
 
 def _ensure_dir(path: str) -> None:
-    if path and not os.path.exists(path):
+    if not path:
+        return
+    if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
 
 
 def _safe_json_dumps(obj: Any) -> str:
     """
-    Safely dump object to JSON string. Non-serializable objects are converted with str().
+    Safely dump object to JSON string. Non-serializable objects are converted via str().
     """
     try:
         return json.dumps(obj, ensure_ascii=False, indent=None, default=str)
@@ -35,9 +37,10 @@ def _safe_json_dumps(obj: Any) -> str:
 class HistoryStore:
     """
     Chat / query history storage with two backends:
-      - "json"   : file-based storage (default) using JSON file
+      - "json"   : file-based storage using a JSON file
       - "sqlite" : sqlite3 DB storage (file-based)
-    Each entry shape (in JSON backend) is:
+
+    JSON entry shape:
         {
           "id": "<uuid>",
           "name": "Query 1",
@@ -62,23 +65,68 @@ class HistoryStore:
         """
         backend: "json" or "sqlite"
         path: optional path to store DB/JSON. If omitted, uses config.DATA_DIR or ./data
+
+        'path' may be either:
+          - a directory (we use a default filename inside it), or
+          - a full file path (file extension present).
         """
         try:
-            self.backend = backend.lower()
-            base_dir = path or getattr(config, "DATA_DIR", os.path.join(os.getcwd(), "data"))
-            _ensure_dir(base_dir)
+            self.backend = (backend or "json").lower()
+            default_base = getattr(config, "DATA_DIR", os.path.join(os.getcwd(), "data"))
+
+            # Normalize provided path (if any)
+            if path:
+                path = os.path.abspath(path)
+
             if self.backend == "json":
-                self.file_path = path or getattr(config, "HISTORY_PATH", os.path.join(base_dir, "history.json"))
+                # If path provided:
+                #   - if path is an existing directory -> use path/history.json
+                #   - if path looks like a directory (ends with os.sep) -> treat as dir
+                #   - otherwise treat path as a file path
+                if path:
+                    if os.path.isdir(path) or path.endswith(os.sep):
+                        base_dir = path
+                        file_path = os.path.join(base_dir, "history.json")
+                    else:
+                        base_dir = os.path.dirname(path) or "."
+                        file_path = path
+                else:
+                    base_dir = os.path.abspath(default_base)
+                    file_path = os.path.join(base_dir, "history.json")
+
+                _ensure_dir(base_dir)
+                self.file_path = file_path
+
                 # create file if missing
                 if not os.path.exists(self.file_path):
+                    # safe create parent dirs then empty list
+                    _ensure_dir(os.path.dirname(self.file_path) or ".")
                     with open(self.file_path, "w", encoding="utf-8") as f:
                         json.dump([], f)
+
             elif self.backend == "sqlite":
-                self.db_path = path or getattr(config, "HISTORY_DB_PATH", os.path.join(base_dir, "history.db"))
-                _ensure_dir(os.path.dirname(self.db_path))
+                # If path provided:
+                #   - if path is dir -> use path/history.db
+                #   - else treat path as file path
+                if path:
+                    if os.path.isdir(path) or path.endswith(os.sep):
+                        base_dir = path
+                        db_path = os.path.join(base_dir, "history.db")
+                    else:
+                        base_dir = os.path.dirname(path) or "."
+                        db_path = path
+                else:
+                    base_dir = os.path.abspath(default_base)
+                    db_path = os.path.join(base_dir, "history.db")
+
+                _ensure_dir(base_dir)
+                self.db_path = db_path
+                _ensure_dir(os.path.dirname(self.db_path) or ".")
                 self._init_sqlite()
             else:
                 raise ValueError("unsupported backend: choose 'json' or 'sqlite'")
+
+            logger.info("HistoryStore initialized (backend=%s) at %s", self.backend, path or default_base)
         except Exception as e:
             logger.exception("Failed to initialize HistoryStore")
             raise CustomException(e, sys)
@@ -88,6 +136,8 @@ class HistoryStore:
     # -------------------------
     def _read_json_file(self) -> List[Dict[str, Any]]:
         try:
+            if not os.path.exists(self.file_path):
+                return []
             with open(self.file_path, "r", encoding="utf-8") as f:
                 data = json.load(f) or []
                 if not isinstance(data, list):
@@ -106,10 +156,12 @@ class HistoryStore:
         """
         try:
             dirpath = os.path.dirname(self.file_path) or "."
+            _ensure_dir(dirpath)
             fd, tmp_path = tempfile.mkstemp(dir=dirpath, prefix="history_", suffix=".tmp")
             os.close(fd)
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(items, f, ensure_ascii=False, indent=2)
+            # atomic move
             shutil.move(tmp_path, self.file_path)
         except Exception as e:
             logger.exception("Failed to write history JSON atomically")
@@ -172,7 +224,6 @@ class HistoryStore:
                 items.append(entry)
                 self._write_json_file_atomic(items)
             else:
-                # sqlite
                 conn = self._get_sqlite_conn()
                 cur = conn.cursor()
                 cur.execute(
@@ -200,6 +251,7 @@ class HistoryStore:
             if self.backend == "json":
                 items = self._read_json_file()
                 found = False
+                updated = None
                 for it in items:
                     if it.get("id") == entry_id:
                         if name is not None:
@@ -220,7 +272,6 @@ class HistoryStore:
             else:
                 conn = self._get_sqlite_conn()
                 cur = conn.cursor()
-                # Build dynamic update
                 updates = []
                 params = []
                 if name is not None:
@@ -232,13 +283,14 @@ class HistoryStore:
                 if result is not None:
                     updates.append("result_json = ?")
                     params.append(_safe_json_dumps(result))
+                # always touch updated_at
+                updates.append("updated_at = ?")
+                params.append(updated_at)
+
                 if not updates:
-                    # nothing to update, but still touch updated_at
-                    updates.append("updated_at = ?")
-                    params.append(updated_at)
-                else:
-                    updates.append("updated_at = ?")
-                    params.append(updated_at)
+                    conn.close()
+                    return None
+
                 params.append(entry_id)
                 sql = f"UPDATE history SET {', '.join(updates)} WHERE id = ?"
                 cur.execute(sql, tuple(params))
@@ -380,7 +432,7 @@ class HistoryStore:
         """
         try:
             export_path = export_path or os.path.join(getattr(config, "DATA_DIR", "./data"), f"history_export_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json")
-            _ensure_dir(os.path.dirname(export_path))
+            _ensure_dir(os.path.dirname(export_path) or ".")
             items = self.list_entries(newest_first=False)
             with open(export_path, "w", encoding="utf-8") as f:
                 json.dump(items, f, ensure_ascii=False, indent=2)
@@ -406,13 +458,17 @@ class HistoryStore:
             count = 0
             for it in data:
                 entry_id = it.get("id") if keep_ids and it.get("id") else str(uuid.uuid4())
+                # preserve created_at if present and keep_ids=True; otherwise set now
+                created_at = it.get("created_at") if (keep_ids and it.get("created_at")) else datetime.utcnow().isoformat() + "Z"
+                updated_at = it.get("updated_at") if (keep_ids and it.get("updated_at")) else datetime.utcnow().isoformat() + "Z"
+
                 entry = {
                     "id": entry_id,
                     "name": it.get("name", f"Query {entry_id}"),
                     "query": it.get("query", ""),
                     "result": it.get("result", None),
-                    "created_at": it.get("created_at", datetime.utcnow().isoformat() + "Z"),
-                    "updated_at": it.get("updated_at", datetime.utcnow().isoformat() + "Z"),
+                    "created_at": created_at,
+                    "updated_at": updated_at,
                 }
                 # write depending on backend
                 if self.backend == "json":

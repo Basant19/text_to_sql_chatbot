@@ -11,8 +11,8 @@ logger = get_logger("tools")
 
 class Tools:
     """
-    Thin adapter layer that exposes simple functions for the Graph nodes to call.
-    Allows dependency injection of the underlying components for easy testing.
+    Thin adapter layer exposing simple functions for Graph nodes.
+    Supports dependency injection of underlying components for easy testing.
     """
 
     def __init__(
@@ -23,51 +23,48 @@ class Tools:
         executor: Optional[Any] = None,
     ):
         try:
-            # Lazy import config only if needed, and tolerate absence in tests
+            # Lazy config import
             try:
-                from app import config as _config  # type: ignore
+                from app import config as _config
             except Exception:
                 _config = None
 
-            # ---------- Database default ----------
+            # -------- Database default --------
             if db is None:
-                # Import app.database lazily so tests that inject a DummyDB don't need config/env.
-                from app import database as _database  # type: ignore
+                from app import database as _database
                 self._db = _database
             else:
                 self._db = db
 
-            # ---------- SchemaStore default ----------
+            # -------- SchemaStore default --------
             if schema_store is None:
-                from app.schema_store import SchemaStore  # type: ignore
+                from app.schema_store import SchemaStore
                 self._schema_store = SchemaStore()
             else:
                 self._schema_store = schema_store
 
-            # ---------- VectorSearch default ----------
+            # -------- VectorSearch default --------
             if vector_search is None:
                 try:
-                    from app.vector_search import VectorSearch  # type: ignore
-                    index_path = None
-                    if _config is not None:
-                        index_path = getattr(_config, "VECTOR_INDEX_PATH", None)
-                    # Provide sensible fallback path if config missing
+                    from app.vector_search import VectorSearch
+                    index_path = getattr(_config, "VECTOR_INDEX_PATH", None) if _config else None
                     index_path = index_path or "./faiss/index.faiss"
                     self._vector_search = VectorSearch(index_path=index_path, embedding_fn=None)
                 except Exception:
-                    # If vector search can't be constructed (faiss missing, etc.), keep placeholder None
-                    logger.warning("VectorSearch default initialization failed; vector search must be injected for retrieval.")
+                    logger.warning(
+                        "VectorSearch default initialization failed; vector search must be injected."
+                    )
                     self._vector_search = None
             else:
                 self._vector_search = vector_search
 
-            # ---------- Executor default ----------
+            # -------- Executor default --------
             if executor is None:
                 try:
-                    from app import sql_executor as _executor  # type: ignore
+                    from app import sql_executor as _executor
                     self._executor = _executor
                 except Exception:
-                    logger.warning("Default sql_executor import failed; executor must be injected for execution.")
+                    logger.warning("Default sql_executor import failed; executor must be injected.")
                     self._executor = None
             else:
                 self._executor = executor
@@ -76,11 +73,8 @@ class Tools:
             logger.exception("Failed to initialize Tools")
             raise CustomException(e, sys)
 
-    # ---------- Database adapters ----------
+    # -------- Database adapters --------
     def load_table(self, csv_path: str, table_name: str, force_reload: bool = False) -> None:
-        """
-        Load a CSV into DuckDB (via database module). Returns None or raises CustomException.
-        """
         try:
             if not hasattr(self._db, "load_csv_table"):
                 raise CustomException("database backend does not implement load_csv_table", sys)
@@ -93,9 +87,6 @@ class Tools:
             raise CustomException(e, sys)
 
     def list_tables(self) -> List[str]:
-        """
-        Return list of tables known to the DuckDB database wrapper.
-        """
         try:
             if not hasattr(self._db, "list_tables"):
                 raise CustomException("database backend does not implement list_tables", sys)
@@ -106,7 +97,7 @@ class Tools:
             logger.exception("Tools.list_tables failed")
             raise CustomException(e, sys)
 
-    # ---------- Schema store adapters ----------
+    # -------- SchemaStore adapters --------
     def get_schema(self, csv_name: str) -> Optional[List[str]]:
         try:
             return self._schema_store.get_schema(csv_name)
@@ -130,11 +121,8 @@ class Tools:
             logger.exception("Tools.list_csvs failed")
             raise CustomException(e, sys)
 
-    # ---------- Vector search adapter ----------
+    # -------- Vector search adapter --------
     def search_vectors(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Query the vector DB and return list of docs (with id, score, text, meta).
-        """
         try:
             if self._vector_search is None:
                 raise CustomException("vector_search backend is not configured", sys)
@@ -147,21 +135,23 @@ class Tools:
             logger.exception("Tools.search_vectors failed")
             raise CustomException(e, sys)
 
-    # ---------- SQL execution adapter ----------
-    def execute_sql(self, sql: str, read_only: bool = True, limit: Optional[int] = None, as_dataframe: bool = False) -> Dict[str, Any]:
-        """
-        Execute SQL safely via the sql_executor module and return execution result dict.
-        """
+    # -------- SQL execution adapter --------
+    def execute_sql(
+        self, 
+        sql: str, 
+        read_only: bool = True, 
+        limit: Optional[int] = None, 
+        as_dataframe: bool = False
+    ) -> Dict[str, Any]:
         try:
             if self._executor is None:
                 raise CustomException("executor backend is not configured", sys)
 
             if hasattr(self._executor, "execute_sql"):
                 return self._executor.execute_sql(sql, read_only=read_only, limit=limit, as_dataframe=as_dataframe)
+            elif callable(self._executor):
+                return self._executor(sql, read_only=read_only, limit=limit, as_dataframe=as_dataframe)
             else:
-                # If executor was injected as a callable
-                if callable(self._executor):
-                    return self._executor(sql, read_only=read_only, limit=limit, as_dataframe=as_dataframe)
                 raise CustomException("executor does not implement execute_sql", sys)
         except CustomException:
             raise

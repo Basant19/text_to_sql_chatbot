@@ -12,7 +12,7 @@ logger = get_logger("langsmith_client")
 
 class LangSmithClient:
     """
-    Tiny wrapper for LangSmith / LLM service.
+    Wrapper for LangSmith / LLM service.
     - Uses config.LANGSMITH_ENDPOINT and config.LANGSMITH_API_KEY by default.
     - Exposes generate(prompt, model, max_tokens) -> {"text": str, "raw": dict}
     - Keeps tracing flag (config.LANGSMITH_TRACING) to enable extra logging.
@@ -31,6 +31,7 @@ class LangSmithClient:
             self.endpoint = endpoint or getattr(config, "LANGSMITH_ENDPOINT", None)
             self.tracing = tracing if tracing is not None else getattr(config, "LANGSMITH_TRACING", False)
 
+            # API key optional during tests — but real usage should set it
             if not self.api_key:
                 raise ValueError("LANGSMITH API key is required")
 
@@ -54,17 +55,20 @@ class LangSmithClient:
         Generate text from the LLM.
         Returns {"text": <string>, "raw": <full response dict>}
         Raises CustomException on failure.
-        Note: This implementation expects a JSON response. It is intentionally generic
-        so tests can monkeypatch requests.post() and return different payloads.
+
+        Implementation notes:
+          - Uses the REST endpoint: {endpoint}/v1/generate with payload containing 'model'
+          - This shape is intentionally generic so tests can monkeypatch requests.post().
         """
         start = time.time()
         try:
-            # import here so tests can monkeypatch requests.post easily
+            # imported here so tests can monkeypatch requests.post easily
             import requests  # type: ignore
 
             if not self.endpoint:
                 raise ValueError("No LANGSMITH endpoint configured")
 
+            # Use the simple generate endpoint (model passed in payload)
             url = f"{self.endpoint}/v1/generate"
             payload = {
                 "model": model,
@@ -75,11 +79,15 @@ class LangSmithClient:
 
             if self.tracing:
                 logger.info("LangSmith generate() called — tracing enabled")
-                logger.debug(f"POST {url} payload={json.dumps(payload)[:1000]}")
+                # avoid logging very large payloads
+                try:
+                    logger.debug(f"POST {url} payload={json.dumps(payload)[:1000]}")
+                except Exception:
+                    logger.debug("POST payload (non-serializable)")
 
             resp = requests.post(url, json=payload, headers=self._headers, timeout=timeout)
 
-            # raise for status codes >= 400
+            # handle HTTP error codes
             if resp.status_code >= 400:
                 logger.error(f"LangSmith generate failed status={resp.status_code}")
                 try:
@@ -88,33 +96,31 @@ class LangSmithClient:
                     detail = resp.text
                 raise RuntimeError(f"LangSmith API error: {resp.status_code} {detail}")
 
+            # parse response (may be JSON or plain text)
             try:
                 data = resp.json()
             except Exception:
-                # If the service returns plain text, wrap it
                 text = resp.text
                 data = {"text": text}
 
-            # Heuristic: try common fields for generated content
+            # Heuristic: extract text from common fields
             text = None
-            # prefer 'text'
             if isinstance(data, dict):
                 for key in ("text", "output", "result", "content"):
                     if key in data and isinstance(data[key], (str, list)):
                         if isinstance(data[key], list):
-                            # join if list of strings
                             text = " ".join(map(str, data[key]))
                         else:
                             text = data[key]
                         break
-                # some APIs nest: { "outputs": [ { "text": "..." } ] }
+                # some payloads include nested outputs list
                 if text is None and "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
                     first = data["outputs"][0]
                     if isinstance(first, dict) and "text" in first:
                         text = first["text"]
 
             if text is None:
-                # fallback: serialize the raw response
+                # fallback: stringify the raw response
                 text = json.dumps(data)
 
             runtime = time.time() - start
@@ -127,17 +133,11 @@ class LangSmithClient:
             raise CustomException(e, sys)
 
 
-# Simple demo when run as a module (will not actually call remote by default in tests)
 if __name__ == "__main__":
-    import os
-    import tempfile
-
     print("LangSmithClient demo")
     try:
-        # create a client using config values; will raise if API key missing
         c = LangSmithClient()
         print("Client initialized. Endpoint:", getattr(c, "endpoint", None))
-        # Do not call generate() here to avoid network calls in demo.
         print("Demo complete — generate() not invoked to avoid network calls.")
     except Exception as e:
         print("Demo error:", e)

@@ -1,3 +1,4 @@
+# D:\text_to_sql_bot\app\schema_store.py
 import os
 import sys
 import csv
@@ -23,7 +24,9 @@ class SchemaStore:
 
     def __init__(self, store_path: Optional[str] = None, sample_limit: int = 5):
         try:
-            self.store_path = store_path or os.path.join(getattr(config, "DATA_DIR", "./data"), "schema_store.json")
+            self.store_path = store_path or os.path.join(
+                getattr(config, "DATA_DIR", "./data"), "schema_store.json"
+            )
             _ensure_dir(os.path.dirname(self.store_path))
             self.sample_limit = sample_limit
             self._store: Dict[str, Dict[str, Any]] = {}

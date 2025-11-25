@@ -9,12 +9,12 @@ from app.vector_search import VectorSearch
 from app.graph.builder import GraphBuilder
 from app.history_sql import HistoryStore
 from app.logger import get_logger
-from app.config import Config
+import app.config as config_module
 
 logger = get_logger("app")
 
 # Initialize components
-config = Config()
+config = config_module
 csv_loader = CSVLoader()
 schema_store = SchemaStore()
 vector_search = VectorSearch()

@@ -1,3 +1,4 @@
+# D:\text_to_sql_bot\app\csv_loader.py
 import os
 import io
 import csv
@@ -20,6 +21,7 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _unique_path(dest_dir: str, filename: str) -> str:
+    """Ensure filename is unique in destination directory."""
     base, ext = os.path.splitext(filename)
     candidate = os.path.join(dest_dir, filename)
     if not os.path.exists(candidate):
@@ -29,6 +31,7 @@ def _unique_path(dest_dir: str, filename: str) -> str:
 
 
 def save_uploaded_csv(fileobj: Union[bytes, TextIO, io.StringIO, io.BytesIO], filename: str) -> str:
+    """Save uploaded CSV to disk safely."""
     try:
         upload_dir = getattr(config, "UPLOAD_DIR", os.path.join(os.getcwd(), "uploads"))
         os.makedirs(upload_dir, exist_ok=True)
@@ -59,6 +62,7 @@ def save_uploaded_csv(fileobj: Union[bytes, TextIO, io.StringIO, io.BytesIO], fi
 
 
 def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
+    """Load CSV header, sample rows, and row count."""
     try:
         if not os.path.exists(path):
             raise FileNotFoundError(f"CSV file not found: {path}")
@@ -105,14 +109,17 @@ class CSVLoader:
         self.uploaded_files: List[str] = []
 
     def save_csv(self, file):
+        """Save a file object and store its path."""
         path = save_uploaded_csv(file, file.name)
         self.uploaded_files.append(path)
         return path
 
     def list_uploaded_csvs(self) -> List[str]:
+        """Return list of saved CSV paths."""
         return self.uploaded_files
 
     def load_and_extract(self, file_paths: List[str]) -> List[Dict[str, Any]]:
+        """Load metadata for multiple CSV files."""
         schemas = []
         for path in file_paths:
             metadata = load_csv_metadata(path)

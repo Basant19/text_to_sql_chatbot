@@ -1,6 +1,5 @@
 import os
 import sys
-import tempfile
 import traceback
 
 # Ensure project root on sys.path so imports work when run directly
@@ -9,7 +8,6 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import pytest  # noqa: E402
-
 from app import config  # noqa: E402
 from app.langsmith_client import LangSmithClient  # noqa: E402
 from app.exception import CustomException  # noqa: E402
@@ -34,14 +32,12 @@ def _make_dummy_response(status=200, json_body=None, text_body=""):
 
 
 def test_generate_success(monkeypatch, tmp_path):
-    # Point config endpoint to a fake URL and key
     monkeypatch.setattr(config, "LANGSMITH_ENDPOINT", "https://fake.endpoint", raising=False)
     monkeypatch.setattr(config, "LANGSMITH_API_KEY", "fake-key", raising=False)
     monkeypatch.setattr(config, "LANGSMITH_PROJECT", "test-proj", raising=False)
     monkeypatch.setattr(config, "LANGSMITH_TRACING", True, raising=False)
 
-    # Monkeypatch requests.post to return a DummyResp
-    import requests  # this will be the real requests but we'll patch its post
+    import requests
     captured = {}
 
     def fake_post(url, json=None, headers=None, timeout=None):
@@ -52,13 +48,14 @@ def test_generate_success(monkeypatch, tmp_path):
 
     monkeypatch.setattr(requests, "post", fake_post)
 
-    client = LangSmithClient()  # uses monkeypatched config
+    client = LangSmithClient()
     out = client.generate("say hello", model="gpt-test", max_tokens=10)
     assert isinstance(out, dict)
     assert out["text"] == "hello from fake"
-    # ensure headers included API key
     assert "Authorization" in captured["headers"]
     assert "fake-key" in captured["headers"]["Authorization"]
+    # URL no longer includes model in path, payload has model key
+    assert captured["json"]["model"] == "gpt-test"
 
 
 def test_generate_api_error_raises(monkeypatch):
@@ -84,7 +81,6 @@ def _run_as_script():
     successes = 0
     failures = 0
 
-    # Use temporary monkeypatch-like overrides by setting config vars directly
     original_endpoint = getattr(config, "LANGSMITH_ENDPOINT", None)
     original_key = getattr(config, "LANGSMITH_API_KEY", None)
     try:
@@ -92,7 +88,6 @@ def _run_as_script():
         config.LANGSMITH_API_KEY = "fake-key"
         config.LANGSMITH_TRACING = True
 
-        # patch requests.post manually
         import requests
 
         def fake_post(url, json=None, headers=None, timeout=None):
@@ -127,7 +122,6 @@ def _run_as_script():
         traceback.print_exc()
         failures += 1
     finally:
-        # restore
         if original_endpoint is None:
             try:
                 delattr(config, "LANGSMITH_ENDPOINT")

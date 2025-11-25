@@ -2,8 +2,7 @@ import os
 import sys
 import json
 import uuid
-import logging
-from typing import List, Dict, Any, Callable, Optional, Tuple
+from typing import List, Dict, Any, Callable, Optional
 
 import numpy as np
 
@@ -13,7 +12,7 @@ from app import config
 
 logger = get_logger("vector_search")
 
-# Try to import faiss; if unavailable, we'll use a numpy fallback
+# Try to import faiss; fallback to numpy if unavailable
 _FAISS_AVAILABLE = True
 try:
     import faiss  # type: ignore
@@ -26,16 +25,21 @@ def _ensure_parent_dir(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
 
+def _remove_file(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 class VectorSearch:
     """
-    Simple vector search wrapper that supports:
-      - building/upserting documents (documents have 'id' and 'text' + optional metadata)
-      - saving/loading index and metadata
-      - searching with a provided embedding function
-
-    Storage:
-      - Index path: config.VECTOR_INDEX_PATH (file). For FAISS we write the index file.
-      - Metadata path: same path + '.meta.json', stores id -> metadata mapping.
+    Vector search wrapper supporting:
+      - Upserting documents with 'text' and optional metadata
+      - Index/metadata persistence
+      - Search with top-k results
+      - FAISS or NumPy backend
     """
 
     def __init__(
@@ -49,20 +53,20 @@ class VectorSearch:
             self.meta_path = f"{self.index_path}.meta.json"
             _ensure_parent_dir(self.index_path)
             _ensure_parent_dir(self.meta_path)
+
             self.embedding_fn = embedding_fn or self._default_embedding
             self.dim = dim
 
-            # metadata: id -> metadata dict (contains 'text' and optional extras)
             self._metadata: Dict[str, Dict[str, Any]] = {}
 
-            # internal vector storage depending on backend:
+            # Backend setup
             self._use_faiss = _FAISS_AVAILABLE
             self._faiss_index = None
             self._numpy_vectors: Optional[np.ndarray] = None
-            self._id_to_idx: Dict[str, int] = {}  # mapping for numpy backend
+            self._id_to_idx: Dict[str, int] = {}
             self._next_idx = 0
 
-            # try to load existing index & metadata if present
+            # Load existing index & metadata if present
             self._load_meta()
             self._load_index()
             logger.info(f"VectorSearch initialized at {self.index_path} (faiss={self._use_faiss})")
@@ -71,23 +75,31 @@ class VectorSearch:
             raise CustomException(e, sys)
 
     # ---------------------------
-    # Default embedding (placeholder)
+    # Helpers
+    # ---------------------------
+    def _normalize_vector(self, vec: np.ndarray) -> np.ndarray:
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 0 else vec
+
+    def _adjust_dim(self, vec: np.ndarray) -> np.ndarray:
+        if vec.size != self.dim:
+            logger.warning(f"Embedding dimension mismatch ({vec.size} != {self.dim}); adjusting")
+            if vec.size < self.dim:
+                padded = np.zeros(self.dim, dtype=np.float32)
+                padded[: vec.size] = vec
+                return padded
+            return vec[: self.dim]
+        return vec
+
+    # ---------------------------
+    # Default embedding
     # ---------------------------
     def _default_embedding(self, text: str) -> List[float]:
-        """
-        Very simple deterministic embedding fallback.
-        Not for production: maps characters to trigram counts and then pads/normalizes.
-        """
         vec = np.zeros(self.dim, dtype=float)
-        if not text:
-            return vec.tolist()
-        s = text.lower()
-        for i, ch in enumerate(s):
-            vec[i % self.dim] += (ord(ch) % 97) * 0.001
-        # normalize
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec /= norm
+        if text:
+            for i, ch in enumerate(text.lower()):
+                vec[i % self.dim] += (ord(ch) % 97) * 0.001
+            vec = self._normalize_vector(vec)
         return vec.tolist()
 
     # ---------------------------
@@ -98,10 +110,6 @@ class VectorSearch:
             if os.path.exists(self.meta_path):
                 with open(self.meta_path, "r", encoding="utf-8") as f:
                     self._metadata = json.load(f)
-                # build id->idx for numpy if we need to
-                if not self._use_faiss and self._metadata:
-                    # we will rebuild numpy vectors on load_index
-                    pass
             else:
                 self._metadata = {}
         except Exception as e:
@@ -121,28 +129,19 @@ class VectorSearch:
     # Index persistence / building
     # ---------------------------
     def _load_index(self) -> None:
-        """
-        Load index from disk. For faiss we use read_index; for numpy we load a .npy if present.
-        If index doesn't exist we initialize an empty index.
-        """
         try:
             if self._use_faiss:
                 if os.path.exists(self.index_path):
                     self._faiss_index = faiss.read_index(self.index_path)
                     logger.info("Loaded faiss index from disk")
                 else:
-                    # create empty index
-                    self._faiss_index = faiss.IndexFlatIP(self.dim)  # inner-product (cosine w/ normalized vectors)
+                    self._faiss_index = faiss.IndexFlatIP(self.dim)
                     logger.info("Created new faiss index (empty)")
             else:
-                # numpy fallback: store vectors in index_path + '.npy'
                 npy_path = f"{self.index_path}.npy"
                 if os.path.exists(npy_path):
                     self._numpy_vectors = np.load(npy_path)
-                    # build id->idx mapping from metadata order
-                    self._id_to_idx = {}
-                    for idx, doc_id in enumerate(list(self._metadata.keys())):
-                        self._id_to_idx[doc_id] = idx
+                    self._id_to_idx = {doc_id: idx for idx, doc_id in enumerate(list(self._metadata.keys()))}
                     self._next_idx = self._numpy_vectors.shape[0]
                     logger.info("Loaded numpy vectors from disk")
                 else:
@@ -175,35 +174,19 @@ class VectorSearch:
     # Upsert documents
     # ---------------------------
     def upsert_documents(self, documents: List[Dict[str, Any]]) -> List[str]:
-        """
-        Upsert a list of documents. Each doc must have 'text' and optionally 'id' and metadata.
-        Returns list of doc ids upserted.
-        """
         try:
-            ids = []
-            vecs = []
+            ids, vecs = [], []
             for doc in documents:
                 doc_id = doc.get("id") or uuid.uuid4().hex
                 text = doc.get("text") or ""
                 meta = doc.get("meta", {})
-                # generate embedding
+
                 emb = np.array(self.embedding_fn(text), dtype=np.float32)
-                # ensure dim
-                if emb.size != self.dim:
-                    # try to pad or truncate
-                    if emb.size < self.dim:
-                        padded = np.zeros(self.dim, dtype=np.float32)
-                        padded[: emb.size] = emb
-                        emb = padded
-                    else:
-                        emb = emb[: self.dim]
-                # normalize for inner product cosine-like similarity
-                norm = np.linalg.norm(emb)
-                if norm > 0:
-                    emb = emb / norm
+                emb = self._adjust_dim(emb)
+                emb = self._normalize_vector(emb)
+
                 ids.append(doc_id)
                 vecs.append(emb)
-                # update metadata
                 self._metadata[doc_id] = {"text": text, **meta}
 
             if not vecs:
@@ -212,27 +195,21 @@ class VectorSearch:
             vecs_arr = np.vstack(vecs).astype(np.float32)
 
             if self._use_faiss:
-                # Ensure faiss index dimension matches
                 if self._faiss_index is None:
                     self._faiss_index = faiss.IndexFlatIP(self.dim)
-                # add
                 self._faiss_index.add(vecs_arr)
             else:
-                # append to numpy array
                 if self._numpy_vectors is None:
                     self._numpy_vectors = vecs_arr.copy()
                 else:
                     self._numpy_vectors = np.vstack([self._numpy_vectors, vecs_arr])
-                # update id->idx mapping
                 start = self._next_idx
                 for i, doc_id in enumerate(ids):
                     self._id_to_idx[doc_id] = start + i
                 self._next_idx += len(ids)
 
-            # persist index and metadata
             self._save_index()
             self._save_meta()
-
             logger.info(f"Upserted {len(ids)} documents")
             return ids
         except Exception as e:
@@ -243,63 +220,38 @@ class VectorSearch:
     # Search
     # ---------------------------
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Search for query and return a list of result dicts:
-          [{"id": id, "score": float, "text": ..., "meta": {...}}, ...]
-        """
         try:
             q_emb = np.array(self.embedding_fn(query), dtype=np.float32)
-            if q_emb.size != self.dim:
-                if q_emb.size < self.dim:
-                    padded = np.zeros(self.dim, dtype=np.float32)
-                    padded[: q_emb.size] = q_emb
-                    q_emb = padded
-                else:
-                    q_emb = q_emb[: self.dim]
-
-            # normalize
-            norm = np.linalg.norm(q_emb)
-            if norm > 0:
-                q_emb = q_emb / norm
+            q_emb = self._adjust_dim(q_emb)
+            q_emb = self._normalize_vector(q_emb)
 
             if self._use_faiss:
                 if self._faiss_index is None or self._faiss_index.ntotal == 0:
                     return []
-                # faiss expects (n, dim)
+
                 D, I = self._faiss_index.search(np.expand_dims(q_emb, axis=0), top_k)
-                scores = D[0].tolist()
-                indices = I[0].tolist()
-                results = []
-                # We need to map index offsets to metadata ids. FAISS stores vectors in insertion order
-                # Our metadata dict preserves insertion order since Python 3.7, so we can get id by position.
                 ids_list = list(self._metadata.keys())
-                for idx, sc in zip(indices, scores):
-                    if idx < 0:
-                        continue
-                    if idx >= len(ids_list):
+                results = []
+                for idx, score in zip(I[0], D[0]):
+                    if idx < 0 or idx >= len(ids_list):
                         continue
                     doc_id = ids_list[idx]
                     md = self._metadata.get(doc_id, {})
-                    results.append({"id": doc_id, "score": float(sc), "text": md.get("text"), "meta": md})
+                    results.append({"id": doc_id, "score": float(score), "text": md.get("text"), "meta": md})
                 return results
             else:
                 if self._numpy_vectors is None or self._numpy_vectors.shape[0] == 0:
                     return []
-                # compute cosine similarity via dot product (vectors normalized)
-                dots = float(np.dot(self._numpy_vectors, q_emb))
-                # For many rows we want vectorized
-                sims = (self._numpy_vectors @ q_emb).astype(float)
-                # get top_k indices
+                sims = self._numpy_vectors @ q_emb
                 idxs = np.argsort(-sims)[:top_k]
-                results = []
                 ids_list = list(self._metadata.keys())
+                results = []
                 for idx in idxs:
                     if idx < 0 or idx >= len(ids_list):
                         continue
                     doc_id = ids_list[idx]
                     md = self._metadata.get(doc_id, {})
-                    score = float(sims[idx])
-                    results.append({"id": doc_id, "score": score, "text": md.get("text"), "meta": md})
+                    results.append({"id": doc_id, "score": float(sims[idx]), "text": md.get("text"), "meta": md})
                 return results
         except Exception as e:
             logger.exception("Search failed")
@@ -314,28 +266,13 @@ class VectorSearch:
             self._metadata = {}
             if self._use_faiss:
                 self._faiss_index = faiss.IndexFlatIP(self.dim)
-                # remove index file if exists
-                try:
-                    if os.path.exists(self.index_path):
-                        os.remove(self.index_path)
-                except Exception:
-                    pass
+                _remove_file(self.index_path)
             else:
                 self._numpy_vectors = np.zeros((0, self.dim), dtype=np.float32)
-                npy_path = f"{self.index_path}.npy"
-                try:
-                    if os.path.exists(npy_path):
-                        os.remove(npy_path)
-                except Exception:
-                    pass
+                _remove_file(f"{self.index_path}.npy")
                 self._id_to_idx = {}
                 self._next_idx = 0
-            # remove meta file
-            try:
-                if os.path.exists(self.meta_path):
-                    os.remove(self.meta_path)
-            except Exception:
-                pass
+            _remove_file(self.meta_path)
             logger.info("Cleared vector index and metadata")
         except Exception as e:
             logger.exception("Failed to clear vector store")

@@ -31,6 +31,7 @@ class RetrieveNode:
             raise CustomException(e, sys)
 
     def _get_vs(self) -> vector_search_module.VectorSearch:
+        """Return the VectorSearch instance, creating it if necessary."""
         if self._vs is None:
             try:
                 self._vs = self._vs_factory()
@@ -39,16 +40,29 @@ class RetrieveNode:
                 raise CustomException(e, sys)
         return self._vs
 
-    def run(self, query: str, csv_names: Optional[List[str]] = None, top_k: int = 5) -> List[Dict[str, Any]]:
+    def run(
+        self,
+        query: str,
+        csv_names: Optional[List[str]] = None,
+        top_k: int = 5
+    ) -> List[Dict[str, Any]]:
         """
-        Run retrieval.
+        Perform retrieval for a query, optionally filtering by CSV/table names.
 
-        - query: user query to embed and search.
-        - csv_names: optional list of csv/table names to filter results to; if omitted, no filtering.
-        - top_k: number of top documents to request from the index.
+        Parameters
+        ----------
+        query : str
+            User query to embed and search.
+        csv_names : Optional[List[str]]
+            Optional list of CSV or table names to filter results; case-insensitive.
+        top_k : int
+            Number of top documents to return.
 
-        Returns a list of documents in the form returned by VectorSearch.search:
-          [{"id": ..., "score": ..., "text": ..., "meta": {...}}, ...]
+        Returns
+        -------
+        List[Dict[str, Any]]
+            List of documents in the form returned by VectorSearch.search:
+            [{"id": ..., "score": ..., "text": ..., "meta": {...}}, ...]
         """
         try:
             vs = self._get_vs()
@@ -56,28 +70,30 @@ class RetrieveNode:
             if not results:
                 return []
 
+            # No filtering requested
             if not csv_names:
                 return results
 
-            # filter by meta.path, meta.table_name, or meta.source heuristics
+            # Filter results based on CSV/table name or metadata source/path
             filtered = []
-            for d in results:
-                meta = d.get("meta", {}) or {}
-                path = str(meta.get("path", "") or meta.get("source", "") or meta.get("table_name", ""))
-                # normalize to lower-case for matching
-                low_path = path.lower()
-                matched = False
-                for name in csv_names:
-                    if not name:
-                        continue
-                    if name.lower() in low_path or name.lower() == str(meta.get("table_name", "")).lower():
-                        matched = True
-                        break
-                if matched:
-                    filtered.append(d)
+            csv_names_lower = [name.lower() for name in csv_names if name]
 
-            # If filtering produced no results, fallback to original results (useful when metadata is sparse)
+            for doc in results:
+                meta = doc.get("meta") or {}
+                meta_identifiers = [
+                    str(meta.get("path", "") or ""),
+                    str(meta.get("source", "") or ""),
+                    str(meta.get("table_name", "") or "")
+                ]
+                meta_identifiers_lower = [m.lower() for m in meta_identifiers]
+
+                if any(csv_name in m or csv_name == meta.get("table_name", "").lower() 
+                       for csv_name in csv_names_lower for m in meta_identifiers_lower):
+                    filtered.append(doc)
+
+            # Fallback to original results if filtering yields nothing
             return filtered if filtered else results
+
         except CustomException:
             raise
         except Exception as e:

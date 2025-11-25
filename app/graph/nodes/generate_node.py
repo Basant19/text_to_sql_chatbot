@@ -1,7 +1,7 @@
 # app/graph/nodes/generate_node.py
 import sys
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -39,27 +39,40 @@ class GenerateNode:
 
     def run(self, prompt: str) -> Dict[str, Any]:
         """
-        Call the LLM/agent with the prompt and return:
-          {
-            "prompt": <original prompt>,
-            "raw": <raw response from client/agent>,
-            "sql": <extracted SQL string>
-          }
-        Raises CustomException on error.
+        Generate SQL from a prompt using the client or agent.
+
+        Parameters
+        ----------
+        prompt : str
+            The text prompt describing the desired SQL.
+
+        Returns
+        -------
+        Dict[str, Any]
+            {
+                "prompt": <original or adjusted prompt>,
+                "raw": <raw response from client/agent>,
+                "sql": <extracted SQL string>
+            }
+
+        Raises
+        ------
+        CustomException
+            If generation fails or client/agent is invalid.
         """
-        start = time.time()
+        start_time = time.time()
         try:
-            raw_resp = None
-            sql = ""
-            prompt_text = prompt
+            raw_resp: Union[Dict[str, Any], str, None] = None
+            sql: str = ""
+            prompt_text: str = prompt
 
             # Prefer LangGraph agent if it has a 'run' method
             if hasattr(self.client, "run") and callable(self.client.run):
-                logger.info("GenerateNode: calling LangGraph agent run()")
+                logger.info("GenerateNode: using LangGraph agent run()")
                 out = self.client.run(prompt)
 
                 if isinstance(out, tuple):
-                    # assume (sql, prompt_text, raw)
+                    # assume (sql, prompt_text, raw_resp)
                     sql, prompt_text, raw_resp = out
                 elif isinstance(out, dict):
                     sql = out.get("sql") or utils.extract_sql_from_text(out.get("text", "")) or ""
@@ -71,22 +84,33 @@ class GenerateNode:
 
             # Fall back to LangSmithClient
             elif hasattr(self.client, "generate") and callable(self.client.generate):
-                logger.info("GenerateNode: calling LangSmithClient generate()")
+                logger.info("GenerateNode: using LangSmithClient generate()")
                 out = self.client.generate(prompt, model=self.model, max_tokens=self.max_tokens)
 
                 if isinstance(out, dict):
                     raw_resp = out
-                    sql = utils.extract_sql_from_text(out.get("text", "")) or out.get("output", "") or ""
+                    sql = (
+                        utils.extract_sql_from_text(out.get("text", ""))
+                        or out.get("output", "")
+                        or ""
+                    )
                 else:
                     raw_resp = out
                     sql = utils.extract_sql_from_text(str(out)) or str(out).strip()
             else:
-                raise CustomException("Client must implement 'run' or 'generate' method", sys)
+                raise CustomException(
+                    "Client must implement 'run' (LangGraph agent) or 'generate' (LangSmithClient)",
+                    sys
+                )
 
-            runtime = time.time() - start
-            logger.info(f"GenerateNode: generation complete in {runtime:.3f}s, sql_len={len(sql)}")
+            runtime = time.time() - start_time
+            logger.info(f"GenerateNode: completed in {runtime:.3f}s, sql_len={len(sql)}")
 
-            return {"prompt": prompt_text, "raw": raw_resp, "sql": sql}
+            return {
+                "prompt": prompt_text,
+                "raw": raw_resp,
+                "sql": sql
+            }
 
         except CustomException:
             raise
