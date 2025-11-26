@@ -13,16 +13,26 @@ logger = get_logger("gemini_client")
 
 class GeminiClient:
     """
-    Wrapper to call Google Gemini / Generative Language model.
+    Adapter for Google Gemini (Generative Models).
 
-    Preference order:
-      1. Use google-generativeai SDK if available (recommended).
-      2. Fallback to a simple REST call to the Generative Language API.
+    Preferred flow (in order):
+      1. LangChain's ChatGoogleGenerativeAI wrapper (if `langchain-google-genai` or compatible package is installed).
+         This mirrors your snippet:
+             llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash', google_api_key=api_key)
+             resp = llm.invoke(prompt)
+             llm_output = resp.content
 
-    Constructor reads:
-      - config.GEMINI_API_KEY (required)
-      - config.GEMINI_ENDPOINT (optional - if you want to override the REST base URL)
-      - config.GEMINI_MODEL (optional default model)
+      2. google.generativeai SDK (if installed) as a fallback.
+
+      3. REST fallback to the Generative Language HTTP API.
+
+    The adapter normalizes responses to:
+        {"text": <str>, "raw": <any>}
+    so the rest of the app can be provider-agnostic.
+
+    Important:
+      - Reads API key and model defaults from app.config (GEMINI_API_KEY, GEMINI_MODEL).
+      - Does not use LangSmith for generation. Tracing/logging is separate.
     """
 
     def __init__(
@@ -33,112 +43,205 @@ class GeminiClient:
         tracing: Optional[bool] = None,
     ):
         try:
+            # config fallbacks
             self.api_key = api_key or getattr(config, "GEMINI_API_KEY", None)
-            self.endpoint = endpoint or getattr(config, "GEMINI_ENDPOINT", "")  # optional override
-            self.default_model = default_model or getattr(config, "GEMINI_MODEL", "gemini-1.5")
+            self.endpoint = endpoint or getattr(config, "GEMINI_ENDPOINT", "")
+            self.default_model = default_model or getattr(config, "GEMINI_MODEL", "gemini-2.5-flash")
             self.tracing = tracing if tracing is not None else getattr(config, "LANGSMITH_TRACING", False)
 
             if not self.api_key:
-                raise ValueError("GEMINI_API_KEY (or GOOGLE_API_KEY) is required for GeminiClient")
+                raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY is required for GeminiClient")
 
-            # Try to initialize SDK if available. We'll keep a flag to know which backend to use.
-            self._use_sdk = False
+            # Try to initialize preferred LangChain Chat wrapper (ChatGoogleGenerativeAI) first.
+            self._use_langchain_llm = False
+            self._llm = None
             try:
-                # The SDK module name may be 'google.generativeai' or 'generativeai' depending on package.
+                # Try a few import paths that users may have depending on installation
                 try:
-                    import google.generativeai as genai  # type: ignore
+                    # preferred package: langchain-google-genai shim
+                    from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
                 except Exception:
-                    import generativeai as genai  # type: ignore
-                # Configure SDK with API key (the SDK usage may vary; common pattern is configure)
-                # We set attribute for later use
-                genai.configure(api_key=self.api_key)  # some SDKs expose configure()
-                self._genai = genai
-                self._use_sdk = True
-                logger.info("GeminiClient: using google-generativeai SDK")
-            except Exception:
-                self._use_sdk = False
-                self._genai = None
-                logger.info("GeminiClient: google-generativeai SDK not available, will use REST fallback")
+                    # alternative: some installations expose it under langchain.chat_models or langchain.google_genai
+                    try:
+                        from langchain.google_genai import ChatGoogleGenerativeAI  # type: ignore
+                    except Exception:
+                        # final fallback: try langchain.chat_models (may not exist)
+                        from langchain.chat_models import ChatGoogleGenerativeAI  # type: ignore
 
-            logger.info(f"GeminiClient initialized (model={self.default_model}, endpoint={self.endpoint or 'default'})")
+                # instantiate LLM wrapper (it typically expects google_api_key or api_key kwarg)
+                try:
+                    # many wrappers accept google_api_key or api_key; try both safe ways
+                    self._llm = ChatGoogleGenerativeAI(model=self.default_model, google_api_key=self.api_key)
+                except TypeError:
+                    # fallback if parameter name differs
+                    self._llm = ChatGoogleGenerativeAI(model=self.default_model, api_key=self.api_key)
+                self._use_langchain_llm = True
+                logger.info("GeminiClient: using ChatGoogleGenerativeAI (LangChain wrapper) as primary backend")
+            except Exception as e:
+                self._use_langchain_llm = False
+                self._llm = None
+                logger.info("GeminiClient: ChatGoogleGenerativeAI not available or failed to initialize: %s", e)
+
+            # If LangChain wrapper not available, try google.generativeai SDK
+            self._use_genai_sdk = False
+            self._genai = None
+            if not self._use_langchain_llm:
+                try:
+                    try:
+                        import google.generativeai as genai  # type: ignore
+                    except Exception:
+                        import generativeai as genai  # type: ignore
+                    # configure SDK (many versions provide `configure` or set API key)
+                    try:
+                        genai.configure(api_key=self.api_key)
+                    except Exception:
+                        # some SDKs expect a top-level variable
+                        try:
+                            genai.api_key = self.api_key  # type: ignore
+                        except Exception:
+                            pass
+                    self._genai = genai
+                    self._use_genai_sdk = True
+                    logger.info("GeminiClient: using google.generativeai SDK as secondary backend")
+                except Exception as e:
+                    self._use_genai_sdk = False
+                    self._genai = None
+                    logger.info("GeminiClient: google.generativeai SDK not available: %s", e)
+
+            # If neither backends available, we'll use REST fallback when generate() is called.
+            logger.info(
+                "GeminiClient initialized (model=%s, endpoint=%s, langchain_llm=%s, genai_sdk=%s)",
+                self.default_model,
+                self.endpoint or "default",
+                self._use_langchain_llm,
+                self._use_genai_sdk,
+            )
         except Exception as e:
             logger.exception("Failed to initialize GeminiClient")
             raise CustomException(e, sys)
 
     def generate(self, prompt: str, model: Optional[str] = None, max_tokens: int = 512, timeout: int = 30) -> Dict[str, Any]:
         """
-        Generate text using Gemini model.
+        Generate text from the configured Gemini provider.
 
         Returns:
-            {"text": <string>, "raw": <raw response dict>}
+            {"text": <str>, "raw": <raw response>}
         Raises:
-            CustomException on errors.
+            CustomException on unexpected errors.
         """
         start = time.time()
         try:
             model = model or self.default_model
 
-            if self._use_sdk and self._genai is not None:
-                # SDK path - try to call a common generate_text API. SDK shapes vary by version.
+            # 1) Preferred LangChain Chat wrapper path (mirrors your snippet)
+            if self._use_langchain_llm and self._llm is not None:
                 try:
-                    # many examples use: generativeai.generate_text(model=model, prompt=...)
-                    resp = self._genai.generate_text(model=model, prompt=prompt, max_output_tokens=int(max_tokens))
-                    # SDK may return an object; try to extract text and raw dict
+                    # The wrapper exposes an `invoke` method in your snippet.
+                    # Accept either a simple string prompt or a list of messages (future extension).
+                    resp = self._llm.invoke(prompt)
+                    # Many wrappers return an object with `.content` or `.generations`. Normalize.
                     text = None
-                    raw = None
-                    # if response is a dict-like
-                    if isinstance(resp, dict):
-                        raw = resp
-                        # common fields:
-                        for key in ("output", "text", "content", "candidates"):
-                            if key in resp:
-                                val = resp[key]
-                                if isinstance(val, str):
-                                    text = val
-                                    break
-                                if isinstance(val, list) and val:
-                                    # join candidate text pieces
-                                    text = " ".join(map(str, val))
-                                    break
-                    else:
-                        # try to access attribute 'text' or 'candidates'
-                        raw = resp
-                        text = getattr(resp, "text", None) or getattr(resp, "output", None)
-                        if not text:
-                            # some SDK return nested structure
-                            try:
-                                # attempt best-effort conversion
-                                raw_json = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
-                                # try typical keys
-                                if isinstance(raw_json, dict):
-                                    for key in ("output", "text", "content", "candidates"):
-                                        if key in raw_json:
-                                            t = raw_json[key]
-                                            if isinstance(t, str):
-                                                text = t
-                                                break
-                                            if isinstance(t, list) and t:
-                                                text = " ".join(map(str, t))
-                                                break
-                                raw = raw_json
-                            except Exception:
-                                raw = {"result": str(resp)}
-                                text = str(resp)
+                    raw = resp
 
+                    # common property `content` as per your snippet
+                    text = getattr(resp, "content", None)
                     if text is None:
-                        # fallback to stringified raw
-                        text = str(raw)
+                        # try attributes used by some wrappers
+                        text = getattr(resp, "text", None)
+                    if text is None:
+                        # sometimes resp has `.generations` or `.generations[0].text`
+                        gens = getattr(resp, "generations", None)
+                        if isinstance(gens, (list, tuple)) and len(gens) > 0:
+                            first = gens[0]
+                            text = getattr(first, "text", None) or getattr(first, "content", None)
+                            if text is None and isinstance(first, dict):
+                                text = first.get("text") or first.get("content")
+                    if text is None:
+                        # best-effort extraction for dict-like
+                        try:
+                            raw_json = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
+                            raw = raw_json
+                            for key in ("content", "text", "output", "candidates"):
+                                if key in raw_json:
+                                    val = raw_json[key]
+                                    if isinstance(val, str):
+                                        text = val
+                                        break
+                                    if isinstance(val, list) and val:
+                                        # if candidates list of dicts with 'content' or 'output'
+                                        if isinstance(val[0], dict):
+                                            text = val[0].get("content") or val[0].get("output") or val[0].get("text")
+                                        else:
+                                            text = " ".join(map(str, val))
+                                        break
+                        except Exception:
+                            # as a final fallback, stringify resp
+                            text = str(resp)
+
                     runtime = time.time() - start
-                    logger.info(f"GeminiClient (SDK) completed in {runtime:.3f}s")
+                    logger.info("GeminiClient (LangChain wrapper) completed in %.3fs", runtime)
                     return {"text": str(text), "raw": raw}
                 except Exception as e:
-                    logger.exception("GeminiClient SDK call failed; falling back to REST")
-                    # fall through to REST path
+                    # If wrapper fails, log and fall through to SDK/REST fallback
+                    logger.exception("GeminiClient: ChatGoogleGenerativeAI invoke failed, falling back: %s", e)
 
-            # REST fallback path
-            # Default Google Generative Language REST endpoint:
-            # https://generativelanguage.googleapis.com/v1beta2/models/{model}:generate
-            # Allow override via self.endpoint (must NOT include trailing slash)
+            # 2) google.generativeai SDK path
+            if self._use_genai_sdk and self._genai is not None:
+                try:
+                    # SDKs change shape; try a common call pattern:
+                    # generativeai.generate_text(model=model, prompt=prompt, max_output_tokens=...)
+                    gen = self._genai
+                    try:
+                        resp = gen.generate_text(model=model, prompt=prompt, max_output_tokens=int(max_tokens))
+                        # extract textual content
+                        text = None
+                        raw = resp
+                        if isinstance(resp, dict):
+                            raw = resp
+                            for key in ("output", "text", "content", "candidates"):
+                                if key in resp:
+                                    val = resp[key]
+                                    if isinstance(val, str):
+                                        text = val
+                                        break
+                                    if isinstance(val, list) and val:
+                                        if isinstance(val[0], dict):
+                                            # candidate objects
+                                            text = val[0].get("output") or val[0].get("content") or val[0].get("text")
+                                            if text:
+                                                break
+                                        else:
+                                            text = " ".join(map(str, val))
+                                            break
+                        else:
+                            # object-like response; try attribute access
+                            text = getattr(resp, "text", None) or getattr(resp, "output", None)
+                            if not text:
+                                try:
+                                    raw_json = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
+                                    raw = raw_json
+                                    for key in ("output", "text", "content"):
+                                        if key in raw_json:
+                                            v = raw_json[key]
+                                            text = v if isinstance(v, str) else " ".join(map(str, v)) if isinstance(v, list) else None
+                                            if text:
+                                                break
+                                except Exception:
+                                    pass
+
+                        if text is None:
+                            text = str(raw)
+                        runtime = time.time() - start
+                        logger.info("GeminiClient (genai SDK) completed in %.3fs", runtime)
+                        return {"text": str(text), "raw": raw}
+                    except Exception as e:
+                        logger.exception("GeminiClient: genai.generate_text failed; falling back to REST: %s", e)
+                        # fall-through to REST
+                except Exception as e:
+                    logger.exception("GeminiClient: unexpected error in genai SDK path: %s", e)
+                    # fall-through to REST
+
+            # 3) REST fallback
             base = self.endpoint.rstrip("/") if self.endpoint else "https://generativelanguage.googleapis.com/v1beta2"
             url = f"{base}/models/{model}:generate"
 
@@ -153,21 +256,21 @@ class GeminiClient:
             }
 
             if self.tracing:
-                logger.info("GeminiClient (REST) calling %s", url)
+                logger.info("GeminiClient (REST) POST %s", url)
                 try:
                     logger.debug("Payload preview: %s", json.dumps(payload)[:1000])
                 except Exception:
                     logger.debug("Payload (non-serializable)")
 
-            import requests  # local import so tests can monkeypatch
+            import requests  # local import for easier test/mocking
 
             resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
             if resp.status_code >= 400:
-                logger.error("GeminiClient REST failed status=%s", resp.status_code)
                 try:
                     detail = resp.json()
                 except Exception:
                     detail = resp.text
+                logger.error("GeminiClient REST call failed: status=%s", resp.status_code)
                 raise RuntimeError(f"Gemini API error: {resp.status_code} {detail}")
 
             try:
@@ -175,10 +278,11 @@ class GeminiClient:
             except Exception:
                 data = {"text": resp.text}
 
-            # heuristic: extract text
+            # Heuristic extraction from REST response shapes
             text = None
+            raw = data
             if isinstance(data, dict):
-                # typical shapes: {"candidates":[{"output":"..."}, ...]} or {"output": "..."} or {"text":"..."}
+                # candidate / output patterns
                 if "candidates" in data and isinstance(data["candidates"], list) and data["candidates"]:
                     first = data["candidates"][0]
                     if isinstance(first, dict) and "output" in first:
@@ -192,27 +296,26 @@ class GeminiClient:
                             text = " ".join(map(str, val))
                         else:
                             text = val
-                # nested 'outputs' sometimes used
                 if text is None and "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
                     first = data["outputs"][0]
-                    if isinstance(first, dict) and "text" in first:
-                        text = first["text"]
-
+                    if isinstance(first, dict):
+                        # some shapes use 'text' inside outputs
+                        text = first.get("text") or first.get("content") or first.get("output")
             if text is None:
                 text = json.dumps(data)
 
             runtime = time.time() - start
-            logger.info(f"GeminiClient (REST) completed in {runtime:.3f}s")
-            return {"text": str(text), "raw": data}
+            logger.info("GeminiClient (REST) completed in %.3fs", runtime)
+            return {"text": str(text), "raw": raw}
         except CustomException:
             raise
         except Exception as e:
-            logger.exception("GeminiClient.generate failed")
+            logger.exception("GeminiClient.generate failed: %s", e)
             raise CustomException(e, sys)
 
 
-# quick demo when run as script (won't call remote if API key missing)
 if __name__ == "__main__":
+    # Simple CLI/demo: do not call network unless user has configured GEMINI_API_KEY
     print("GeminiClient demo")
     try:
         c = GeminiClient()

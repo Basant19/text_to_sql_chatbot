@@ -1,10 +1,9 @@
-# D:\text_to_sql_bot\app\utils.py
+# app/utils.py
 import re
-from typing import List, Dict, Optional, Any
 import logging
+from typing import List, Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
-
 
 # -------------------------------
 # SQL Extraction & Safety Helpers

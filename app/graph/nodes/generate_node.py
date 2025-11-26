@@ -1,4 +1,5 @@
 # app/graph/nodes/generate_node.py
+
 import sys
 import time
 import threading
@@ -6,107 +7,97 @@ from typing import Optional, Dict, Any, Union
 
 from app.logger import get_logger
 from app.exception import CustomException
-from app import utils
+from app import utils, config
+from app.tools import Tools
 
 logger = get_logger("generate_node")
 
 
 class GenerateNode:
     """
-    Node that calls an LLM to generate SQL from a prompt.
+    Node responsible for generating SQL from a prompt via an LLM.
 
-    Behavior:
-      - If `client` has a .run() method (LangGraph agent), that is used and its output
-        is trusted (keeps previous behavior for agents).
-      - Otherwise, generation is done via a provider client that implements
-        generate(prompt, model, max_tokens). The provider client can be passed via
-        `provider_client` (preferred) or `client` (legacy).
-      - Optionally a `tracer_client` (e.g. LangSmithClient) may be provided. It will be
-        called for observability only (we call it in a background thread and ignore output).
-        Any tracer errors are caught and logged — they won't affect inference.
+    Key behaviors:
+    - Supports agent-based or direct provider generation.
+    - Observability via a tracer client (LangSmith), fire-and-forget.
+    - Strict safeguards: tracer cannot act as generator unless explicitly enabled via config.
     """
 
     def __init__(
         self,
+        tools: Optional[Tools] = None,
         client: Optional[Any] = None,
         provider_client: Optional[Any] = None,
         tracer_client: Optional[Any] = None,
-        model: str = "gpt",
+        model: Optional[str] = None,
         max_tokens: int = 512,
     ):
         try:
-            # `client` kept for backward compatibility: it may be an agent or a provider.
+            self.tools = tools or Tools()
             self.client = client
-            # provider_client is explicit LLM provider (GeminiClient, etc.)
             self.provider_client = provider_client
-            # tracer_client is optional (LangSmithClient) used for observability only
             self.tracer_client = tracer_client
-
-            self.model = model
+            self.model = model or getattr(config, "GEMINI_MODEL", "gemini-2.5-flash")
             self.max_tokens = max_tokens
 
             logger.info(
-                f"GenerateNode initialized (model={self.model}, max_tokens={self.max_tokens}, "
-                f"has_provider={bool(self.provider_client or self.client)}, has_tracer={bool(self.tracer_client)})"
+                "GenerateNode initialized (model=%s, max_tokens=%s, has_provider=%s, has_tracer=%s)",
+                self.model,
+                self.max_tokens,
+                bool(self.provider_client or self.client),
+                bool(self.tracer_client),
             )
         except Exception as e:
             logger.exception("Failed to initialize GenerateNode")
             raise CustomException(e, sys)
 
-    def _call_tracer(self, prompt: str, model: str, max_tokens: int, sql: Optional[str] = None) -> None:
+    def _call_tracer(self, prompt: str, sql: Optional[str] = None) -> None:
         """
-        Call the tracer client (LangSmith) for observability in a fire-and-forget manner.
-        This spawns a daemon thread so tracing does not add latency to inference.
-
-        Preferred tracer interface: tracer_client.trace_run(name, prompt, sql, metadata)
-        Fallback (not recommended): tracer_client.generate(...) — kept only as a last-resort
-        and will be ignored if tracer does not implement trace_run.
-
-        Any exception in tracing is logged and ignored.
+        Fire-and-forget tracer call for observability.
+        Exceptions are logged but do not affect generation.
         """
         if not self.tracer_client:
             return
 
-        def _do_trace():
+        def _trace():
             try:
-                # Prefer dedicated trace_run (no inference)
-                if hasattr(self.tracer_client, "trace_run") and callable(self.tracer_client.trace_run):
-                    try:
-                        self.tracer_client.trace_run(
-                            name="generate_node.run",
-                            prompt=prompt,
-                            sql=sql,
-                            metadata={"model": model, "max_tokens": max_tokens},
-                        )
-                    except Exception as e:
-                        logger.warning(f"Tracer.trace_run() failed (ignored): {e}")
+                if hasattr(self.tracer_client, "trace_run"):
+                    self.tracer_client.trace_run(
+                        name="generate_node.run",
+                        prompt=prompt,
+                        sql=sql,
+                        metadata={
+                            "model": self.model,
+                            "max_tokens": self.max_tokens,
+                            "timestamp": time.time(),
+                        },
+                    )
                     return
 
-                # Fallback: very lightweight generate() call (max_tokens=1) if trace_run not available
-                if hasattr(self.tracer_client, "generate") and callable(self.tracer_client.generate):
+                # fallback: tracer.generate only if explicitly enabled
+                if getattr(config, "USE_LANGSMITH_FOR_GEN", False) and hasattr(self.tracer_client, "generate"):
+                    logger.warning(
+                        "Tracer.generate() called (USE_LANGSMITH_FOR_GEN=true). Not recommended for production."
+                    )
                     try:
-                        self.tracer_client.generate(prompt, model=model, max_tokens=1)
-                    except Exception as e:
-                        logger.warning(f"Tracer.generate() fallback failed (ignored): {e}")
+                        self.tracer_client.generate(prompt, model=self.model, max_tokens=1)
+                    except TypeError:
+                        self.tracer_client.generate(prompt)
             except Exception as e:
-                logger.debug(f"Tracer background task encountered error (ignored): {e}")
+                logger.debug("Tracer error ignored: %s", e)
 
-        try:
-            t = threading.Thread(target=_do_trace, daemon=True)
-            t.start()
-        except Exception as e:
-            logger.debug(f"Failed to start tracer thread (ignored): {e}")
+        threading.Thread(target=_trace, daemon=True).start()
 
     def run(self, prompt: str) -> Dict[str, Any]:
         """
-        Generate SQL from a prompt.
+        Generate SQL from prompt.
 
-        Returns dict:
-          {
-            "prompt": <prompt used or agent-provided prompt>,
-            "raw": <raw response from provider or agent (if any)>,
+        Returns:
+        {
+            "prompt": <prompt used>,
+            "raw": <raw provider/agent output>,
             "sql": <extracted SQL string>
-          }
+        }
         """
         start_time = time.time()
         try:
@@ -114,13 +105,12 @@ class GenerateNode:
             sql: str = ""
             prompt_text: str = prompt
 
-            # 1) If client is an agent (has run), prefer it (keeps existing behavior)
-            if self.client and hasattr(self.client, "run") and callable(self.client.run):
-                logger.info("GenerateNode: using LangGraph agent run()")
+            # 1) Use agent if available
+            if self.client and hasattr(self.client, "run"):
+                logger.info("GenerateNode: using agent client run()")
                 out = self.client.run(prompt)
 
                 if isinstance(out, tuple):
-                    # assume (sql, prompt_text, raw_resp)
                     sql, prompt_text, raw_resp = out
                 elif isinstance(out, dict):
                     prompt_text = out.get("prompt", prompt)
@@ -130,53 +120,33 @@ class GenerateNode:
                     raw_resp = out
                     sql = utils.extract_sql_from_text(str(out)) or str(out).strip()
 
-                # fire tracer asynchronously (do not block)
-                try:
-                    self._call_tracer(prompt_text, self.model, self.max_tokens, sql=sql)
-                except Exception:
-                    logger.debug("Tracer call after agent run failed (ignored)")
+                self._call_tracer(prompt_text, sql=sql)
 
             else:
-                # 2) Determine provider client (explicit provider_client preferred)
+                # 2) Determine provider
                 provider = self.provider_client or self.client
-                # If still None, try to import GeminiClient lazily (best-effort)
                 if provider is None:
-                    try:
-                        from app.gemini_client import GeminiClient  # type: ignore
-                        provider = GeminiClient()
-                        logger.debug("GenerateNode: lazily instantiated GeminiClient as provider")
-                    except Exception:
-                        provider = None
+                    from app.gemini_client import GeminiClient
+                    provider = GeminiClient()
+                    logger.debug("GenerateNode: lazily instantiated GeminiClient")
 
-                if provider is None:
-                    raise CustomException("No LLM provider configured (provider_client or client required)", sys)
-
-                # Ensure provider has generate()
                 if not hasattr(provider, "generate") or not callable(provider.generate):
-                    raise CustomException("Provider client must implement generate(prompt, model, max_tokens)", sys)
+                    raise CustomException("Provider must implement generate(prompt, model, max_tokens)", sys)
 
-                # 3) Call provider to get generation (this is the real inference call)
-                logger.info("GenerateNode: calling provider.generate() for inference")
+                logger.info("GenerateNode: calling provider.generate() (model=%s)", self.model)
                 out = provider.generate(prompt, model=self.model, max_tokens=self.max_tokens)
                 raw_resp = out
 
-                # extract SQL from provider response
                 if isinstance(out, dict):
-                    # common field for text is 'text'; allow fallback to 'output'
-                    resp_text = out.get("text") or out.get("output") or ""
+                    resp_text = out.get("text") or out.get("output") or out.get("content") or ""
                     sql = utils.extract_sql_from_text(resp_text) or str(resp_text).strip()
                 else:
                     sql = utils.extract_sql_from_text(str(out)) or str(out).strip()
 
-                # 4) Fire-and-forget tracer (LangSmith) for observability only.
-                try:
-                    self._call_tracer(prompt, self.model, self.max_tokens, sql=sql)
-                except Exception:
-                    logger.debug("Tracer call after provider.generate failed (ignored)")
+                self._call_tracer(prompt, sql=sql)
 
             runtime = time.time() - start_time
-            logger.info(f"GenerateNode: completed in {runtime:.3f}s, sql_len={len(sql)}")
-
+            logger.info("GenerateNode completed in %.3fs, sql_len=%d", runtime, len(sql or ""))
             return {"prompt": prompt_text, "raw": raw_resp, "sql": sql}
 
         except CustomException:

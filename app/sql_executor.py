@@ -11,7 +11,7 @@ from app import database
 logger = get_logger("sql_executor")
 
 # ---------------------------
-# SQL Safety (readonly mode)
+# SQL Safety (read-only mode)
 # ---------------------------
 _READONLY_DISALLOWED = (
     "DROP",
@@ -33,7 +33,7 @@ _READONLY_DISALLOWED = (
 def _validate_sql(sql: str, read_only: bool) -> None:
     """
     Validate SQL query for safety in read-only mode.
-    Raises CustomException if disallowed keywords found.
+    Raises CustomException if disallowed keywords are found.
     """
     if not read_only:
         return
@@ -57,7 +57,7 @@ def _rows_to_dicts(rows: List[Tuple[Any, ...]], columns: List[str]) -> List[Dict
 
 
 # ---------------------------
-# Main Executor
+# Main SQL Executor
 # ---------------------------
 def execute_sql(
     sql: str,
@@ -95,18 +95,30 @@ def execute_sql(
     """
     start = time.time()
     try:
+        # ---------------------------
         # Safety check
+        # ---------------------------
         _validate_sql(sql, read_only)
 
+        # ---------------------------
         # Apply row limit if requested
+        # ---------------------------
         exec_sql = sql
         if limit is not None:
             exec_sql = f"SELECT * FROM ({sql}) AS _sub LIMIT {int(limit)}"
 
+        # ---------------------------
         # Execute via database module
-        rows_or_df, columns, meta = database.execute_query(exec_sql, read_only=read_only, as_dataframe=as_dataframe)
+        # ---------------------------
+        rows_or_df, columns, meta = database.execute_query(
+            exec_sql,
+            read_only=read_only,
+            as_dataframe=as_dataframe
+        )
 
+        # ---------------------------
         # Convert results to list-of-dicts
+        # ---------------------------
         if as_dataframe:
             try:
                 import pandas as pd  # local import
@@ -118,6 +130,7 @@ def execute_sql(
                 logger.info(f"Executed SQL in {time.time() - start:.3f}s (as_dataframe)")
                 return result
             except Exception:
+                # Fallback to list-of-dicts
                 rows_list = _rows_to_dicts(rows_or_df, columns)
                 result = {"rows": rows_list, "columns": list(columns), "meta": meta}
                 logger.info(f"Executed SQL in {time.time() - start:.3f}s (as_dataframe-fallback)")
@@ -125,7 +138,10 @@ def execute_sql(
 
         # Normal path (list of tuples)
         rows_list = _rows_to_dicts(rows_or_df, columns)
-        meta_out = {"rowcount": meta.get("rowcount", len(rows_list)), "runtime": meta.get("runtime", time.time() - start)}
+        meta_out = {
+            "rowcount": meta.get("rowcount", len(rows_list)),
+            "runtime": meta.get("runtime", time.time() - start)
+        }
         logger.info(f"Executed SQL; rows={meta_out['rowcount']} runtime={meta_out['runtime']:.3f}s")
         return {"rows": rows_list, "columns": list(columns), "meta": meta_out}
 

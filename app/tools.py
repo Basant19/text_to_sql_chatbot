@@ -1,6 +1,6 @@
 # app/tools.py
+
 import sys
-import time
 from typing import Any, Dict, List, Optional
 
 from app.logger import get_logger
@@ -11,8 +11,8 @@ logger = get_logger("tools")
 
 class Tools:
     """
-    Thin adapter layer exposing simple functions for Graph nodes.
-    Supports dependency injection of underlying components for easy testing.
+    Thin adapter layer exposing simple functions for Graph nodes or LLM flow.
+    Supports dependency injection of underlying components for easier testing.
     """
 
     def __init__(
@@ -24,8 +24,12 @@ class Tools:
         provider_client: Optional[Any] = None,
         tracer_client: Optional[Any] = None,
     ):
+        """
+        Initialize tools with optional injected dependencies. Defaults will be used if
+        specific components are not provided (DB, SchemaStore, VectorSearch, SQL executor).
+        """
         try:
-            # Lazy config import
+            # Lazy import config if needed
             try:
                 from app import config as _config
             except Exception:
@@ -71,8 +75,7 @@ class Tools:
             else:
                 self._executor = executor
 
-            # -------- Provider / Tracer clients (LLM + Observability) --------
-            # These are optional and used by GenerateNode / LangGraph glue for dependency injection.
+            # -------- Provider / Tracer clients --------
             self._provider_client = provider_client
             self._tracer_client = tracer_client
 
@@ -84,24 +87,20 @@ class Tools:
             logger.exception("Failed to initialize Tools")
             raise CustomException(e, sys)
 
-    # -------- Accessors for injected clients --------
+    # -------- Provider / Tracer accessors --------
     def get_provider_client(self) -> Optional[Any]:
-        """
-        Return the injected provider client (e.g. GeminiClient) or None.
-        """
+        """Return the injected provider client (e.g., GeminiClient) or None."""
         return self._provider_client
 
     def get_tracer_client(self) -> Optional[Any]:
-        """
-        Return the injected tracer client (e.g. LangSmithClient) or None.
-        """
+        """Return the injected tracer client (e.g., LangSmithClient) or None."""
         return self._tracer_client
 
     # -------- Database adapters --------
     def load_table(self, csv_path: str, table_name: str, force_reload: bool = False) -> None:
         try:
             if not hasattr(self._db, "load_csv_table"):
-                raise CustomException("database backend does not implement load_csv_table", sys)
+                raise CustomException("Database backend does not implement load_csv_table", sys)
             self._db.load_csv_table(csv_path, table_name, force_reload=force_reload)
             logger.info(f"Tools: loaded table {table_name} from {csv_path}")
         except CustomException:
@@ -113,7 +112,7 @@ class Tools:
     def list_tables(self) -> List[str]:
         try:
             if not hasattr(self._db, "list_tables"):
-                raise CustomException("database backend does not implement list_tables", sys)
+                raise CustomException("Database backend does not implement list_tables", sys)
             return self._db.list_tables()
         except CustomException:
             raise
@@ -149,9 +148,9 @@ class Tools:
     def search_vectors(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         try:
             if self._vector_search is None:
-                raise CustomException("vector_search backend is not configured", sys)
+                raise CustomException("VectorSearch backend is not configured", sys)
             if not hasattr(self._vector_search, "search"):
-                raise CustomException("vector_search backend does not implement search()", sys)
+                raise CustomException("VectorSearch backend does not implement search()", sys)
             return self._vector_search.search(query, top_k=top_k)
         except CustomException:
             raise
@@ -169,14 +168,14 @@ class Tools:
     ) -> Dict[str, Any]:
         try:
             if self._executor is None:
-                raise CustomException("executor backend is not configured", sys)
+                raise CustomException("Executor backend is not configured", sys)
 
             if hasattr(self._executor, "execute_sql"):
                 return self._executor.execute_sql(sql, read_only=read_only, limit=limit, as_dataframe=as_dataframe)
             elif callable(self._executor):
                 return self._executor(sql, read_only=read_only, limit=limit, as_dataframe=as_dataframe)
             else:
-                raise CustomException("executor does not implement execute_sql", sys)
+                raise CustomException("Executor does not implement execute_sql", sys)
         except CustomException:
             raise
         except Exception as e:

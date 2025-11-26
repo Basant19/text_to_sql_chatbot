@@ -1,4 +1,4 @@
-# app.py (relevant parts)
+# app.py
 import streamlit as st
 import os
 from typing import List, Dict, Any
@@ -13,32 +13,33 @@ import app.config as config_module
 
 logger = get_logger("app")
 
-# Initialize components
+# ---------------------------
+# Initialize core components
+# ---------------------------
 config = config_module
 csv_loader = CSVLoader()
 schema_store = SchemaStore()
 vector_search = VectorSearch()
 
-# Build the default agent graph
+# Build the default agent graph (LangGraph)
 try:
     graph = GraphBuilder.build_default()
 except Exception as e:
-    logger.exception("Failed to build default GraphBuilder. Ensure graph nodes are implemented.")
+    logger.exception("Failed to build default GraphBuilder. Check node implementations.")
     graph = None
 
-# Initialize persistent history store (choose backend via config if you want)
-# By default this uses JSON file under data/history.json; pass backend="sqlite" to use sqlite.
+# Persistent history store (JSON by default, SQLite optional)
 history_store = HistoryStore(backend=getattr(config, "HISTORY_BACKEND", "json"))
 
-# Initialize Streamlit session state for chat history (in-memory view)
+# Streamlit session state for chat history
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  # each item: { "id", "name", "query", "result" }
+    st.session_state.chat_history = []
 
 st.set_page_config(page_title="Text-to-SQL Bot", layout="wide")
 st.title("📊 Text-to-SQL Bot")
 
 # ---------------------------
-# Sidebar - CSV Management
+# Sidebar: CSV Management
 # ---------------------------
 st.sidebar.header("CSV Management")
 
@@ -51,7 +52,7 @@ if uploaded_files:
         try:
             saved_path = csv_loader.save_csv(file)
             st.sidebar.success(f"Uploaded {file.name}")
-            logger.info(f"Saved upload {file.name} -> {saved_path}")
+            logger.info(f"Saved {file.name} -> {saved_path}")
         except Exception as e:
             st.sidebar.error(f"Failed to save {file.name}: {e}")
             logger.exception("CSV upload failed")
@@ -68,7 +69,6 @@ selected_csvs = st.sidebar.multiselect(
 )
 
 load_button = st.sidebar.button("Load Selected CSVs")
-
 if load_button and selected_csvs:
     try:
         schemas = csv_loader.load_and_extract(selected_csvs)
@@ -76,36 +76,37 @@ if load_button and selected_csvs:
             path = meta.get("path")
             name = meta.get("table_name") or os.path.basename(path)
             schema_store.add_csv(path, csv_name=name)
+
+        # Index schemas for vector search (RAG)
         if hasattr(vector_search, "index_schemas"):
             try:
                 vector_search.index_schemas(schemas)
             except Exception:
                 logger.exception("vector_search.index_schemas failed; continuing")
+
         st.sidebar.success("Schemas loaded and vector index updated!")
     except Exception as e:
         st.sidebar.error(f"Failed to load selected CSVs: {e}")
         logger.exception("Load selected CSVs failed")
 
 # ---------------------------
-# Main area - Query input
+# Main area: Query input
 # ---------------------------
 st.header("Ask a Question in Natural Language")
 user_query = st.text_area("Enter your question here:", height=120)
-
 default_name = f"Query {len(st.session_state.chat_history) + 1}"
 query_name = st.text_input("Optional: Give this query a name", value=default_name)
-
 run_query = st.checkbox("Execute SQL if valid?", value=True)
 execute_button = st.button("Run Query")
 
 # ---------------------------
-# Execute / generate SQL
+# Execute / Generate SQL
 # ---------------------------
 if execute_button and user_query:
     if not selected_csvs:
-        st.error("Please select at least one CSV in the sidebar to provide context.")
+        st.error("Select at least one CSV in the sidebar for context.")
     elif graph is None:
-        st.error("Agent pipeline is not available. Check server logs for details.")
+        st.error("Agent pipeline unavailable. Check server logs.")
     else:
         with st.spinner("Generating SQL..."):
             try:
@@ -115,21 +116,19 @@ if execute_button and user_query:
                 logger.exception("Agent run failed")
                 result = {"error": str(e)}
 
-        # persist to history store and also keep in session state
+        # Persist to history store + session
         try:
             entry = history_store.add_entry(name=query_name, query=user_query, result=result)
-            # store id so we can update/delete later
             st.session_state.chat_history.append({
-                "id": entry["id"],
-                "name": entry["name"],
-                "query": entry["query"],
-                "result": entry["result"],
+                "id": entry.get("id"),
+                "name": entry.get("name"),
+                "query": entry.get("query"),
+                "result": entry.get("result"),
                 "created_at": entry.get("created_at"),
                 "updated_at": entry.get("updated_at"),
             })
         except Exception:
-            # if persistence fails, still keep in session memory (without id)
-            logger.exception("Failed to persist history entry; falling back to session-only storage")
+            logger.exception("Failed to persist history entry; using session-only storage")
             st.session_state.chat_history.append({
                 "id": None,
                 "name": query_name,
@@ -138,12 +137,10 @@ if execute_button and user_query:
             })
 
 # ---------------------------
-# Chat history management UI
+# Chat History UI
 # ---------------------------
 if st.session_state.chat_history:
     st.subheader("💬 Query History")
-
-    # controls
     col_a, col_b, col_c = st.columns([1, 1, 2])
     with col_a:
         if st.button("Clear History (memory only)"):
@@ -156,30 +153,23 @@ if st.session_state.chat_history:
                 st.success(f"Exported history to {path}")
             except Exception:
                 st.exception("Failed to export history")
-
     with col_c:
         st.info(f"{len(st.session_state.chat_history)} queries stored in this session")
 
-    # show newest first (reversed)
     for display_idx, chat in enumerate(reversed(st.session_state.chat_history)):
         real_index = len(st.session_state.chat_history) - 1 - display_idx
         disp_name = chat.get("name", f"Query {display_idx+1}")
         expander_key = f"expander_{real_index}"
 
         with st.expander(f"{disp_name}", expanded=False, key=expander_key):
-            # rename input (stable key uses real_index)
             rename_key = f"rename_{real_index}"
             new_name = st.text_input("Rename query", value=disp_name, key=rename_key)
             if new_name and new_name != disp_name:
-                # update session-state immediately
                 st.session_state.chat_history[real_index]["name"] = new_name
-
-                # if persisted id present, update persistent store as well
                 entry_id = st.session_state.chat_history[real_index].get("id")
                 if entry_id:
                     try:
                         updated = history_store.update_entry(entry_id, name=new_name)
-                        # optionally sync updated metadata
                         if updated:
                             st.session_state.chat_history[real_index].update({
                                 "updated_at": updated.get("updated_at")
@@ -222,7 +212,6 @@ if st.session_state.chat_history:
                 with st.expander("Execution Timings"):
                     st.json(res["timings"])
 
-            # delete entry (persisted + session)
             if st.button("Delete entry (persisted + session)", key=f"del_{real_index}"):
                 entry_id = st.session_state.chat_history[real_index].get("id")
                 if entry_id:
@@ -233,6 +222,8 @@ if st.session_state.chat_history:
                 st.session_state.chat_history.pop(real_index)
                 st.experimental_rerun()
 
-# Footer
+# ---------------------------
+# Sidebar Footer
+# ---------------------------
 st.sidebar.markdown("---")
 st.sidebar.markdown("Developed by Text-to-SQL Bot Team")

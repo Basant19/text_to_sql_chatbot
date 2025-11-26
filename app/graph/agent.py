@@ -3,6 +3,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from app import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,21 +28,16 @@ class Agent:
         last_output = None
 
         for name, node in self.nodes.items():
-            logger.debug(f"Agent: Executing node '{name}'")
+            logger.debug("Agent: Executing node '%s'", name)
             if not hasattr(node, "run"):
                 raise AttributeError(f"Node '{name}' does not implement run()")
             try:
                 output = node.run(current_data)
             except Exception as exc:
-                logger.exception(f"Error in node '{name}'")
+                logger.exception("Error in node '%s'", name)
                 output = {"error": str(exc)}
 
-            context["steps"].append({
-                "node": name,
-                "input": current_data,
-                "output": output
-            })
-
+            context["steps"].append({"node": name, "input": current_data, "output": output})
             last_output = output
 
             # Normalize what to pass next
@@ -80,16 +77,21 @@ class LangGraphAgent:
         provider_client: Optional[Any] = None,
         langsmith_client: Optional[Any] = None,
     ):
-        self.schema_map = schema_map
+        self.schema_map = schema_map or {}
         self.retrieved_docs = retrieved_docs or []
         self.few_shot = few_shot or []
         self.provider_client = provider_client
         self.langsmith_client = langsmith_client
 
+        # Default model from config
+        self.default_model = getattr(config, "GEMINI_MODEL", "gemini-2.5-flash")
+        # Safety guard: disallow LangSmith for generation unless explicitly enabled
+        self.allow_langsmith_gen = getattr(config, "USE_LANGSMITH_FOR_GEN", False)
+
     def _build_prompt(self, user_query: str) -> str:
         """
-        Build a plain prompt used to ask the LLM. In your real code this should
-        call the prompt_node/prompt builder to create a nicely formatted prompt.
+        Build a plain prompt used to ask the LLM. In production code, replace this with a
+        proper PromptNode/prompt builder that formats schema, retrieved docs, and few-shot examples.
         """
         prompt_parts = [
             "-- USER QUERY --",
@@ -125,7 +127,7 @@ class LangGraphAgent:
                 first = outputs[0]
                 if isinstance(first, dict) and "text" in first:
                     return str(first["text"]).strip()
-            # fallback: stringify
+            # fallback: try to stringify but keep it short
             try:
                 return str(raw)
             except Exception:
@@ -136,10 +138,17 @@ class LangGraphAgent:
     def run(self, user_query: str):
         """
         Simulates SQL generation via LangGraph flow.
-        Prefer provider_client.generate() (Gemini) for generation.
-        Falls back to langsmith_client.generate() only if provider missing.
-        Uses langsmith_client.trace_run() (if provided) to record observability metadata.
 
+        Preferred path:
+          - provider_client.generate(prompt, model, max_tokens)
+
+        Fallback path:
+          - If provider_client missing AND USE_LANGSMITH_FOR_GEN=true, use langsmith_client.generate()
+          - Otherwise return a safe dummy SQL
+
+        Observability:
+          - Calls langsmith_client.trace_run() at start and completion if available.
+          - Does NOT call langsmith_client.generate() unless USE_LANGSMITH_FOR_GEN is true.
         Returns:
             sql (str), prompt_text (str), raw_response (dict or other)
         """
@@ -152,11 +161,7 @@ class LangGraphAgent:
             "few_shot": len(self.few_shot),
         }
 
-        # Try provider_client first (preferred path)
-        raw_response = None
-        sql = ""
-
-        # If langsmith_client is present, record a pre-run trace (start)
+        # Pre-run trace
         if self.langsmith_client and hasattr(self.langsmith_client, "trace_run"):
             try:
                 self.langsmith_client.trace_run(
@@ -168,36 +173,43 @@ class LangGraphAgent:
             except Exception:
                 logger.exception("LangSmith trace_run (start) failed; continuing")
 
-        # Attempt generation with provider_client
-        provider_used = None
+        raw_response = None
+        sql = ""
+        provider_used = "none"
         gen_start = time.time()
         try:
+            # Primary: provider_client.generate
             if self.provider_client and hasattr(self.provider_client, "generate"):
                 provider_used = getattr(self.provider_client, "__class__", type(self.provider_client)).__name__
-                logger.debug(f"LangGraphAgent: generating via provider_client ({provider_used})")
-                raw_response = self.provider_client.generate(prompt_text, model="gemini-1.5-flash", max_tokens=512)
-            elif self.langsmith_client and hasattr(self.langsmith_client, "generate"):
-                provider_used = "LangSmith (fallback)"
-                logger.debug("LangGraphAgent: provider_client missing, using LangSmith.generate() as fallback")
-                raw_response = self.langsmith_client.generate(prompt_text, model="gemini-1.5-flash", max_tokens=512)
+                logger.debug("LangGraphAgent: generating via provider_client (%s)", provider_used)
+                raw_response = self.provider_client.generate(prompt_text, model=self.default_model, max_tokens=512)
             else:
-                # No provider available: produce a dummy safe SQL response
-                provider_used = "none"
-                raw_response = {"text": "SELECT * FROM dummy LIMIT 10;"}
-                logger.warning("LangGraphAgent: no provider available, returning dummy SQL")
-        except Exception as e:
-            gen_err = e
-            logger.exception("Generation call failed in LangGraphAgent")
-            # Try to capture fallback to LangSmith if not already used
-            if provider_used != "LangSmith (fallback)" and self.langsmith_client and hasattr(self.langsmith_client, "generate"):
-                try:
-                    raw_response = self.langsmith_client.generate(prompt_text, model="gemini-1.5-flash", max_tokens=512)
+                # provider_client missing: consider LangSmith only if operator explicitly allowed it
+                if self.langsmith_client and self.allow_langsmith_gen and hasattr(self.langsmith_client, "generate"):
+                    provider_used = "LangSmith (opt-in)"
+                    logger.warning("LangGraphAgent: provider_client missing, using LangSmith.generate() because USE_LANGSMITH_FOR_GEN=true")
+                    raw_response = self.langsmith_client.generate(prompt_text, model=self.default_model, max_tokens=512)
+                else:
+                    # No provider available: safe fallback
+                    provider_used = "none"
+                    raw_response = {"text": "SELECT * FROM dummy LIMIT 10;"}
+                    logger.warning("LangGraphAgent: no provider available, returning dummy SQL")
+
+        except Exception as gen_exc:
+            logger.exception("Generation call failed in LangGraphAgent: %s", gen_exc)
+
+            # Attempt fallback to LangSmith only if not already used and operator allowed it
+            try:
+                if provider_used != "LangSmith (opt-in)" and self.langsmith_client and self.allow_langsmith_gen and hasattr(self.langsmith_client, "generate"):
+                    logger.warning("LangGraphAgent: attempting LangSmith.generate() fallback due to error")
+                    raw_response = self.langsmith_client.generate(prompt_text, model=self.default_model, max_tokens=512)
                     provider_used = "LangSmith (fallback-after-error)"
-                except Exception:
-                    logger.exception("Fallback to LangSmith.generate() also failed")
+                else:
+                    # final safe fallback
                     raw_response = {"text": "SELECT * FROM dummy LIMIT 10;"}
                     provider_used = "none-fallback"
-            else:
+            except Exception:
+                logger.exception("Fallback to LangSmith.generate() also failed; using dummy SQL")
                 raw_response = {"text": "SELECT * FROM dummy LIMIT 10;"}
                 provider_used = "none-fallback"
 
@@ -206,19 +218,20 @@ class LangGraphAgent:
         # Extract SQL text
         sql = self._extract_text(raw_response)
 
-        # Post-run trace with latency and status
+        # Post-run trace
         if self.langsmith_client and hasattr(self.langsmith_client, "trace_run"):
             try:
                 meta = {
                     **trace_metadata_base,
                     "provider": provider_used,
                     "gen_time_s": gen_time,
-                    "success": True if sql else False,
+                    "success": bool(sql),
                 }
-                # include error info when generation failed
                 if not sql:
                     meta["error"] = "empty_response"
-                self.langsmith_client.trace_run(name="langgraph.generate.complete", prompt=prompt_text, sql=sql or None, metadata=meta)
+                self.langsmith_client.trace_run(
+                    name="langgraph.generate.complete", prompt=prompt_text, sql=sql or None, metadata=meta
+                )
             except Exception:
                 logger.exception("LangSmith trace_run (complete) failed; ignoring")
 

@@ -10,70 +10,107 @@ from app.exception import CustomException
 # Initialize logger for config
 logger = get_logger("config")
 
-# Load .env
+# Load .env (best-effort)
 try:
     load_dotenv()
-    logger.info("Loaded environment variables from .env file")
+    logger.info("Loaded environment variables from .env file (if present)")
 except Exception as e:
-    # If dotenv fails, still allow process to continue; raise only when required keys are missing later
+    # dotenv failing is non-fatal here; we validate required keys below when needed.
     logger.warning("Could not load .env file (or none present): %s", e)
 
-# Module-level defaults (also useful if other modules import these directly)
+
+# -----------------------
+# Module-level defaults
+# -----------------------
+
 # GEMINI_API_KEY supports both GEMINI_API_KEY and GOOGLE_API_KEY envvars (backwards compat)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-GEMINI_ENDPOINT = os.environ.get("GEMINI_ENDPOINT", "")  # optional; SDK may not need it
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5")
 
-# LangSmith (observability/tracing) - optional for runtime (not required for generation)
-LANGSMITH_API_KEY = os.environ.get("LANGSMITH_API_KEY")  # optional (tracing only)
+# Optional endpoint override (most SDKs won't require this)
+GEMINI_ENDPOINT = os.environ.get("GEMINI_ENDPOINT", "")
+
+# Default Gemini model (configurable via .env)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+# LangSmith (observability/tracing) - optional for runtime (not required for generation by default)
+LANGSMITH_API_KEY = os.environ.get("LANGSMITH_API_KEY")
 LANGSMITH_TRACING = os.environ.get("LANGSMITH_TRACING", "false").lower() == "true"
 LANGSMITH_ENDPOINT = os.environ.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 LANGSMITH_PROJECT = os.environ.get("LANGSMITH_PROJECT", "default-project")
 
-# Other app configs
+# Safety guard: prevent accidental use of LangSmith for generation unless explicit opt-in
+USE_LANGSMITH_FOR_GEN = os.environ.get("USE_LANGSMITH_FOR_GEN", "false").lower() == "true"
+
+# Storage / app paths
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "./data/text_to_sql.db")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
 VECTOR_INDEX_PATH = os.environ.get("VECTOR_INDEX_PATH", "./faiss/index.faiss")
 HISTORY_BACKEND = os.environ.get("HISTORY_BACKEND", "json")  # used by app.py
 
-# LangGraph / agent related flag
+# LangGraph toggle
 LANGGRAPH_ENABLED = os.environ.get("LANGGRAPH_ENABLED", "false").lower() == "true"
+
+# Vector chunking defaults (configurable)
+VECTOR_CHUNK_SIZE = int(os.environ.get("VECTOR_CHUNK_SIZE", 1000))
+VECTOR_CHUNK_OVERLAP = int(os.environ.get("VECTOR_CHUNK_OVERLAP", 200))
 
 
 class Config:
     """
     Encapsulate configuration and ensure required environment variables and directories.
-    Instantiate with `cfg = Config()` (app.py already expects this pattern).
 
-    Notes:
-      - GEMINI_API_KEY (or GOOGLE_API_KEY) is treated as required by default (generation).
-      - LANGSMITH_API_KEY is optional since we only use LangSmith for tracing/observability.
-      - Pass require_keys=False to skip the required-key check (useful in some tests).
+    Usage:
+        cfg = Config()          # validate required keys (default)
+        cfg = Config(False)     # skip required-key check (useful for some tests)
+
+    Validation logic:
+      - By default (require_keys=True) we *require* GEMINI_API_KEY or GOOGLE_API_KEY.
+      - If USE_LANGSMITH_FOR_GEN=true then generation via LangSmith is explicitly opted-in,
+        and LANGSMITH_API_KEY must be present for generation to work. This is allowed but
+        discouraged unless you explicitly want LangSmith as a provider.
+      - LANGSMITH_API_KEY is otherwise optional (used only for tracing).
     """
 
     def __init__(self, require_keys: Optional[bool] = True):
-        # required keys
+        # Validate required keys based on policy and opt-in flags.
         if require_keys:
-            try:
-                # Require a Gemini/Google API key for generation.
-                # Accept either GEMINI_API_KEY or GOOGLE_API_KEY for backward compatibility.
-                if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-                    raise KeyError("GEMINI_API_KEY / GOOGLE_API_KEY")
+            # Primary expected path: Gemini (or GOOGLE_API_KEY)
+            gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            use_langsmith_for_gen = os.environ.get("USE_LANGSMITH_FOR_GEN", str(USE_LANGSMITH_FOR_GEN)).lower() == "true"
+            langsmith_key = os.environ.get("LANGSMITH_API_KEY")
 
-                # Do NOT raise if LANGSMITH_API_KEY is missing. LangSmith is optional for tracing.
-                # If you want to require LangSmith in some deployments, set require_keys=True and check explicitly.
-            except KeyError as e:
-                raise CustomException(f"Missing required environment variable: {str(e)}")
+            if not gemini_key:
+                # If user explicitly opted to use LangSmith for generation, allow it only if LANGSMITH_API_KEY exists.
+                if use_langsmith_for_gen:
+                    if not langsmith_key:
+                        raise CustomException(
+                            "USE_LANGSMITH_FOR_GEN=true but LANGSMITH_API_KEY is missing. "
+                            "Provide LANGSMITH_API_KEY or set USE_LANGSMITH_FOR_GEN=false and provide GEMINI_API_KEY/GOOGLE_API_KEY."
+                        )
+                    else:
+                        # Allowed: LangSmith gen opt-in with key present (explicit opt-in)
+                        logger.warning(
+                            "No GEMINI_API_KEY/GOOGLE_API_KEY found; USE_LANGSMITH_FOR_GEN is true and LANGSMITH_API_KEY is present. "
+                            "This means LangSmith will be used for generation — ensure this is intentional."
+                        )
+                else:
+                    # Default safe behavior: require Gemini/Google API key
+                    raise CustomException(
+                        "Missing required environment variable: GEMINI_API_KEY or GOOGLE_API_KEY. "
+                        "Set GEMINI_API_KEY (or set GOOGLE_API_KEY) for generation."
+                    )
 
-        # optional / defaults (expose both module-level and instance-level)
+        # Populate instance attributes from environment (fall back to module-level defaults)
         self.GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         self.GEMINI_ENDPOINT = os.environ.get("GEMINI_ENDPOINT", GEMINI_ENDPOINT)
         self.GEMINI_MODEL = os.environ.get("GEMINI_MODEL", GEMINI_MODEL)
 
         self.LANGSMITH_API_KEY = os.environ.get("LANGSMITH_API_KEY", LANGSMITH_API_KEY)
-        self.LANGSMITH_TRACING = os.environ.get("LANGSMITH_TRACING", "false").lower() == "true"
+        self.LANGSMITH_TRACING = os.environ.get("LANGSMITH_TRACING", str(LANGSMITH_TRACING)).lower() == "true"
         self.LANGSMITH_ENDPOINT = os.environ.get("LANGSMITH_ENDPOINT", LANGSMITH_ENDPOINT)
         self.LANGSMITH_PROJECT = os.environ.get("LANGSMITH_PROJECT", LANGSMITH_PROJECT)
+
+        self.USE_LANGSMITH_FOR_GEN = os.environ.get("USE_LANGSMITH_FOR_GEN", str(USE_LANGSMITH_FOR_GEN)).lower() == "true"
 
         self.DATABASE_PATH = os.environ.get("DATABASE_PATH", DATABASE_PATH)
         self.UPLOAD_DIR = os.environ.get("UPLOAD_DIR", UPLOAD_DIR)
@@ -82,24 +119,44 @@ class Config:
 
         self.LANGGRAPH_ENABLED = os.environ.get("LANGGRAPH_ENABLED", str(LANGGRAPH_ENABLED)).lower() == "true"
 
-        # derived paths
+        # Vector chunking
+        try:
+            self.VECTOR_CHUNK_SIZE = int(os.environ.get("VECTOR_CHUNK_SIZE", VECTOR_CHUNK_SIZE))
+        except Exception:
+            logger.warning("Invalid VECTOR_CHUNK_SIZE, falling back to default %s", VECTOR_CHUNK_SIZE)
+            self.VECTOR_CHUNK_SIZE = VECTOR_CHUNK_SIZE
+
+        try:
+            self.VECTOR_CHUNK_OVERLAP = int(os.environ.get("VECTOR_CHUNK_OVERLAP", VECTOR_CHUNK_OVERLAP))
+        except Exception:
+            logger.warning("Invalid VECTOR_CHUNK_OVERLAP, falling back to default %s", VECTOR_CHUNK_OVERLAP)
+            self.VECTOR_CHUNK_OVERLAP = VECTOR_CHUNK_OVERLAP
+
+        # Derived directories
         self.DATABASE_DIR = str(Path(self.DATABASE_PATH).parent) if self.DATABASE_PATH else ""
         self.VECTOR_INDEX_DIR = str(Path(self.VECTOR_INDEX_PATH).parent) if self.VECTOR_INDEX_PATH else ""
 
-        # ensure directories exist, but guard against empty strings
+        # Ensure important directories exist (best-effort). Skip empty strings.
         for dir_path in [self.DATABASE_DIR, self.UPLOAD_DIR, self.VECTOR_INDEX_DIR, LOGS_DIR]:
             if not dir_path:
-                # if path is empty (e.g., database path in current dir), skip creating ''
                 continue
             try:
                 Path(dir_path).mkdir(parents=True, exist_ok=True)
-                logger.info(f"Ensured directory exists: {dir_path}")
+                logger.info("Ensured directory exists: %s", dir_path)
             except Exception as e:
-                logger.exception(f"Failed to ensure directory {dir_path}: {e}")
-                raise CustomException(e)
+                logger.exception("Failed to ensure directory %s: %s", dir_path, e)
+                # Directory creation failures are likely environmental; raise a clear exception
+                raise CustomException(f"Failed to create directory {dir_path}: {e}")
 
-        logger.info("Configuration (Config) initialized successfully")
+        # Log current high-level configuration (do not print secrets)
+        logger.info(
+            "Config initialized: GEMINI_MODEL=%s, LANGGRAPH_ENABLED=%s, LANGSMITH_TRACING=%s, USE_LANGSMITH_FOR_GEN=%s",
+            self.GEMINI_MODEL,
+            self.LANGGRAPH_ENABLED,
+            self.LANGSMITH_TRACING,
+            self.USE_LANGSMITH_FOR_GEN,
+        )
 
-    # convenience: allow attribute-style access for keys
+    # convenience accessor
     def get(self, name: str, default=None):
         return getattr(self, name, default)

@@ -1,4 +1,5 @@
 # app/graph/nodes/error_node.py
+
 import sys
 import traceback
 from typing import Any, Dict, Optional
@@ -15,7 +16,8 @@ class ErrorNode:
 
     Usage:
         node = ErrorNode()
-        payload = node.run(exc, step="generate", context={"user_query": "..."})
+        payload = node.run(exc, step="generate", context={"user_query": "..."}).
+
     Returns:
         {
             "ok": False,
@@ -28,57 +30,72 @@ class ErrorNode:
 
     def __init__(self):
         try:
-            # nothing special to init for now
-            pass
+            logger.info("ErrorNode initialized")
         except Exception as e:
             logger.exception("Failed to initialize ErrorNode")
             raise CustomException(e, sys)
 
-    def run(self, exc: Exception, step: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def run(
+        self,
+        exc: Exception,
+        step: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Normalize the exception and return a dictionary suitable for UI/telemetry.
 
-        :param exc: Exception instance (or anything convertible to str)
-        :param step: optional step identifier in which the exception happened
-        :param context: optional context dict (will not be deeply serialized here)
-        :return: normalized error dict
+        Parameters
+        ----------
+        exc : Exception
+            Exception instance (or anything convertible to str)
+        step : Optional[str]
+            Identifier for the step where the exception occurred
+        context : Optional[Dict[str, Any]]
+            Additional context information (not deeply serialized)
+
+        Returns
+        -------
+        Dict[str, Any]
+            Standardized error payload
         """
         try:
-            # Build short message and details
+            # Short message
             short_msg = str(exc) or exc.__class__.__name__
-            # If CustomException wraps details differently, attempt to pull meaningful info
+
+            # Details: extract human-friendly message if CustomException
             if isinstance(exc, CustomException):
-                # CustomException in this project expects its message to be human-friendly
                 details = getattr(exc, "error_message", None) or short_msg
             else:
                 details = repr(exc)
 
-            # Build stack trace
-            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if isinstance(exc, BaseException) else None
+            # Stack trace
+            trace_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) \
+                if isinstance(exc, BaseException) else None
 
             payload = {
                 "ok": False,
                 "error": short_msg,
                 "details": details,
                 "step": step,
-                "trace": tb,
+                "trace": trace_str,
             }
 
-            # Log with traceback for visibility
-            if tb:
-                logger.error("ErrorNode caught exception at step=%s: %s\n%s", step, short_msg, tb)
+            # Log for observability
+            if trace_str:
+                logger.error("ErrorNode caught exception at step=%s: %s\n%s", step, short_msg, trace_str)
             else:
                 logger.error("ErrorNode caught exception at step=%s: %s", step, short_msg)
 
             return payload
+
         except Exception as e:
-            # Failsafe: if error normalization itself fails, return a minimal payload
-            tb2 = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-            logger.exception("ErrorNode failed while formatting exception: %s", tb2)
+            # Failsafe: if normalization itself fails
+            fallback_trace = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            logger.exception("ErrorNode failed while formatting exception: %s", fallback_trace)
             return {
                 "ok": False,
                 "error": "ErrorNode failed to normalize exception",
                 "details": repr(e),
                 "step": step,
-                "trace": tb2,
+                "trace": fallback_trace,
             }

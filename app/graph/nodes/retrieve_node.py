@@ -1,10 +1,11 @@
 # app/graph/nodes/retrieve_node.py
+
 import sys
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
-from app import vector_search as vector_search_module
+from app.tools import Tools
 
 logger = get_logger("retrieve_node")
 
@@ -13,32 +14,18 @@ class RetrieveNode:
     """
     Node that performs RAG retrieval using VectorSearch.
 
-    Parameters
-    ----------
-    vs_instance : Optional[vector_search_module.VectorSearch]
-        If provided, the node will use this instance (useful for tests). Otherwise
-        a default VectorSearch() will be created on first run.
+    Accepts an optional Tools instance for dependency injection:
+        - vector search (Google embeddings + FAISS)
     """
 
-    def __init__(self, vs_instance: Optional[vector_search_module.VectorSearch] = None):
+    def __init__(self, tools: Optional[Tools] = None):
         try:
-            self._vs = vs_instance
-            self._vs_factory: Callable[[], vector_search_module.VectorSearch] = (
-                lambda: vector_search_module.VectorSearch()
-            )
+            self._tools = tools or Tools()
+            if not hasattr(self._tools, "_vector_search") or self._tools._vector_search is None:
+                logger.warning("RetrieveNode: Tools instance has no VectorSearch; retrieval may fail.")
         except Exception as e:
             logger.exception("Failed to initialize RetrieveNode")
             raise CustomException(e, sys)
-
-    def _get_vs(self) -> vector_search_module.VectorSearch:
-        """Return the VectorSearch instance, creating it if necessary."""
-        if self._vs is None:
-            try:
-                self._vs = self._vs_factory()
-            except Exception as e:
-                logger.exception("Failed to create VectorSearch instance")
-                raise CustomException(e, sys)
-        return self._vs
 
     def run(
         self,
@@ -65,9 +52,12 @@ class RetrieveNode:
             [{"id": ..., "score": ..., "text": ..., "meta": {...}}, ...]
         """
         try:
-            vs = self._get_vs()
-            results = vs.search(query, top_k=top_k) or []
+            if not hasattr(self._tools, "search_vectors"):
+                raise CustomException("Tools instance does not implement search_vectors", sys)
+
+            results = self._tools.search_vectors(query, top_k=top_k) or []
             if not results:
+                logger.debug("RetrieveNode.run: No results found for query.")
                 return []
 
             # No filtering requested
@@ -75,11 +65,11 @@ class RetrieveNode:
                 return results
 
             # Filter results based on CSV/table name or metadata source/path
-            filtered = []
             csv_names_lower = [name.lower() for name in csv_names if name]
+            filtered = []
 
             for doc in results:
-                meta = doc.get("meta") or {}
+                meta = doc.get("meta", {}) or {}
                 meta_identifiers = [
                     str(meta.get("path", "") or ""),
                     str(meta.get("source", "") or ""),
@@ -87,12 +77,15 @@ class RetrieveNode:
                 ]
                 meta_identifiers_lower = [m.lower() for m in meta_identifiers]
 
-                if any(csv_name in m or csv_name == meta.get("table_name", "").lower() 
-                       for csv_name in csv_names_lower for m in meta_identifiers_lower):
+                if any(csv_name in m for csv_name in csv_names_lower for m in meta_identifiers_lower):
                     filtered.append(doc)
 
             # Fallback to original results if filtering yields nothing
-            return filtered if filtered else results
+            if not filtered:
+                logger.debug("RetrieveNode.run: Filtering yielded no matches; returning all results.")
+                return results
+
+            return filtered
 
         except CustomException:
             raise

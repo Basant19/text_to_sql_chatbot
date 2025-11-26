@@ -1,4 +1,4 @@
-# D:\text_to_sql_bot\app\csv_loader.py
+# app/csv_loader.py
 import os
 import io
 import csv
@@ -13,7 +13,11 @@ logger = get_logger("csv_loader")
 
 
 def _sanitize_filename(name: str) -> str:
-    """Make a filename safe: replace spaces and remove troublesome chars."""
+    """
+    Make a filename safe by replacing unsafe characters.
+    Keeps alphanumeric, space, dot, underscore, and dash.
+    Converts spaces to underscores.
+    """
     keepchars = (" ", ".", "_", "-")
     safe = "".join(c if c.isalnum() or c in keepchars else "_" for c in name)
     safe = safe.replace(" ", "_")
@@ -21,7 +25,10 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _unique_path(dest_dir: str, filename: str) -> str:
-    """Ensure filename is unique in destination directory."""
+    """
+    Ensure a filename is unique in the destination directory.
+    Appends a UUID if file exists.
+    """
     base, ext = os.path.splitext(filename)
     candidate = os.path.join(dest_dir, filename)
     if not os.path.exists(candidate):
@@ -31,7 +38,11 @@ def _unique_path(dest_dir: str, filename: str) -> str:
 
 
 def save_uploaded_csv(fileobj: Union[bytes, TextIO, io.StringIO, io.BytesIO], filename: str) -> str:
-    """Save uploaded CSV to disk safely."""
+    """
+    Save an uploaded CSV to disk safely.
+    Supports bytes, file-like objects, and StringIO/BytesIO.
+    Returns the final path of the saved file.
+    """
     try:
         upload_dir = getattr(config, "UPLOAD_DIR", os.path.join(os.getcwd(), "uploads"))
         os.makedirs(upload_dir, exist_ok=True)
@@ -62,7 +73,10 @@ def save_uploaded_csv(fileobj: Union[bytes, TextIO, io.StringIO, io.BytesIO], fi
 
 
 def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
-    """Load CSV header, sample rows, and row count."""
+    """
+    Load CSV metadata: columns, sample rows, and total row count.
+    Returns a dict suitable for schema display or ingestion into SchemaStore.
+    """
     try:
         if not os.path.exists(path):
             raise FileNotFoundError(f"CSV file not found: {path}")
@@ -72,6 +86,7 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
             try:
                 header = next(reader)
             except StopIteration:
+                # Empty CSV file
                 return {
                     "table_name": _sanitize_filename(os.path.basename(path)),
                     "path": path,
@@ -103,25 +118,41 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
 
 
 class CSVLoader:
-    """Wrapper class to manage uploaded CSVs."""
+    """
+    Centralized CSV management class.
+    Tracks uploaded files and exposes metadata extraction.
+    """
 
     def __init__(self):
         self.uploaded_files: List[str] = []
 
-    def save_csv(self, file):
-        """Save a file object and store its path."""
-        path = save_uploaded_csv(file, file.name)
-        self.uploaded_files.append(path)
-        return path
+    def save_csv(self, file) -> str:
+        """
+        Save a file object to disk and track its path.
+        Returns the saved file path.
+        """
+        try:
+            path = save_uploaded_csv(file, file.name)
+            self.uploaded_files.append(path)
+            return path
+        except Exception as e:
+            logger.exception("CSVLoader.save_csv failed")
+            raise CustomException(e)
 
     def list_uploaded_csvs(self) -> List[str]:
-        """Return list of saved CSV paths."""
+        """Return the list of saved CSV paths."""
         return self.uploaded_files
 
     def load_and_extract(self, file_paths: List[str]) -> List[Dict[str, Any]]:
-        """Load metadata for multiple CSV files."""
-        schemas = []
+        """
+        Load metadata for multiple CSV files.
+        Returns list of dicts containing columns, samples, and row counts.
+        """
+        schemas: List[Dict[str, Any]] = []
         for path in file_paths:
-            metadata = load_csv_metadata(path)
-            schemas.append(metadata)
+            try:
+                metadata = load_csv_metadata(path)
+                schemas.append(metadata)
+            except Exception as e:
+                logger.warning(f"Skipping CSV {path} due to load failure: {e}")
         return schemas

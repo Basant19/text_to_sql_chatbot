@@ -1,5 +1,4 @@
 # app/database.py
-
 import os
 import sys
 import time
@@ -13,8 +12,11 @@ from app import config
 
 logger = get_logger("database")
 
+# ---------------------------
 # Module-level connection cache
+# ---------------------------
 _conn: Optional[duckdb.DuckDBPyConnection] = None
+
 
 # ---------------------------
 # Connection Management
@@ -26,7 +28,6 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     Returns
     -------
     duckdb.DuckDBPyConnection
-        The DuckDB connection object.
     """
     global _conn
     try:
@@ -44,16 +45,16 @@ def get_connection() -> duckdb.DuckDBPyConnection:
 def close_connection() -> None:
     """
     Close the module-level DuckDB connection if it exists.
-    Useful for cleanup in tests or when shutting down the app.
+    Useful for cleanup in tests or shutdown.
     """
     global _conn
     try:
-        if _conn is not None:
+        if _conn:
             try:
                 _conn.close()
                 logger.info("DuckDB connection closed")
             except Exception as inner:
-                logger.warning(f"Error while closing DuckDB connection: {inner}")
+                logger.warning(f"Error closing DuckDB connection: {inner}")
             finally:
                 _conn = None
     except Exception as e:
@@ -82,23 +83,15 @@ def _is_safe_sql(sql: str, read_only: bool) -> Tuple[bool, Optional[str]]:
     """
     Heuristic check for unsafe SQL queries.
 
-    Parameters
-    ----------
-    sql : str
-        SQL query to check.
-    read_only : bool
-        If True, disallow dangerous keywords.
-
     Returns
     -------
-    Tuple[bool, Optional[str]]
-        (is_safe, offending_keyword_or_none)
+    Tuple[bool, Optional[str]]: (is_safe, offending_keyword_or_none)
     """
     if not read_only:
         return True, None
-    upper = sql.upper()
+    upper_sql = sql.upper()
     for kw in _DISALLOWED_KEYWORDS:
-        if kw in upper:
+        if kw in upper_sql:
             return False, kw
     return True, None
 
@@ -108,21 +101,16 @@ def _is_safe_sql(sql: str, read_only: bool) -> Tuple[bool, Optional[str]]:
 # ---------------------------
 def load_csv_table(path: str, table_name: str, force_reload: bool = False) -> None:
     """
-    Load a CSV file into DuckDB as a table.
+    Load a CSV into DuckDB as a table.
 
     Parameters
     ----------
     path : str
-        Path to the CSV file.
+        Path to CSV file.
     table_name : str
-        Table name to create in DuckDB.
+        DuckDB table name.
     force_reload : bool
-        If True, existing table will be replaced.
-
-    Raises
-    ------
-    CustomException
-        If the CSV cannot be loaded.
+        Replace table if exists.
     """
     try:
         if not os.path.exists(path):
@@ -131,7 +119,7 @@ def load_csv_table(path: str, table_name: str, force_reload: bool = False) -> No
         con = get_connection()
 
         if table_exists(table_name) and not force_reload:
-            logger.info(f"Table {table_name} already exists. Skipping load (force_reload=False).")
+            logger.info(f"Table {table_name} exists. Skipping load (force_reload=False).")
             return
 
         safe_path = path.replace("'", "''")
@@ -147,36 +135,23 @@ def load_csv_table(path: str, table_name: str, force_reload: bool = False) -> No
 # ---------------------------
 # Query Execution
 # ---------------------------
-def execute_query(sql: str, read_only: bool = True, as_dataframe: bool = False) -> Tuple[Any, List[str], Dict[str, Any]]:
+def execute_query(
+    sql: str,
+    read_only: bool = True,
+    as_dataframe: bool = False
+) -> Tuple[Any, List[str], Dict[str, Any]]:
     """
-    Execute a SQL query against DuckDB.
-
-    Parameters
-    ----------
-    sql : str
-        SQL query to execute.
-    read_only : bool
-        If True, disallow unsafe operations.
-    as_dataframe : bool
-        If True and pandas available, return a pandas.DataFrame.
+    Execute a SQL query safely.
 
     Returns
     -------
-    Tuple[Any, List[str], Dict[str, Any]]
-        - result: list of rows or pandas.DataFrame
-        - columns: list of column names
-        - meta: metadata dict (rowcount, runtime)
-
-    Raises
-    ------
-    CustomException
-        On query failure or disallowed SQL.
+    Tuple[result, columns, metadata]
     """
     start = time.time()
     try:
-        safe, bad = _is_safe_sql(sql, read_only)
+        safe, bad_kw = _is_safe_sql(sql, read_only)
         if not safe:
-            msg = f"Disallowed SQL keyword in read-only mode: {bad}"
+            msg = f"Disallowed SQL keyword in read-only mode: {bad_kw}"
             logger.warning(msg)
             raise PermissionError(msg)
 
@@ -184,6 +159,7 @@ def execute_query(sql: str, read_only: bool = True, as_dataframe: bool = False) 
         logger.info(f"Executing SQL (read_only={read_only}): {sql}")
         res = con.execute(sql)
 
+        # Column names
         try:
             columns = [c[0] for c in res.description] if res.description else []
         except Exception:
@@ -207,8 +183,6 @@ def execute_query(sql: str, read_only: bool = True, as_dataframe: bool = False) 
         return rows, columns, meta
     except Exception as e:
         logger.exception("Failed to execute query")
-        if isinstance(e, PermissionError):
-            raise CustomException(e, sys)
         raise CustomException(e, sys)
 
 
@@ -216,18 +190,7 @@ def execute_query(sql: str, read_only: bool = True, as_dataframe: bool = False) 
 # Table Utilities
 # ---------------------------
 def table_exists(table_name: str) -> bool:
-    """
-    Check if a table exists in DuckDB.
-
-    Parameters
-    ----------
-    table_name : str
-
-    Returns
-    -------
-    bool
-        True if table exists, False otherwise.
-    """
+    """Check if a table exists in DuckDB."""
     try:
         con = get_connection()
         tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
@@ -238,14 +201,7 @@ def table_exists(table_name: str) -> bool:
 
 
 def list_tables() -> List[str]:
-    """
-    List all tables in the current DuckDB database.
-
-    Returns
-    -------
-    List[str]
-        List of table names.
-    """
+    """List all tables in DuckDB."""
     try:
         con = get_connection()
         tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]

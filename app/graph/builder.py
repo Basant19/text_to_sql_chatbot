@@ -58,9 +58,12 @@ class GraphBuilder:
         """
         Build a default graph using the project's node implementations.
         (lazy import so module can be imported even if graph isn't used)
-        This attempts to wire a Gemini provider (if available) as the provider_client
-        and a LangSmithClient as tracer_client (if configured). Failures are logged
-        and ignored to preserve test friendliness.
+
+        Wiring rules:
+          - Attempt to instantiate a GeminiClient provider (preferred) if possible.
+          - Instantiate LangSmithClient as tracer only if LANGSMITH_API_KEY is present.
+          - Both provider and tracer instantiation failures are non-fatal; they are logged
+            and the GenerateNode will be constructed with None for those clients (tests can inject mocks).
         """
         try:
             from app.graph.nodes.context_node import ContextNode
@@ -75,43 +78,50 @@ class GraphBuilder:
             logger.exception("Failed to import default nodes")
             raise CustomException(e, sys)
 
-        # Try to instantiate optional provider / tracer clients for GenerateNode
         provider_client = None
         tracer_client = None
-        try:
-            # lazy import of config so we can check keys
-            from app import config  # type: ignore
-        except Exception:
-            config = None
 
-        # Attempt to create a Gemini provider if available (non-fatal)
+        # Avoid forcing config validation here; instantiate config in permissive mode
+        try:
+            from app.config import Config
+
+            cfg = Config(require_keys=False)
+        except Exception:
+            cfg = None
+
+        # Try to create a Gemini provider (preferred) — non-fatal
         try:
             try:
                 from app.gemini_client import GeminiClient  # type: ignore
-                # Prefer explicit API key if available; GeminiClient constructor may accept no args in tests
-                gemini_api_key = getattr(config, "GEMINI_API_KEY", None) if config is not None else None
-                provider_client = GeminiClient(api_key=gemini_api_key) if gemini_api_key is not None else GeminiClient()
-                logger.info("GraphBuilder: GeminiClient provider instantiated for GenerateNode")
+
+                gemini_api_key = getattr(cfg, "GEMINI_API_KEY", None) if cfg is not None else None
+                if gemini_api_key:
+                    provider_client = GeminiClient(api_key=gemini_api_key)
+                else:
+                    # Try to instantiate with no args (use config module-level fallback inside GeminiClient)
+                    provider_client = GeminiClient()
+                logger.info("GraphBuilder: GeminiClient instantiated as provider_client")
             except Exception as e:
                 provider_client = None
-                logger.debug(f"GeminiClient not available or failed to instantiate (will fallback): {e}")
+                logger.debug("GraphBuilder: GeminiClient unavailable or failed to instantiate: %s", e)
         except Exception:
             provider_client = None
 
-        # Attempt to create LangSmith tracer (observability only) if configured
+        # Try to create LangSmith tracer (observability only) — non-fatal
         try:
             try:
                 from app.langsmith_client import LangSmithClient  # type: ignore
-                langsmith_key = getattr(config, "LANGSMITH_API_KEY", None) if config is not None else None
+
+                langsmith_key = getattr(cfg, "LANGSMITH_API_KEY", None) if cfg is not None else None
                 if langsmith_key:
                     tracer_client = LangSmithClient(api_key=langsmith_key)
-                    logger.info("GraphBuilder: LangSmithClient tracer instantiated for GenerateNode")
+                    logger.info("GraphBuilder: LangSmithClient instantiated as tracer_client")
                 else:
                     tracer_client = None
-                    logger.debug("GraphBuilder: LANGSMITH_API_KEY not set; tracer not created")
+                    logger.debug("GraphBuilder: LANGSMITH_API_KEY not set; tracer_client not created")
             except Exception as e:
                 tracer_client = None
-                logger.debug(f"LangSmithClient import/instantiation failed (tracer disabled): {e}")
+                logger.debug("GraphBuilder: LangSmithClient import/instantiation failed (tracer disabled): %s", e)
         except Exception:
             tracer_client = None
 
@@ -211,7 +221,7 @@ class GraphBuilder:
             total = time.time() - start_all
             timings["total"] = total
 
-            logger.info(f"GraphBuilder: run complete valid={result['valid']} total={total:.3f}s")
+            logger.info("GraphBuilder: run complete valid=%s total=%.3fs", result["valid"], total)
             return result
 
         except Exception as e:
