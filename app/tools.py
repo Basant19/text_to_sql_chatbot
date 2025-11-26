@@ -1,7 +1,7 @@
 # app/tools.py
 
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable, Union
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -13,6 +13,11 @@ class Tools:
     """
     Thin adapter layer exposing simple functions for Graph nodes or LLM flow.
     Supports dependency injection of underlying components for easier testing.
+
+    Important: provides a safe embedding_fn wrapper (accepts str or List[str])
+    which is passed into VectorSearch when the default VectorSearch is created.
+    This prevents errors where VectorSearch calls embedding_fn with a list but
+    the embedding function only handled single strings.
     """
 
     def __init__(
@@ -24,12 +29,8 @@ class Tools:
         provider_client: Optional[Any] = None,
         tracer_client: Optional[Any] = None,
     ):
-        """
-        Initialize tools with optional injected dependencies. Defaults will be used if
-        specific components are not provided (DB, SchemaStore, VectorSearch, SQL executor).
-        """
         try:
-            # Lazy import config if needed
+            # Lazy-import config (optional)
             try:
                 from app import config as _config
             except Exception:
@@ -49,17 +50,75 @@ class Tools:
             else:
                 self._schema_store = schema_store
 
-            # -------- VectorSearch default --------
+            # -------- VectorSearch default (provide safe embedding_fn) --------
             if vector_search is None:
                 try:
                     from app.vector_search import VectorSearch
                     index_path = getattr(_config, "VECTOR_INDEX_PATH", None) if _config else None
                     index_path = index_path or "./faiss/index.faiss"
-                    self._vector_search = VectorSearch(index_path=index_path, embedding_fn=None)
-                except Exception:
-                    logger.warning(
-                        "VectorSearch default initialization failed; vector search must be injected."
-                    )
+
+                    # Dimension inference from config
+                    try:
+                        inferred_dim = int(getattr(_config, "VECTOR_DIM", 128)) if _config else 128
+                    except Exception:
+                        inferred_dim = 128
+
+                    # Try to use LangChain GoogleGenerativeAIEmbeddings if available,
+                    # otherwise fallback to deterministic char-based embedding.
+                    def _build_embedding_wrapper(dim: int) -> Callable[[Union[str, List[str]]], Union[List[float], List[List[float]]]]:
+                        """
+                        Returns a function emb(x) that accepts either:
+                          - a single string -> returns a single vector (list[float])
+                          - a list of strings -> returns list[list[float]]
+                        This wrapper first tries to use LangChain's GoogleGenerativeAIEmbeddings
+                        if present; otherwise it uses a deterministic fallback matching the
+                        project's earlier default embedding approach.
+                        """
+                        # attempt import of LangChain provider lazily
+                        try:
+                            from langchain.embeddings import GoogleGenerativeAIEmbeddings  # type: ignore
+                            emb_client = GoogleGenerativeAIEmbeddings(model=getattr(_config, "EMBEDDING_MODEL", "models/gemini-embedding-001"))
+                            logger.info("Tools: using GoogleGenerativeAIEmbeddings for embedding_fn")
+                            def _lc_emb(x: Union[str, List[str]]):
+                                if isinstance(x, (list, tuple)):
+                                    res = emb_client.embed_documents(list(x))
+                                    return [list(map(float, r)) for r in res]
+                                else:
+                                    res = emb_client.embed_query(x)
+                                    return list(map(float, res)) if res is not None else [0.0] * dim
+                            return _lc_emb
+                        except Exception as lc_err:
+                            logger.debug("Tools: LangChain GoogleGenerativeAIEmbeddings not available: %s", lc_err)
+
+                        # Fallback deterministic embedding
+                        import numpy as _np
+                        logger.info("Tools: using deterministic fallback embedding for embedding_fn")
+
+                        def _single_default_emb(text: str) -> List[float]:
+                            vec = _np.zeros(dim, dtype=float)
+                            if text:
+                                for i, ch in enumerate(str(text).lower()):
+                                    # keep same simple char-based scheme as prior fallback
+                                    vec[i % dim] += (ord(ch) % 97) * 0.001
+                                norm = _np.linalg.norm(vec)
+                                if norm > 0:
+                                    vec = vec / norm
+                            return vec.tolist()
+
+                        def _wrapper(input_texts: Union[str, List[str]]):
+                            if isinstance(input_texts, (list, tuple)):
+                                return [_single_default_emb(str(t)) for t in input_texts]
+                            return _single_default_emb(str(input_texts))
+
+                        return _wrapper
+
+                    embedding_fn_wrapper = _build_embedding_wrapper(inferred_dim)
+
+                    # instantiate VectorSearch with a wrapper that accepts lists
+                    self._vector_search = VectorSearch(index_path=index_path, embedding_fn=embedding_fn_wrapper, dim=inferred_dim)
+                    logger.debug("Tools: VectorSearch default initialized with safe embedding_fn")
+                except Exception as e:
+                    logger.warning("VectorSearch default initialization failed; vector_search must be injected. Error: %s", e)
                     self._vector_search = None
             else:
                 self._vector_search = vector_search
@@ -75,12 +134,15 @@ class Tools:
             else:
                 self._executor = executor
 
-            # -------- Provider / Tracer clients --------
+            # -------- Provider / Tracer clients (injected or None) --------
             self._provider_client = provider_client
             self._tracer_client = tracer_client
 
             logger.debug(
-                f"Tools initialized (has_provider={bool(self._provider_client)}, has_tracer={bool(self._tracer_client)})"
+                "Tools initialized (has_provider=%s, has_tracer=%s, has_vector=%s)",
+                bool(self._provider_client),
+                bool(self._tracer_client),
+                bool(self._vector_search),
             )
 
         except Exception as e:

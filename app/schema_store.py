@@ -1,7 +1,5 @@
-# app/schema_store.py
 import os
 import sys
-import csv
 import json
 from typing import List, Dict, Any, Optional
 
@@ -13,15 +11,15 @@ logger = get_logger("schema_store")
 
 
 def _ensure_dir(path: str) -> None:
-    """Ensure directory exists."""
+    """Ensure the given directory exists."""
     os.makedirs(path, exist_ok=True)
 
 
 class SchemaStore:
     """
     Manages CSV metadata: schemas, sample rows, and column info.
-    Stores metadata in JSON files for persistent access.
-    Compatible with CSVLoader and vectorization pipelines.
+    Stores metadata persistently in JSON files.
+    Designed for compatibility with CSVLoader and vectorization pipelines.
     """
 
     def __init__(self, store_path: Optional[str] = None, sample_limit: int = 5):
@@ -41,7 +39,7 @@ class SchemaStore:
     # Persistence
     # ---------------------------
     def _load_store(self) -> None:
-        """Load schema metadata from JSON file."""
+        """Load schema metadata from JSON file if exists."""
         try:
             if os.path.exists(self.store_path):
                 with open(self.store_path, "r", encoding="utf-8") as f:
@@ -53,7 +51,7 @@ class SchemaStore:
             raise CustomException(e, sys)
 
     def _save_store(self) -> None:
-        """Save schema metadata to JSON file."""
+        """Persist schema metadata to JSON file."""
         try:
             with open(self.store_path, "w", encoding="utf-8") as f:
                 json.dump(self._store, f, indent=2, ensure_ascii=False)
@@ -66,12 +64,14 @@ class SchemaStore:
     # ---------------------------
     def add_csv(self, csv_path: str, csv_name: Optional[str] = None) -> None:
         """
-        Read CSV file, store columns and sample rows.
+        Read CSV file, store column names and sample rows.
         Updates internal store and persists to disk.
         """
         try:
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+            import csv
 
             csv_name = csv_name or os.path.basename(csv_path)
             columns: List[str] = []
@@ -97,19 +97,19 @@ class SchemaStore:
             raise CustomException(e, sys)
 
     def get_schema(self, csv_name: str) -> Optional[List[str]]:
-        """Return list of column names for a CSV."""
+        """Return column names for a given CSV."""
         return self._store.get(csv_name, {}).get("columns")
 
     def get_sample_rows(self, csv_name: str) -> Optional[List[Dict[str, Any]]]:
-        """Return sample rows for a CSV."""
+        """Return sample rows for a given CSV."""
         return self._store.get(csv_name, {}).get("sample_rows")
 
     def list_csvs(self) -> List[str]:
-        """List all CSVs currently stored."""
+        """Return a list of all CSVs stored."""
         return list(self._store.keys())
 
     def clear(self) -> None:
-        """Clear store in memory and remove persisted JSON."""
+        """Clear in-memory store and remove persisted JSON file."""
         try:
             self._store = {}
             if os.path.exists(self.store_path):

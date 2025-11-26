@@ -114,6 +114,45 @@ def validate_tables_in_sql(sql: str, schemas: Dict[str, Dict[str, Any]]) -> List
     return missing
 
 
+def validate_columns_in_sql(sql: str, schemas: Dict[str, Dict[str, Any]]) -> List[str]:
+    """
+    Return list of columns referenced in SQL that do NOT exist in the schema.
+    Simple heuristic: checks SELECT columns against known table columns.
+    """
+    missing_columns = []
+    # Extract SELECT columns
+    select_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql, re.IGNORECASE | re.DOTALL)
+    if select_match:
+        cols = select_match.group(1).split(",")
+        cols = [c.strip().split()[-1] for c in cols]  # handle AS alias
+        for col in cols:
+            found = any(col.lower() in [c.lower() for c in tbl.get("columns", [])] for tbl in schemas.values())
+            if not found:
+                missing_columns.append(col)
+    return missing_columns
+
+
+def exceeds_row_limit(sql: str, limit: int) -> bool:
+    """
+    Check if SQL has a LIMIT clause exceeding the specified limit.
+    """
+    m = re.search(r"\bLIMIT\s+(\d+)", sql, re.IGNORECASE)
+    if m:
+        return int(m.group(1)) > limit
+    return False
+
+
+def check_forbidden_tables(sql: str, forbidden: List[str]) -> List[str]:
+    """
+    Check if SQL references any forbidden tables.
+    """
+    forbidden_used = []
+    for tbl in forbidden:
+        if re.search(rf"\b{re.escape(tbl)}\b", sql, re.IGNORECASE):
+            forbidden_used.append(tbl)
+    return forbidden_used
+
+
 # -------------------------------
 # Prompt / LLM Helpers
 # -------------------------------

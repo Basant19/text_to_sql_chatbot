@@ -17,6 +17,7 @@ class ValidateNode:
     Features:
     - Ensures only SELECT queries are allowed.
     - Checks that referenced tables and columns exist in the provided schema.
+    - Enforces optional safety rules: max row limit, forbidden tables.
     - Returns structured validation info including errors.
     - Designed for testability and modularity.
     """
@@ -26,10 +27,11 @@ class ValidateNode:
         Optional safety_rules can include:
           - "max_row_limit": int
           - "forbidden_tables": List[str]
-          - etc.
         """
         try:
             self.safety_rules = safety_rules or {}
+            self.max_row_limit = self.safety_rules.get("max_row_limit")
+            self.forbidden_tables = self.safety_rules.get("forbidden_tables", [])
             logger.info("ValidateNode initialized with safety_rules: %s", self.safety_rules)
         except Exception as e:
             logger.exception("Failed to initialize ValidateNode")
@@ -56,7 +58,7 @@ class ValidateNode:
         -------
         Dict[str, Any]
             {
-                "sql": <original SQL>,
+                "sql": <possibly modified SQL>,
                 "valid": <bool>,
                 "errors": <list of error messages>
             }
@@ -69,32 +71,39 @@ class ValidateNode:
         try:
             errors: List[str] = []
 
+            sql = sql.strip()
+
             # 1) Check for empty query
-            if not sql.strip():
+            if not sql:
                 errors.append("SQL query is empty.")
 
             # 2) Allow only SELECT queries
-            if not utils.is_select_query(sql):
+            if sql and not utils.is_select_query(sql):
                 errors.append("Only SELECT statements are allowed.")
 
             # 3) Validate referenced tables exist
-            missing_tables = utils.validate_tables_in_sql(sql, schemas)
-            if missing_tables:
-                errors.append(f"Tables not found in schema: {', '.join(missing_tables)}")
+            if sql:
+                missing_tables = utils.validate_tables_in_sql(sql, schemas)
+                if missing_tables:
+                    errors.append(f"Tables not found in schema: {', '.join(missing_tables)}")
 
-            # 4) Optional: validate columns and enforce safety rules
-            missing_columns = utils.validate_columns_in_sql(sql, schemas)
-            if missing_columns:
-                errors.append(f"Columns not found in schema: {', '.join(missing_columns)}")
+            # 4) Validate referenced columns exist
+            if sql:
+                missing_columns = utils.validate_columns_in_sql(sql, schemas)
+                if missing_columns:
+                    errors.append(f"Columns not found in schema: {', '.join(missing_columns)}")
 
-            max_rows = self.safety_rules.get("max_row_limit")
-            if max_rows and utils.exceeds_row_limit(sql, max_rows):
-                errors.append(f"Query exceeds maximum row limit of {max_rows}")
+            # 5) Enforce max row limit
+            if sql and self.max_row_limit:
+                if utils.exceeds_row_limit(sql, self.max_row_limit):
+                    errors.append(f"Query exceeds maximum row limit of {self.max_row_limit}")
+                    sql = utils.limit_sql_rows(sql, self.max_row_limit)  # automatically limit
 
-            forbidden_tables = self.safety_rules.get("forbidden_tables", [])
-            forbidden_used = utils.check_forbidden_tables(sql, forbidden_tables)
-            if forbidden_used:
-                errors.append(f"Query uses forbidden tables: {', '.join(forbidden_used)}")
+            # 6) Check forbidden tables
+            if sql and self.forbidden_tables:
+                forbidden_used = utils.check_forbidden_tables(sql, self.forbidden_tables)
+                if forbidden_used:
+                    errors.append(f"Query uses forbidden tables: {', '.join(forbidden_used)}")
 
             valid = len(errors) == 0
 

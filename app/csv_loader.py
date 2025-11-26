@@ -1,4 +1,3 @@
-# app/csv_loader.py
 import os
 import io
 import csv
@@ -15,13 +14,11 @@ logger = get_logger("csv_loader")
 def _sanitize_filename(name: str) -> str:
     """
     Make a filename safe by replacing unsafe characters.
-    Keeps alphanumeric, space, dot, underscore, and dash.
-    Converts spaces to underscores.
+    Keeps alphanumeric, dot, underscore, dash, and replaces spaces with underscores.
     """
     keepchars = (" ", ".", "_", "-")
     safe = "".join(c if c.isalnum() or c in keepchars else "_" for c in name)
-    safe = safe.replace(" ", "_")
-    return safe
+    return safe.replace(" ", "_")
 
 
 def _unique_path(dest_dir: str, filename: str) -> str:
@@ -86,7 +83,7 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
             try:
                 header = next(reader)
             except StopIteration:
-                # Empty CSV file
+                # Empty CSV
                 return {
                     "table_name": _sanitize_filename(os.path.basename(path)),
                     "path": path,
