@@ -58,6 +58,9 @@ class GraphBuilder:
         """
         Build a default graph using the project's node implementations.
         (lazy import so module can be imported even if graph isn't used)
+        This attempts to wire a Gemini provider (if available) as the provider_client
+        and a LangSmithClient as tracer_client (if configured). Failures are logged
+        and ignored to preserve test friendliness.
         """
         try:
             from app.graph.nodes.context_node import ContextNode
@@ -72,15 +75,70 @@ class GraphBuilder:
             logger.exception("Failed to import default nodes")
             raise CustomException(e, sys)
 
+        # Try to instantiate optional provider / tracer clients for GenerateNode
+        provider_client = None
+        tracer_client = None
+        try:
+            # lazy import of config so we can check keys
+            from app import config  # type: ignore
+        except Exception:
+            config = None
+
+        # Attempt to create a Gemini provider if available (non-fatal)
+        try:
+            try:
+                from app.gemini_client import GeminiClient  # type: ignore
+                # Prefer explicit API key if available; GeminiClient constructor may accept no args in tests
+                gemini_api_key = getattr(config, "GEMINI_API_KEY", None) if config is not None else None
+                provider_client = GeminiClient(api_key=gemini_api_key) if gemini_api_key is not None else GeminiClient()
+                logger.info("GraphBuilder: GeminiClient provider instantiated for GenerateNode")
+            except Exception as e:
+                provider_client = None
+                logger.debug(f"GeminiClient not available or failed to instantiate (will fallback): {e}")
+        except Exception:
+            provider_client = None
+
+        # Attempt to create LangSmith tracer (observability only) if configured
+        try:
+            try:
+                from app.langsmith_client import LangSmithClient  # type: ignore
+                langsmith_key = getattr(config, "LANGSMITH_API_KEY", None) if config is not None else None
+                if langsmith_key:
+                    tracer_client = LangSmithClient(api_key=langsmith_key)
+                    logger.info("GraphBuilder: LangSmithClient tracer instantiated for GenerateNode")
+                else:
+                    tracer_client = None
+                    logger.debug("GraphBuilder: LANGSMITH_API_KEY not set; tracer not created")
+            except Exception as e:
+                tracer_client = None
+                logger.debug(f"LangSmithClient import/instantiation failed (tracer disabled): {e}")
+        except Exception:
+            tracer_client = None
+
+        # Instantiate nodes, wiring provider/tracer into GenerateNode
+        try:
+            context_node = ContextNode()
+            retrieve_node = RetrieveNode()
+            prompt_node = PromptNode()
+            # Pass provider_client and tracer_client into GenerateNode constructor
+            generate_node = GenerateNode(provider_client=provider_client, tracer_client=tracer_client)
+            validate_node = ValidateNode()
+            execute_node = ExecuteNode()
+            format_node = FormatNode()
+            error_node = ErrorNode()
+        except Exception as e:
+            logger.exception("Failed to instantiate nodes for default graph")
+            raise CustomException(e, sys)
+
         return GraphBuilder(
-            context_node=ContextNode(),
-            retrieve_node=RetrieveNode(),
-            prompt_node=PromptNode(),
-            generate_node=GenerateNode(),
-            validate_node=ValidateNode(),
-            execute_node=ExecuteNode(),
-            format_node=FormatNode(),
-            error_node=ErrorNode(),
+            context_node=context_node,
+            retrieve_node=retrieve_node,
+            prompt_node=prompt_node,
+            generate_node=generate_node,
+            validate_node=validate_node,
+            execute_node=execute_node,
+            format_node=format_node,
+            error_node=error_node,
         )
 
     def run(self, user_query: str, csv_names: list, run_query: bool = False) -> Dict[str, Any]:
@@ -112,6 +170,8 @@ class GraphBuilder:
             timings["context"] = time.time() - t0
 
             t1 = time.time()
+            # retrieve_node.run signature historically accepted (query, csv_names) or (query, schemas)
+            # keep passing user_query and schemas (many implementations expect schemas)
             retrieved = self.retrieve_node.run(user_query, schemas)
             timings["retrieve"] = time.time() - t1
 
@@ -124,7 +184,7 @@ class GraphBuilder:
             gen = self.generate_node.run(prompt)
             timings["generate"] = time.time() - t3
 
-            # normalize
+            # normalize generation output
             raw = gen.get("raw") if isinstance(gen, dict) else gen
             sql = gen.get("sql") if isinstance(gen, dict) else (gen[0] if isinstance(gen, tuple) else str(gen))
             result["raw"] = raw
@@ -168,4 +228,13 @@ class GraphBuilder:
                 logger.exception("ErrorNode itself failed")
 
             # fallback error shape
-            return {"prompt": None, "sql": None, "valid": False, "execution": None, "formatted": None, "raw": None, "error": str(e), "timings": timings}
+            return {
+                "prompt": None,
+                "sql": None,
+                "valid": False,
+                "execution": None,
+                "formatted": None,
+                "raw": None,
+                "error": str(e),
+                "timings": timings,
+            }

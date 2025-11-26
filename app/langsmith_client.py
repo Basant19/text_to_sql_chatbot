@@ -1,3 +1,4 @@
+# app/langsmith_client.py
 import sys
 import json
 import time
@@ -12,10 +13,9 @@ logger = get_logger("langsmith_client")
 
 class LangSmithClient:
     """
-    Wrapper for LangSmith / LLM service.
-    - Uses config.LANGSMITH_ENDPOINT and config.LANGSMITH_API_KEY by default.
-    - Exposes generate(prompt, model, max_tokens) -> {"text": str, "raw": dict}
-    - Keeps tracing flag (config.LANGSMITH_TRACING) to enable extra logging.
+    Wrapper for LangSmith observability + fallback LLM generation.
+    - generate(): Only for LLM calls (rarely used now; Gemini/Graph handles generation)
+    - trace_run(): For LangSmith observability (preferred)
     """
 
     def __init__(
@@ -31,11 +31,9 @@ class LangSmithClient:
             self.endpoint = endpoint or getattr(config, "LANGSMITH_ENDPOINT", None)
             self.tracing = tracing if tracing is not None else getattr(config, "LANGSMITH_TRACING", False)
 
-            # API key optional during tests — but real usage should set it
             if not self.api_key:
                 raise ValueError("LANGSMITH API key is required")
 
-            # normalize endpoint (no trailing slash)
             if self.endpoint and self.endpoint.endswith("/"):
                 self.endpoint = self.endpoint[:-1]
 
@@ -50,25 +48,76 @@ class LangSmithClient:
             logger.exception("Failed to initialize LangSmithClient")
             raise CustomException(e, sys)
 
+    # -------------------------------------------------------------------------
+    # NEW — Observability-only tracing
+    # -------------------------------------------------------------------------
+    def trace_run(
+        self,
+        name: str,
+        prompt: str,
+        sql: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Sends a trace run to LangSmith for observability.
+        Does NOT call LLM. Only logs metadata.
+
+        Parameters
+        ----------
+        name : str
+            Name of the run (e.g., "generate_sql", "retrieve_schema")
+        prompt : str
+            Prompt used in the node
+        sql : Optional[str]
+            Generated SQL (if available)
+        metadata : dict
+            Extra debug info (latency etc.)
+
+        Returns: {"success": True, "run_id": <id>}
+        """
+        try:
+            import requests  # type: ignore
+
+            url = f"{self.endpoint}/v1/runs"
+            payload = {
+                "name": name,
+                "project": self.project,
+                "input": {"prompt": prompt},
+                "output": {"sql": sql} if sql else {},
+                "metadata": metadata or {},
+            }
+
+            if self.tracing:
+                logger.info(f"[TRACE] Sending LangSmith trace: {name}")
+                logger.debug(str(payload)[:1500])
+
+            resp = requests.post(url, json=payload, headers=self._headers, timeout=10)
+
+            if resp.status_code >= 400:
+                logger.error(f"LangSmith trace_run failed ({resp.status_code})")
+                return {"success": False, "error": resp.text}
+
+            data = resp.json()
+            return {"success": True, "run_id": data.get("id")}
+
+        except Exception as e:
+            logger.exception("trace_run failed")
+            return {"success": False, "error": str(e)}
+
+    # -------------------------------------------------------------------------
+    # LLM generation (fallback only)
+    # -------------------------------------------------------------------------
     def generate(self, prompt: str, model: str = "gemini-1.5-flash", max_tokens: int = 512, timeout: int = 30) -> Dict[str, Any]:
         """
-        Generate text from the LLM.
-        Returns {"text": <string>, "raw": <full response dict>}
-        Raises CustomException on failure.
-
-        Implementation notes:
-          - Uses the REST endpoint: {endpoint}/v1/generate with payload containing 'model'
-          - This shape is intentionally generic so tests can monkeypatch requests.post().
+        Prefer Gemini via LangGraph. Use this only as fallback.
         """
         start = time.time()
         try:
-            # imported here so tests can monkeypatch requests.post easily
             import requests  # type: ignore
 
             if not self.endpoint:
                 raise ValueError("No LANGSMITH endpoint configured")
 
-            # Use the simple generate endpoint (model passed in payload)
             url = f"{self.endpoint}/v1/generate"
             payload = {
                 "model": model,
@@ -79,55 +128,45 @@ class LangSmithClient:
 
             if self.tracing:
                 logger.info("LangSmith generate() called — tracing enabled")
-                # avoid logging very large payloads
                 try:
                     logger.debug(f"POST {url} payload={json.dumps(payload)[:1000]}")
                 except Exception:
-                    logger.debug("POST payload (non-serializable)")
+                    pass
 
             resp = requests.post(url, json=payload, headers=self._headers, timeout=timeout)
 
-            # handle HTTP error codes
             if resp.status_code >= 400:
-                logger.error(f"LangSmith generate failed status={resp.status_code}")
                 try:
                     detail = resp.json()
                 except Exception:
                     detail = resp.text
                 raise RuntimeError(f"LangSmith API error: {resp.status_code} {detail}")
 
-            # parse response (may be JSON or plain text)
             try:
                 data = resp.json()
             except Exception:
-                text = resp.text
-                data = {"text": text}
+                data = {"text": resp.text}
 
-            # Heuristic: extract text from common fields
             text = None
             if isinstance(data, dict):
-                for key in ("text", "output", "result", "content"):
-                    if key in data and isinstance(data[key], (str, list)):
-                        if isinstance(data[key], list):
-                            text = " ".join(map(str, data[key]))
-                        else:
-                            text = data[key]
+                for k in ("text", "output", "result", "content"):
+                    if k in data:
+                        v = data[k]
+                        text = " ".join(v) if isinstance(v, list) else v
                         break
-                # some payloads include nested outputs list
-                if text is None and "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
+
+                if text is None and "outputs" in data:
                     first = data["outputs"][0]
-                    if isinstance(first, dict) and "text" in first:
-                        text = first["text"]
+                    text = first.get("text") if isinstance(first, dict) else None
 
             if text is None:
-                # fallback: stringify the raw response
                 text = json.dumps(data)
 
             runtime = time.time() - start
             logger.info(f"LangSmith generate completed in {runtime:.3f}s")
+
             return {"text": str(text), "raw": data}
-        except CustomException:
-            raise
+
         except Exception as e:
             logger.exception("LangSmith generate failed")
             raise CustomException(e, sys)
@@ -137,8 +176,7 @@ if __name__ == "__main__":
     print("LangSmithClient demo")
     try:
         c = LangSmithClient()
-        print("Client initialized. Endpoint:", getattr(c, "endpoint", None))
-        print("Demo complete — generate() not invoked to avoid network calls.")
+        print("Client initialised.")
     except Exception as e:
         print("Demo error:", e)
         sys.exit(1)

@@ -21,6 +21,8 @@ class Tools:
         schema_store: Optional[Any] = None,
         vector_search: Optional[Any] = None,
         executor: Optional[Any] = None,
+        provider_client: Optional[Any] = None,
+        tracer_client: Optional[Any] = None,
     ):
         try:
             # Lazy config import
@@ -69,9 +71,31 @@ class Tools:
             else:
                 self._executor = executor
 
+            # -------- Provider / Tracer clients (LLM + Observability) --------
+            # These are optional and used by GenerateNode / LangGraph glue for dependency injection.
+            self._provider_client = provider_client
+            self._tracer_client = tracer_client
+
+            logger.debug(
+                f"Tools initialized (has_provider={bool(self._provider_client)}, has_tracer={bool(self._tracer_client)})"
+            )
+
         except Exception as e:
             logger.exception("Failed to initialize Tools")
             raise CustomException(e, sys)
+
+    # -------- Accessors for injected clients --------
+    def get_provider_client(self) -> Optional[Any]:
+        """
+        Return the injected provider client (e.g. GeminiClient) or None.
+        """
+        return self._provider_client
+
+    def get_tracer_client(self) -> Optional[Any]:
+        """
+        Return the injected tracer client (e.g. LangSmithClient) or None.
+        """
+        return self._tracer_client
 
     # -------- Database adapters --------
     def load_table(self, csv_path: str, table_name: str, force_reload: bool = False) -> None:
@@ -137,11 +161,11 @@ class Tools:
 
     # -------- SQL execution adapter --------
     def execute_sql(
-        self, 
-        sql: str, 
-        read_only: bool = True, 
-        limit: Optional[int] = None, 
-        as_dataframe: bool = False
+        self,
+        sql: str,
+        read_only: bool = True,
+        limit: Optional[int] = None,
+        as_dataframe: bool = False,
     ) -> Dict[str, Any]:
         try:
             if self._executor is None:
