@@ -1,6 +1,7 @@
 # app.py
 import streamlit as st
 import os
+import json
 from typing import List, Dict, Any
 
 from app.csv_loader import CSVLoader
@@ -12,6 +13,60 @@ from app.logger import get_logger
 import app.config as config_module
 
 logger = get_logger("app")
+
+
+def _sanitize_for_history(obj: Any) -> Any:
+    """
+    Convert obj into a JSON-friendly structure:
+      - keep primitives (str/int/float/bool/None)
+      - convert datetime/date to isoformat (if present)
+      - recursively sanitize dicts, lists, tuples
+      - convert other objects to str(obj)
+
+    This is intentionally conservative: it's OK to lose complex internals for persistence.
+    """
+    # import locally to avoid top-level import dependencies
+    from datetime import datetime, date
+
+    # primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # datetime-like
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    # dict -> sanitize items
+    if isinstance(obj, dict):
+        sanitized = {}
+        for k, v in obj.items():
+            try:
+                sanitized[k] = _sanitize_for_history(v)
+            except Exception:
+                sanitized[k] = str(v)
+        return sanitized
+
+    # list/tuple/set -> sanitize elements
+    if isinstance(obj, (list, tuple, set)):
+        try:
+            return [_sanitize_for_history(v) for v in obj]
+        except Exception:
+            return [str(v) for v in obj]
+
+    # attempt to JSON-dump unknown objects with default=str
+    try:
+        json.dumps(obj, default=str)
+        # if dumps didn't raise, return str(obj) to keep content stable (avoid complex types)
+        return str(obj)
+    except Exception:
+        pass
+
+    # fallback: string representation
+    try:
+        return str(obj)
+    except Exception:
+        return repr(obj)
+
 
 # ---------------------------
 # Initialize core components
@@ -33,7 +88,13 @@ history_store = HistoryStore(backend=getattr(config, "HISTORY_BACKEND", "json"))
 
 # Streamlit session state for chat history
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    # Try to seed session from persisted history so users see existing items
+    try:
+        persisted = history_store.list_entries()
+        # Keep the persisted structure as-is for display, don't attempt to rehydrate complex objects
+        st.session_state.chat_history = persisted or []
+    except Exception:
+        st.session_state.chat_history = []
 
 st.set_page_config(page_title="Text-to-SQL Bot", layout="wide")
 st.title("📊 Text-to-SQL Bot")
@@ -116,18 +177,22 @@ if execute_button and user_query:
                 logger.exception("Agent run failed")
                 result = {"error": str(e)}
 
-        # Persist to history store + session
+        # Prepare a sanitized copy for persistent storage (so history JSON / sqlite won't fail)
         try:
-            entry = history_store.add_entry(name=query_name, query=user_query, result=result)
-            st.session_state.chat_history.append({
+            sanitized_result = _sanitize_for_history(result)
+            entry = history_store.add_entry(name=query_name, query=user_query, result=sanitized_result)
+            # keep full (non-sanitized) result in session for UI, but store persisted metadata from entry
+            session_entry = {
                 "id": entry.get("id"),
                 "name": entry.get("name"),
                 "query": entry.get("query"),
-                "result": entry.get("result"),
+                "result": result,
                 "created_at": entry.get("created_at"),
                 "updated_at": entry.get("updated_at"),
-            })
+            }
+            st.session_state.chat_history.append(session_entry)
         except Exception:
+            # if persistent storage fails for any reason, still keep session-only copy (unsanitized)
             logger.exception("Failed to persist history entry; using session-only storage")
             st.session_state.chat_history.append({
                 "id": None,
@@ -145,7 +210,7 @@ if st.session_state.chat_history:
     with col_a:
         if st.button("Clear History (memory only)"):
             st.session_state.chat_history = []
-            st.experimental_rerun()
+            # no explicit rerun call - button click already triggers a rerun
     with col_b:
         if st.button("Export History JSON (persisted)"):
             try:
@@ -156,71 +221,134 @@ if st.session_state.chat_history:
     with col_c:
         st.info(f"{len(st.session_state.chat_history)} queries stored in this session")
 
+    # Render query history (robust: stable keys, per-entry error handling)
     for display_idx, chat in enumerate(reversed(st.session_state.chat_history)):
+        # compute a stable index into session list
         real_index = len(st.session_state.chat_history) - 1 - display_idx
+        # prefer stable id for keys (use index only when id is missing)
+        entry_id = chat.get("id") or f"idx_{real_index}"
         disp_name = chat.get("name", f"Query {display_idx+1}")
-        expander_key = f"expander_{real_index}"
 
-        with st.expander(f"{disp_name}", expanded=False, key=expander_key):
-            rename_key = f"rename_{real_index}"
-            new_name = st.text_input("Rename query", value=disp_name, key=rename_key)
-            if new_name and new_name != disp_name:
-                st.session_state.chat_history[real_index]["name"] = new_name
-                entry_id = st.session_state.chat_history[real_index].get("id")
-                if entry_id:
-                    try:
-                        updated = history_store.update_entry(entry_id, name=new_name)
-                        if updated:
-                            st.session_state.chat_history[real_index].update({
-                                "updated_at": updated.get("updated_at")
-                            })
-                    except Exception:
-                        logger.exception("Failed to update persisted history entry (rename)")
+        # keys for inner widgets still used to keep widget identity stable
+        rename_key = f"rename_{entry_id}"
+        delete_key = f"del_{entry_id}"
 
-            st.markdown(f"**User Query:** {chat.get('query')}")
-            res = chat.get("result") or {}
-            if not res:
-                st.info("No result stored for this query.")
-                continue
-
-            st.markdown("**Generated SQL:**")
-            st.code(res.get("sql") or "No SQL generated.", language="sql")
-            st.write(f"Valid SQL: {res.get('valid')}")
-
-            if res.get("execution"):
-                st.markdown("**Execution Results:**")
-                exec_res = res["execution"]
-                rows = exec_res.get("rows") if isinstance(exec_res, dict) else exec_res
+        try:
+            # NOTE: Streamlit 1.51.0 does not accept a 'key' arg on st.expander in your environment,
+            # so we avoid passing it here. The inner widgets (text_input, button) keep stable keys.
+            with st.expander(f"{disp_name}", expanded=False):
+                # Rename input (safe: unique key per entry)
                 try:
-                    st.dataframe(rows)
+                    new_name = st.text_input("Rename query", value=disp_name, key=rename_key)
+                    if new_name and new_name != disp_name:
+                        # update session state
+                        st.session_state.chat_history[real_index]["name"] = new_name
+                        # attempt to update persisted entry if available
+                        if chat.get("id"):
+                            try:
+                                updated = history_store.update_entry(chat["id"], name=new_name)
+                                if updated:
+                                    st.session_state.chat_history[real_index].update({
+                                        "updated_at": updated.get("updated_at")
+                                    })
+                            except Exception:
+                                logger.exception("Failed to update persisted history entry (rename)")
                 except Exception:
-                    st.write(rows)
-                st.write("Metadata:", exec_res.get("meta", {}))
+                    logger.exception("Rename widget failed for entry %s", entry_id)
+                    st.warning("Rename unavailable for this entry.")
 
-            if res.get("formatted"):
-                st.markdown("**Formatted Output / Explanation:**")
-                st.json(res["formatted"])
+                # Main content
+                try:
+                    st.markdown(f"**User Query:** {chat.get('query')}")
+                except Exception:
+                    st.markdown("**User Query:** (could not render)")
+                res = chat.get("result") or {}
+                if not res:
+                    st.info("No result stored for this query.")
+                    continue
 
-            if res.get("raw"):
-                with st.expander("Raw LLM / Agent Output"):
-                    st.json(res["raw"])
+                # SQL
+                try:
+                    st.markdown("**Generated SQL:**")
+                    st.code(res.get("sql") or "No SQL generated.", language="sql")
+                    st.write(f"Valid SQL: {res.get('valid')}")
+                except Exception:
+                    logger.exception("Failed to render SQL for entry %s", entry_id)
+                    st.error("Failed to render SQL for this entry.")
 
-            if res.get("error"):
-                st.error(f"Error: {res['error']}")
-
-            if res.get("timings"):
-                with st.expander("Execution Timings"):
-                    st.json(res["timings"])
-
-            if st.button("Delete entry (persisted + session)", key=f"del_{real_index}"):
-                entry_id = st.session_state.chat_history[real_index].get("id")
-                if entry_id:
+                # Execution results (dataframe)
+                if res.get("execution"):
                     try:
-                        history_store.delete_entry(entry_id)
+                        st.markdown("**Execution Results:**")
+                        exec_res = res["execution"]
+                        rows = exec_res.get("rows") if isinstance(exec_res, dict) else exec_res
+                        try:
+                            st.dataframe(rows)
+                        except Exception:
+                            # fallback to plain write if dataframe fails
+                            st.write(rows)
+                        # metadata may not exist
+                        if isinstance(exec_res, dict):
+                            st.write("Metadata:", exec_res.get("meta", {}))
                     except Exception:
-                        logger.exception("Failed to delete persisted history entry")
-                st.session_state.chat_history.pop(real_index)
-                st.experimental_rerun()
+                        logger.exception("Failed to render execution results for entry %s", entry_id)
+                        st.error("Failed to render execution results for this entry.")
+
+                # Formatted output / explanation
+                if res.get("formatted"):
+                    try:
+                        st.markdown("**Formatted Output / Explanation:**")
+                        formatted_val = res["formatted"]
+                        if isinstance(formatted_val, (dict, list)):
+                            st.json(formatted_val)
+                        else:
+                            st.write(formatted_val)
+                    except Exception:
+                        logger.exception("Failed to render formatted output for entry %s", entry_id)
+                        st.error("Failed to render formatted output for this entry.")
+
+                # Raw LLM output
+                if res.get("raw"):
+                    try:
+                        with st.expander("Raw LLM / Agent Output"):
+                            # raw may be complex; try to show as JSON if dict-like, else string
+                            raw_val = res["raw"]
+                            if isinstance(raw_val, (dict, list)):
+                                st.json(raw_val)
+                            else:
+                                st.write(str(raw_val))
+                    except Exception:
+                        logger.exception("Failed to render raw output for entry %s", entry_id)
+                        st.write("Raw output present but could not be displayed.")
+
+                # Error and timings
+                try:
+                    if res.get("error"):
+                        st.error(f"Error: {res['error']}")
+                    if res.get("timings"):
+                        with st.expander("Execution Timings"):
+                            st.json(res["timings"])
+                except Exception:
+                    logger.exception("Failed to render error/timings for entry %s", entry_id)
+
+                # Delete entry (persisted + session)
+                try:
+                    if st.button("Delete entry (persisted + session)", key=delete_key):
+                        if chat.get("id"):
+                            try:
+                                history_store.delete_entry(chat["id"])
+                            except Exception:
+                                logger.exception("Failed to delete persisted history entry %s", chat.get("id"))
+                        # remove from session - button click already triggers a rerun
+                        st.session_state.chat_history.pop(real_index)
+                except Exception:
+                    logger.exception("Delete button failed for entry %s", entry_id)
+                    st.warning("Could not delete this entry.")
+        except Exception as e:
+            # If the expander itself fails, log and display the problem and continue rendering other entries.
+            logger.exception("Failed rendering history entry %s: %s", entry_id, e)
+            st.error(f"Failed to render history entry '{disp_name}' (id={entry_id}). See server logs.")
+            continue
 
 # ---------------------------
 # Sidebar Footer

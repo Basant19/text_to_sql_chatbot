@@ -1,7 +1,8 @@
 # app/graph/builder.py
 import sys
 import time
-from typing import Any, Dict, Optional
+import inspect
+from typing import Any, Dict, Optional, Tuple
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -9,27 +10,94 @@ from app.exception import CustomException
 logger = get_logger("graph_builder")
 
 
+def _try_call_run(node: Any, *args, **kwargs) -> Any:
+    """
+    Resilient caller for node.run:
+      - First attempt to bind args/kwargs to the function signature using inspect.signature.bind_partial.
+        If binding succeeds, call the function directly so runtime TypeErrors inside the function are
+        propagated (and not misinterpreted as signature mismatches).
+      - If binding fails, treat it as a signature mismatch and attempt adaptive calling:
+          * progressively fewer positional args (keeping kwargs)
+          * mapping positional args to parameter names and calling with filtered kwargs
+      - If nothing works, re-raise the last TypeError.
+
+    This prevents masking runtime TypeErrors raised inside a node's implementation.
+    """
+    if node is None:
+        raise RuntimeError("Node is None, cannot call run()")
+
+    if not hasattr(node, "run"):
+        raise AttributeError(f"Node {node} has no run()")
+
+    run_fn = getattr(node, "run")
+    last_exc = None
+
+    # 0) Try to bind args/kwargs to signature first to distinguish signature mismatch vs runtime TypeError
+    try:
+        sig = inspect.signature(run_fn)
+        try:
+            # bind_partial won't require all parameters; it will raise TypeError if args/kwargs can't bind
+            sig.bind_partial(*args, **kwargs)
+            # binding succeeded -> safe to call directly (let runtime TypeErrors propagate)
+            return run_fn(*args, **kwargs)
+        except TypeError:
+            # binding failed -> treat as signature mismatch and attempt adaptive calls below
+            pass
+    except (ValueError, TypeError):
+        # inspect.signature can fail for builtins/C-implemented callables; fall back to a direct attempt
+        try:
+            return run_fn(*args, **kwargs)
+        except TypeError as e:
+            last_exc = e
+        except Exception:
+            # real runtime exception -> propagate
+            raise
+
+    # 1) Try progressively fewer positional args (keep kwargs intact)
+    for n in range(len(args), -1, -1):
+        try:
+            return run_fn(*args[:n], **kwargs)
+        except TypeError as e:
+            last_exc = e
+        except Exception:
+            # real runtime error — re-raise so caller/error node handles it
+            raise
+
+    # 2) Try calling using signature introspection with matching keyword names
+    try:
+        sig = inspect.signature(run_fn)
+        call_kwargs = {}
+        params = list(sig.parameters.values())
+        # Map positional args by parameter names when possible
+        for i, a in enumerate(args):
+            if i < len(params):
+                name = params[i].name
+                call_kwargs[name] = a
+        # Merge explicit kwargs (kwargs override)
+        call_kwargs.update(kwargs)
+        # Filter call_kwargs to only those parameters accepted by the function
+        accepted = {p.name for p in params if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+        filtered = {k: v for k, v in call_kwargs.items() if k in accepted}
+        return run_fn(**filtered)
+    except TypeError as e:
+        last_exc = e
+    except Exception:
+        # real runtime error -> propagate
+        raise
+
+    # 3) Nothing worked — raise the last TypeError to indicate signature mismatch
+    raise last_exc or RuntimeError("Failed to call node.run() for unknown reasons")
+
+
 class GraphBuilder:
     """
-    Simple orchestrator that wires LangGraph-like nodes together into a linear flow:
+    Orchestrator wiring nodes into a linear flow:
 
         context_node -> retrieve_node -> prompt_node -> generate_node ->
         validate_node -> execute_node -> format_node
 
-    Each node is expected to expose a .run(...) method, signature depending on the node.
-    You can inject any node instances for testing.
-
-    The builder.run(...) method returns a unified dict:
-      {
-        "prompt": <str>,
-        "sql": <str>,
-        "valid": <bool>,
-        "execution": <dict|None>,
-        "formatted": <any|None>,
-        "raw": <raw generation output|None>,
-        "error": <str|None>,
-        "timings": {...}
-      }
+    This version is defensive: it adapts to node signature variations and uses an ErrorNode
+    (if provided) to format or handle exceptions.
     """
 
     def __init__(
@@ -57,13 +125,7 @@ class GraphBuilder:
     def build_default():
         """
         Build a default graph using the project's node implementations.
-        (lazy import so module can be imported even if graph isn't used)
-
-        Wiring rules:
-          - Attempt to instantiate a GeminiClient provider (preferred) if possible.
-          - Instantiate LangSmithClient as tracer only if LANGSMITH_API_KEY is present.
-          - Both provider and tracer instantiation failures are non-fatal; they are logged
-            and the GenerateNode will be constructed with None for those clients (tests can inject mocks).
+        Lazy imports so module can be imported without actually having all deps.
         """
         try:
             from app.graph.nodes.context_node import ContextNode
@@ -72,7 +134,7 @@ class GraphBuilder:
             from app.graph.nodes.generate_node import GenerateNode
             from app.graph.nodes.validate_node import ValidateNode
             from app.graph.nodes.execute_node import ExecuteNode
-            from app.graph.nodes.format_node import FormatNode
+            from app.graph.nodes.format_node import FormatNode, FormatAdapter
             from app.graph.nodes.error_node import ErrorNode
         except Exception as e:
             logger.exception("Failed to import default nodes")
@@ -81,60 +143,63 @@ class GraphBuilder:
         provider_client = None
         tracer_client = None
 
-        # Avoid forcing config validation here; instantiate config in permissive mode
+        # Try permissive config (don't require provider keys here)
         try:
             from app.config import Config
-
             cfg = Config(require_keys=False)
         except Exception:
             cfg = None
 
-        # Try to create a Gemini provider (preferred) — non-fatal
+        # Try instantiate provider (non-fatal)
         try:
             try:
                 from app.gemini_client import GeminiClient  # type: ignore
-
                 gemini_api_key = getattr(cfg, "GEMINI_API_KEY", None) if cfg is not None else None
                 if gemini_api_key:
                     provider_client = GeminiClient(api_key=gemini_api_key)
                 else:
-                    # Try to instantiate with no args (use config module-level fallback inside GeminiClient)
                     provider_client = GeminiClient()
                 logger.info("GraphBuilder: GeminiClient instantiated as provider_client")
             except Exception as e:
                 provider_client = None
-                logger.debug("GraphBuilder: GeminiClient unavailable or failed to instantiate: %s", e)
+                logger.debug("GraphBuilder: GeminiClient unavailable: %s", e)
         except Exception:
             provider_client = None
 
-        # Try to create LangSmith tracer (observability only) — non-fatal
+        # Try LangSmith tracer (non-fatal)
         try:
             try:
                 from app.langsmith_client import LangSmithClient  # type: ignore
-
                 langsmith_key = getattr(cfg, "LANGSMITH_API_KEY", None) if cfg is not None else None
                 if langsmith_key:
                     tracer_client = LangSmithClient(api_key=langsmith_key)
                     logger.info("GraphBuilder: LangSmithClient instantiated as tracer_client")
                 else:
                     tracer_client = None
-                    logger.debug("GraphBuilder: LANGSMITH_API_KEY not set; tracer_client not created")
             except Exception as e:
                 tracer_client = None
-                logger.debug("GraphBuilder: LangSmithClient import/instantiation failed (tracer disabled): %s", e)
+                logger.debug("GraphBuilder: LangSmithClient unavailable: %s", e)
         except Exception:
             tracer_client = None
 
-        # Instantiate nodes, wiring provider/tracer into GenerateNode
+        # Instantiate nodes; pass provider/tracer into GenerateNode if it accepts them
         try:
             context_node = ContextNode()
             retrieve_node = RetrieveNode()
             prompt_node = PromptNode()
-            # Pass provider_client and tracer_client into GenerateNode constructor
-            generate_node = GenerateNode(provider_client=provider_client, tracer_client=tracer_client)
+            # GenerateNode may accept kwargs provider_client/tracer_client — try both ways when constructing
+            try:
+                generate_node = GenerateNode(provider_client=provider_client, tracer_client=tracer_client)
+            except TypeError:
+                # fallback to positional or no-arg constructor
+                try:
+                    generate_node = GenerateNode(provider_client, tracer_client)
+                except Exception:
+                    generate_node = GenerateNode()
             validate_node = ValidateNode()
             execute_node = ExecuteNode()
-            format_node = FormatNode()
+            raw_format = FormatNode()
+            format_node = FormatAdapter(raw_format)
             error_node = ErrorNode()
         except Exception as e:
             logger.exception("Failed to instantiate nodes for default graph")
@@ -151,19 +216,40 @@ class GraphBuilder:
             error_node=error_node,
         )
 
+    def _handle_error_node(self, exc: Exception, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Attempt to use the configured error_node to produce a friendly result payload.
+        If that fails, fall back to a standard error dict.
+        """
+        logger.exception("GraphBuilder: handling exception via error_node: %s", exc)
+        try:
+            if self.error_node:
+                if hasattr(self.error_node, "handle"):
+                    return self.error_node.handle(exc, ctx)
+                elif hasattr(self.error_node, "run"):
+                    return self.error_node.run(exc, ctx)
+        except Exception:
+            logger.exception("ErrorNode failed while handling exception")
+        # fallback raw error response
+        return {
+            "prompt": None,
+            "sql": None,
+            "valid": False,
+            "execution": None,
+            "formatted": None,
+            "raw": None,
+            "error": str(exc),
+            "timings": ctx.get("timings", {}),
+        }
+
     def run(self, user_query: str, csv_names: list, run_query: bool = False) -> Dict[str, Any]:
         """
-        Execute the graph end-to-end.
-
-        - user_query: user's natural language question
-        - csv_names: list of csv/table names that form the context
-        - run_query: if True, execution node will be invoked (when SQL is valid)
-
-        Returns the result dict described in class docstring.
+        Execute the graph end-to-end in a resilient manner.
+        Each node is called defensively to accommodate different node signatures.
         """
         start_all = time.time()
-        timings = {}
-        result = {
+        timings: Dict[str, float] = {}
+        result: Dict[str, Any] = {
             "prompt": None,
             "sql": None,
             "valid": False,
@@ -174,77 +260,116 @@ class GraphBuilder:
             "timings": timings,
         }
 
+        ctx_for_error = {"user_query": user_query, "csv_names": csv_names, "timings": timings}
+
         try:
+            # context_node -> schemas
             t0 = time.time()
-            schemas = self.context_node.run(csv_names)
+            try:
+                schemas = _try_call_run(self.context_node, csv_names)
+            except Exception as e:
+                # immediately hand over to error handler for context failures
+                return self._handle_error_node(e, ctx_for_error)
             timings["context"] = time.time() - t0
 
+            # retrieve_node -> retrieved docs
             t1 = time.time()
-            # retrieve_node.run signature historically accepted (query, csv_names) or (query, schemas)
-            # keep passing user_query and schemas (many implementations expect schemas)
-            retrieved = self.retrieve_node.run(user_query, schemas)
+            try:
+                # try passing (user_query, schemas) first (most implementations expect schemas)
+                retrieved = _try_call_run(self.retrieve_node, user_query, schemas)
+            except Exception as e:
+                return self._handle_error_node(e, ctx_for_error)
             timings["retrieve"] = time.time() - t1
 
+            # prompt_node -> prompt text
             t2 = time.time()
-            prompt = self.prompt_node.run(user_query, schemas, retrieved_docs=retrieved)
+            try:
+                # try (user_query, schemas, retrieved_docs=retrieved) / (user_query, schemas, retrieved)
+                prompt = _try_call_run(self.prompt_node, user_query, schemas, retrieved_docs=retrieved)
+            except Exception as e:
+                return self._handle_error_node(e, ctx_for_error)
             timings["prompt"] = time.time() - t2
             result["prompt"] = prompt
 
+            # generate_node -> generation result (dict|tuple|str)
             t3 = time.time()
-            gen = self.generate_node.run(prompt)
+            try:
+                gen = _try_call_run(self.generate_node, prompt)
+            except Exception as e:
+                return self._handle_error_node(e, ctx_for_error)
             timings["generate"] = time.time() - t3
 
-            # normalize generation output
+            # Normalize generation output
             raw = gen.get("raw") if isinstance(gen, dict) else gen
-            sql = gen.get("sql") if isinstance(gen, dict) else (gen[0] if isinstance(gen, tuple) else str(gen))
+            # sql may be in dict key "sql" or "text" or returned as tuple/list
+            sql = None
+            if isinstance(gen, dict):
+                sql = gen.get("sql") or gen.get("text") or gen.get("output") or ""
+            elif isinstance(gen, (list, tuple)) and len(gen) > 0:
+                # prefer first element if tuple (sql, prompt, raw) style
+                sql = gen[0]
+            else:
+                sql = str(gen) if gen is not None else ""
             result["raw"] = raw
             result["sql"] = sql
 
+            # validate_node -> possibly modified sql + validity info
             t4 = time.time()
-            val = self.validate_node.run(sql, schemas)
+            try:
+                val = _try_call_run(self.validate_node, sql, schemas)
+            except Exception as e:
+                return self._handle_error_node(e, ctx_for_error)
             timings["validate"] = time.time() - t4
 
-            result["valid"] = bool(val.get("valid", False))
+            # val expected to be dict {"sql":..., "valid":bool, "errors":[...]}
+            if isinstance(val, dict):
+                # if validation modified sql (e.g., applied LIMIT), pick it up
+                sql = val.get("sql", sql)
+                result["sql"] = sql
+                result["valid"] = bool(val.get("valid", False))
+                # collect validation errors if present
+                if val.get("errors"):
+                    result.setdefault("validation_errors", []).extend(val.get("errors"))
+            else:
+                # non-dict return fall back: treat truthiness as validity
+                result["valid"] = bool(val)
 
+            # optionally execute SQL
             execution_result = None
             if run_query and result["valid"]:
                 t5 = time.time()
-                execution_result = self.execute_node.run(sql, schemas)
+                try:
+                    execution_result = _try_call_run(self.execute_node, sql, schemas)
+                except Exception as e:
+                    # execution failure — hand off to error_node for formatting (but include what we have)
+                    ctx_for_error.update({"sql": sql, "execution_error": str(e)})
+                    return self._handle_error_node(e, ctx_for_error)
                 timings["execute"] = time.time() - t5
                 result["execution"] = execution_result
 
+            # format_node -> produce formatted output
             t6 = time.time()
-            formatted = self.format_node.run(sql, schemas, retrieved, execution_result, raw)
+            try:
+                # Try flexible calling patterns for format_node (it might accept fewer args)
+                formatted = _try_call_run(self.format_node, sql, schemas, retrieved, execution_result, raw)
+            except Exception as e:
+                # If formatting fails, use error node to produce a response (with partial data)
+                ctx_for_error.update({
+                    "sql": sql,
+                    "raw": raw,
+                    "retrieved": retrieved,
+                    "execution": execution_result,
+                })
+                return self._handle_error_node(e, ctx_for_error)
             timings["format"] = time.time() - t6
             result["formatted"] = formatted
 
+            # final timings and return
             total = time.time() - start_all
             timings["total"] = total
-
-            logger.info("GraphBuilder: run complete valid=%s total=%.3fs", result["valid"], total)
+            logger.info("GraphBuilder: run complete valid=%s total=%.3fs", result.get("valid"), total)
             return result
 
         except Exception as e:
-            logger.exception("GraphBuilder.run encountered an error")
-            # Use error_node if available to format error response
-            try:
-                if self.error_node:
-                    # prefer handle(), else run()
-                    if hasattr(self.error_node, "handle"):
-                        return self.error_node.handle(e, {"user_query": user_query, "csv_names": csv_names})
-                    elif hasattr(self.error_node, "run"):
-                        return self.error_node.run(e, {"user_query": user_query, "csv_names": csv_names})
-            except Exception:
-                logger.exception("ErrorNode itself failed")
-
-            # fallback error shape
-            return {
-                "prompt": None,
-                "sql": None,
-                "valid": False,
-                "execution": None,
-                "formatted": None,
-                "raw": None,
-                "error": str(e),
-                "timings": timings,
-            }
+            logger.exception("GraphBuilder.run encountered an unexpected error")
+            return self._handle_error_node(e, ctx_for_error)

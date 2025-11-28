@@ -1,117 +1,126 @@
 # app/graph/nodes/format_node.py
-
 import sys
-import time
-from typing import Dict, Any, List, Optional
+import json
+from typing import Any, Dict, List, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
-from app import utils
 
 logger = get_logger("format_node")
 
 
 class FormatNode:
     """
-    Node to format SQL execution results for UI or downstream consumption.
+    FormatNode: produce a user-friendly formatted response.
 
-    Input:
-        execution_result as returned by sql_executor.execute_sql:
-        {
-            "rows": [ {col: val, ...}, ... ],
-            "columns": [...],
-            "meta": {"rowcount": int, "runtime": float}
-        }
+    Preferred run signature:
+        run(sql: str, schemas: dict, retrieved: Optional[list],
+            execution: Optional[dict], raw: Optional[Any]) -> Dict[str, Any]
 
-    Output:
-        {
-            "preview_text": "<human readable preview>",
-            "columns": [...],
-            "rowcount": int,
-            "runtime": float,
-            "rows": [ ... ]  # truncated to max_preview
-        }
+    Returns a dict:
+    {
+      "output": <str|dict>,    # rendered text or structured object
+      "sql": <sql>,
+      "explain": <str> (optional),
+      "rows": <list> (optional),
+      "meta": {...} (optional)
+    }
     """
 
-    def __init__(self):
+    def __init__(self, pretty: bool = True):
+        self.pretty = pretty
+        logger.info("FormatNode initialized (pretty=%s)", self.pretty)
+
+    def run(self, sql: str, schemas: Optional[Dict[str, Any]] = None,
+            retrieved: Optional[List[Dict[str, Any]]] = None,
+            execution: Optional[Dict[str, Any]] = None,
+            raw: Optional[Any] = None) -> Dict[str, Any]:
         try:
-            logger.info("FormatNode initialized")
-        except Exception as e:
-            logger.exception("Failed to initialize FormatNode")
-            raise CustomException(e, sys)
-
-    def run(
-        self,
-        execution_result: Optional[Dict[str, Any]],
-        max_preview: int = 5
-    ) -> Dict[str, Any]:
-        """
-        Format an execution result dict for display.
-
-        Parameters
-        ----------
-        execution_result : Optional[Dict[str, Any]]
-            Output from sql_executor.execute_sql
-        max_preview : int
-            Maximum number of rows to include in preview_text and 'rows'
-
-        Returns
-        -------
-        Dict[str, Any]
-            Formatted result including preview text, columns, rowcount, runtime, and preview rows.
-        """
-        start_time = time.time()
-        try:
-            if not execution_result:
-                logger.info("FormatNode: empty execution_result provided")
-                return {
-                    "preview_text": "",
-                    "columns": [],
-                    "rowcount": 0,
-                    "runtime": 0.0,
-                    "rows": [],
-                }
-
-            rows = execution_result.get("rows", []) or []
-            columns = execution_result.get("columns", []) or []
-            meta = execution_result.get("meta", {}) or {}
-            rowcount = int(meta.get("rowcount", len(rows)))
-            runtime = float(meta.get("runtime", 0.0))
-
-            # Prepare preview rows
-            preview_rows: List[Dict[str, Any]] = []
-            for r in rows[:max_preview]:
-                if isinstance(r, dict):
-                    preview_rows.append(r)
-                elif columns:
-                    # Convert tuple/list rows to dict using columns
-                    preview_rows.append({col: val for col, val in zip(columns, r)})
-                else:
-                    # Fallback: represent row as single value
-                    preview_rows.append({"value": r})
-
-            # Generate human-readable preview text
-            preview_text = utils.preview_sample_rows(preview_rows, max_preview)
-
-            formatted_result = {
-                "preview_text": preview_text,
-                "columns": columns,
-                "rowcount": rowcount,
-                "runtime": runtime,
-                "rows": preview_rows,
+            # Basic formatted payload
+            payload: Dict[str, Any] = {
+                "sql": sql,
             }
 
-            duration = time.time() - start_time
-            logger.info(
-                "FormatNode: formatted result in %.3fs, rows_preview=%d",
-                duration,
-                len(preview_rows),
-            )
+            # Add execution results if present
+            if execution is not None:
+                # Accept execution in many shapes: dict with 'rows' or list of tuples
+                if isinstance(execution, dict):
+                    payload["rows"] = execution.get("rows") or execution.get("data") or execution.get("results")
+                    payload["meta"] = {k: v for k, v in execution.items() if k != "rows"}
+                else:
+                    payload["rows"] = execution
 
-            return formatted_result
+            # Simple explanation constructed from raw and retrieved docs
+            explain_parts = []
+            if retrieved:
+                explain_parts.append(f"{len(retrieved)} retrieved document(s) used for RAG context.")
+            if raw:
+                # try to pretty print the raw LLM output (non-sensitive)
+                try:
+                    explain_parts.append("Raw LLM output present.")
+                except Exception:
+                    pass
 
-        except CustomException:
-            raise
+            if explain_parts:
+                payload["explain"] = " ".join(explain_parts)
+
+            # Human-friendly output
+            if self.pretty:
+                # Try to build a short textual summary
+                output_lines = []
+                output_lines.append(f"SQL: {sql}")
+                if payload.get("rows") is not None:
+                    r_preview = payload["rows"][:3] if isinstance(payload["rows"], list) else str(payload["rows"])
+                    output_lines.append(f"Preview rows: {json.dumps(r_preview, default=str) if not isinstance(r_preview, str) else r_preview}")
+                if payload.get("explain"):
+                    output_lines.append(f"Notes: {payload['explain']}")
+                payload["output"] = "\n".join(output_lines)
+            else:
+                payload["output"] = payload
+
+            logger.info("FormatNode: formatted output ready (sql_len=%s)", len(sql or ""))
+            return payload
+
         except Exception as e:
             logger.exception("FormatNode.run failed")
             raise CustomException(e, sys)
+
+
+# backward-compatibility adapter that can wrap old signature formatters
+class FormatAdapter:
+    """
+    Wraps a format_node instance that may accept a different signature.
+    Adapter will attempt to call the underlying node with a modern signature,
+    then try fewer args (positional), then finally fall back to calling with only sql.
+
+    Useful if you have older FormatNode implementations in other repos.
+    """
+
+    def __init__(self, fmt_node):
+        self._node = fmt_node
+
+    def run(self, sql, schemas=None, retrieved=None, execution=None, raw=None):
+        # Try the node directly with the modern args
+        try:
+            return self._node.run(sql, schemas, retrieved, execution, raw)
+        except TypeError:
+            pass
+
+        # Try common older signature: run(sql, schemas, retrieved)
+        try:
+            return self._node.run(sql, schemas, retrieved)
+        except TypeError:
+            pass
+
+        # Try minimal signature: run(sql)
+        try:
+            return self._node.run(sql)
+        except TypeError:
+            pass
+
+        # Last resort: try with kwargs mapped
+        try:
+            return self._node.run(sql=sql, schemas=schemas, retrieved=retrieved, execution=execution, raw=raw)
+        except Exception as e:
+            # re-raise so builder's error handler can catch it
+            raise
