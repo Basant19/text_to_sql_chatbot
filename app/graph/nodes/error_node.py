@@ -1,5 +1,4 @@
 # app/graph/nodes/error_node.py
-
 import sys
 import traceback
 from typing import Any, Dict, Optional
@@ -18,16 +17,18 @@ class ErrorNode:
         node = ErrorNode()
         payload = node.run(exc, step="generate", context={"user_query": "..."}).
 
-    Returns:
+    This implementation returns a GraphBuilder-friendly result dict:
         {
-            "ok": False,
+            "prompt": None,
+            "sql": None,
+            "valid": False,
+            "execution": None,
+            "formatted": { "output": "<user-friendly msg>", "meta": {"debug": {...}} },
+            "raw": { ... normalized error object ... },
             "error": "<short message>",
-            "details": "<detailed message or repr>",
-            "step": "<step name where error occurred>",
-            "trace": "<stack trace string>"
+            "timings": context.get("timings", {})
         }
     """
-
     def __init__(self):
         try:
             logger.info("ErrorNode initialized")
@@ -35,67 +36,105 @@ class ErrorNode:
             logger.exception("Failed to initialize ErrorNode")
             raise CustomException(e, sys)
 
-    def run(
-        self,
-        exc: Exception,
-        step: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        Normalize the exception and return a dictionary suitable for UI/telemetry.
-
-        Parameters
-        ----------
-        exc : Exception
-            Exception instance (or anything convertible to str)
-        step : Optional[str]
-            Identifier for the step where the exception occurred
-        context : Optional[Dict[str, Any]]
-            Additional context information (not deeply serialized)
-
-        Returns
-        -------
-        Dict[str, Any]
-            Standardized error payload
-        """
+    def _normalize_exception(self, exc: Any) -> Dict[str, Any]:
+        """Return a normalized dict with short message, details and stack trace (if available)."""
         try:
-            # Short message
-            short_msg = str(exc) or exc.__class__.__name__
-
-            # Details: extract human-friendly message if CustomException
+            short_msg = str(exc) if exc is not None else "Unknown error"
             if isinstance(exc, CustomException):
                 details = getattr(exc, "error_message", None) or short_msg
             else:
                 details = repr(exc)
 
-            # Stack trace
-            trace_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) \
-                if isinstance(exc, BaseException) else None
+            trace_str = None
+            if isinstance(exc, BaseException):
+                trace_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
-            payload = {
-                "ok": False,
-                "error": short_msg,
-                "details": details,
-                "step": step,
-                "trace": trace_str,
-            }
+            return {"error": short_msg, "details": details, "trace": trace_str}
+        except Exception as e:
+            # fallback
+            logger.exception("ErrorNode._normalize_exception failed")
+            return {"error": "Failed to normalize exception", "details": repr(e), "trace": None}
 
-            # Log for observability
-            if trace_str:
-                logger.error("ErrorNode caught exception at step=%s: %s\n%s", step, short_msg, trace_str)
+    def run(
+        self,
+        exc: Any,
+        step: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Normalize the exception and return a GraphBuilder-compatible error payload.
+
+        Parameters
+        ----------
+        exc : Exception | Any
+            The exception or error-like object.
+        step : Optional[str]
+            Identifier for pipeline step (generate/validate/execute/etc.)
+        context : Optional[Dict[str, Any]]
+            Additional run-time context (may include timings).
+        """
+        try:
+            ctx = context or {}
+            timings = ctx.get("timings", {})
+
+            # Build normalized error dict for logs and developer debug
+            norm = self._normalize_exception(exc)
+            short_msg = norm.get("error") or "Error"
+            details = norm.get("details")
+            trace = norm.get("trace")
+
+            # Log with trace for observability
+            if trace:
+                logger.error("ErrorNode caught exception at step=%s: %s\n%s", step, short_msg, trace)
             else:
                 logger.error("ErrorNode caught exception at step=%s: %s", step, short_msg)
 
-            return payload
+            # Build a concise user-facing formatted response
+            user_message = f"An error occurred while processing your request."
+            if step:
+                user_message += f" Step: {step}."
+            # include a short reason if available (keep it user-friendly)
+            if short_msg:
+                user_message += f" Reason: {short_msg}"
+
+            formatted = {
+                "output": user_message,
+                "explain": "See developer details for full error information.",
+                "meta": {
+                    "debug": {
+                        "step": step,
+                        "error_short": short_msg,
+                        "error_details": details,
+                        # include truncated trace for dev but avoid huge dumps
+                        "error_trace": trace if trace and len(trace) < 20000 else (trace[:20000] + "..." if trace else None),
+                        "context": {k: v for k, v in (ctx.items() if isinstance(ctx, dict) else [])}
+                    }
+                }
+            }
+
+            # GraphBuilder-compatible error payload
+            return {
+                "prompt": None,
+                "sql": None,
+                "valid": False,
+                "execution": None,
+                "formatted": formatted,
+                "raw": norm,
+                "error": short_msg,
+                "timings": timings or {},
+            }
 
         except Exception as e:
-            # Failsafe: if normalization itself fails
-            fallback_trace = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-            logger.exception("ErrorNode failed while formatting exception: %s", fallback_trace)
+            # If normalization itself fails, return a minimal error payload
+            fallback = {"error": "ErrorNode failed while handling another error", "details": repr(e)}
+            logger.exception("ErrorNode.run failed while handling exception: %s", fallback)
             return {
-                "ok": False,
-                "error": "ErrorNode failed to normalize exception",
-                "details": repr(e),
-                "step": step,
-                "trace": fallback_trace,
+                "prompt": None,
+                "sql": None,
+                "valid": False,
+                "execution": None,
+                "formatted": {"output": "Internal error", "meta": {"debug": {"fallback": fallback}}},
+                "raw": fallback,
+                "error": fallback.get("error"),
+                "timings": context.get("timings") if isinstance(context, dict) else {},
             }

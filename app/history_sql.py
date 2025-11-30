@@ -1,13 +1,39 @@
 # app/history_sql.py
-import sys
+"""
+SQLite-first HistoryStore with conversation/message model (ChatGPT-style).
+
+Changes made (high level):
+- Uses SQLite only (no JSON backend) and creates two tables: conversations and messages.
+- Conversations store metadata (id, name, created_at, updated_at, meta JSON).
+- Messages are normalized into a messages table: id, conversation_id, role, content,
+  meta JSON, created_at, position (message order).
+- Provides conversation API: create_conversation, list_conversations (summaries),
+  get_conversation (full), append_message, update_conversation_name, delete_conversation,
+  export_conversation, migrate_from_legacy_json.
+- Backwards-compatible helper add_entry that creates a single-message conversation
+  (keeps old callers working).
+
+Design choices:
+- SQLite with WAL journal and foreign keys enabled for safety and concurrency.
+- JSON meta columns stored as TEXT using json.dumps with a safe serializer.
+- Every public method uses transactions and commits; errors raise CustomException.
+- Keep full LLM blobs optional (store them in message.meta under a key; user can
+  control via config flag STORE_FULL_LLM_BLOBS).
+
+This file replaces the previous ad-hoc JSON/sql hybrid and implements a clear
+conversation-first API suitable for the Streamlit chat UI (left sidebar list +
+message stream in main view).
+"""
+
 import os
+import sys
 import json
+import sqlite3
 import tempfile
 import uuid
 import time
-import sqlite3
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -18,43 +44,30 @@ logger = get_logger("history_store")
 
 def _make_json_serializable(obj: Any) -> Any:
     """
-    Convert objects to JSON-serializable forms.
-    Special-case LangChain message objects when available, datetimes, bytes,
-    sets, objects with to_dict(), dataclasses / __dict__ and finally fall back to str().
+    Convert objects to JSON-serializable forms. Keep identical to prior helper but
+    kept here for json.dumps default.
     """
-    # 1) LangChain message objects (AIMessage/HumanMessage/SystemMessage)
     try:
-        # lazy import: don't require langchain to be installed
         from langchain.schema import AIMessage, HumanMessage, SystemMessage  # type: ignore
         if isinstance(obj, (AIMessage, HumanMessage, SystemMessage)):
             return {
                 "message_type": getattr(obj, "type", obj.__class__.__name__),
-                "content": getattr(obj, "content", str(obj))
+                "content": getattr(obj, "content", str(obj)),
             }
     except Exception:
-        # not installed or different API — ignore
         pass
 
-    # Basic types
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
-
-    # datetime/date
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
-
-    # bytes
     if isinstance(obj, (bytes, bytearray)):
         try:
             return obj.decode("utf-8")
         except Exception:
             return str(obj)
-
-    # set -> list
     if isinstance(obj, set):
         return list(obj)
-
-    # objects with to_dict()
     try:
         if hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
             try:
@@ -63,8 +76,6 @@ def _make_json_serializable(obj: Any) -> Any:
                 pass
     except Exception:
         pass
-
-    # objects with __dict__
     try:
         if hasattr(obj, "__dict__"):
             d = {}
@@ -76,299 +87,347 @@ def _make_json_serializable(obj: Any) -> Any:
             return d
     except Exception:
         pass
-
-    # fallback
     try:
         return str(obj)
     except Exception:
         return repr(obj)
 
 
-def _write_json_file_atomic(path: str, items: Any) -> None:
-    """
-    Write `items` to `path` atomically; use _make_json_serializable as json.default
-    to tolerate non-serializable values (LLM message objects, etc).
-    """
-    tmp_path = None
-    try:
-        dirpath = os.path.dirname(path) or "."
-        os.makedirs(dirpath, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_history_", dir=dirpath, text=True)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2, default=_make_json_serializable)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except Exception as e:
-        # cleanup tmp file if present
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        raise CustomException(e, sys)
-
-
 class HistoryStore:
     """
-    Simple history persistence with pluggable backends: "json" (default) or "sqlite".
+    Conversation-first history store backed by SQLite.
 
-    Methods:
-      - add_entry(name, query, result) -> entry dict (with id)
-      - update_entry(entry_id, **fields) -> updated entry dict or None
-      - delete_entry(entry_id)
-      - export_json(path=None) -> path of exported JSON
-      - list_entries() -> list of entries
+    Public methods (high-level):
+      - create_conversation(name, first_message) -> conversation dict
+      - list_conversations() -> list of conversation summaries
+      - get_conversation(conversation_id) -> full conversation dict
+      - append_message(conversation_id, message) -> message dict
+      - update_conversation_name(conversation_id, new_name) -> bool
+      - delete_conversation(conversation_id) -> bool
+      - export_conversation(conversation_id, path=None) -> path
+      - migrate_from_legacy_json(path) -> int (count migrated)
+
+    Message format expected by append_message:
+      {"id": "<uuid>", "role":"user|assistant", "content":"...", "meta": {...}, "created_at":"..."}
+
+    Conversation dict returned from get_conversation:
+      {"id":..., "name":..., "messages": [...], "created_at":..., "updated_at":..., "meta": {...}}
     """
 
-    def __init__(self, backend: str = "json", store_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None):
         try:
-            self.backend = backend or "json"
             data_dir = getattr(config_module, "DATA_DIR", "./data")
             os.makedirs(data_dir, exist_ok=True)
-            # JSON file path
-            self.json_path = store_path or os.path.join(data_dir, "history.json")
-            # In-memory fallback
-            self._mem: List[Dict[str, Any]] = []
-            # sqlite connection if requested
-            self._conn: Optional[sqlite3.Connection] = None
-
-            if self.backend == "sqlite":
-                self._init_sqlite(os.path.join(data_dir, "history.db"))
-            else:
-                # ensure file exists
-                if not os.path.exists(self.json_path):
-                    _write_json_file_atomic(self.json_path, [])
-                self._load_from_json()
-            logger.info("HistoryStore initialized (backend=%s) at %s", self.backend, self.json_path)
+            self.db_path = db_path or os.path.join(data_dir, "history.db")
+            # sqlite connection
+            self._conn: sqlite3.Connection = sqlite3.connect(
+                self.db_path, check_same_thread=False, isolation_level=None
+            )
+            # pragmas for durability and concurrency
+            cur = self._conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL;")
+            cur.execute("PRAGMA foreign_keys=ON;")
+            cur.execute("PRAGMA busy_timeout=5000;")
+            self._conn.row_factory = sqlite3.Row
+            self._init_schema()
+            logger.info("HistoryStore (sqlite) initialized at %s", self.db_path)
         except Exception as e:
             logger.exception("HistoryStore initialization failed")
             raise CustomException(e, sys)
 
+    def _init_schema(self) -> None:
+        cur = self._conn.cursor()
+        cur.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                meta_json TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations (updated_at);
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                meta_json TEXT,
+                created_at TEXT,
+                position INTEGER,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_conv_pos ON messages (conversation_id, position);
+            """
+        )
+        self._conn.commit()
+
     # --------------------------
-    # SQLite backend helpers
+    # Helpers
     # --------------------------
-    def _init_sqlite(self, path: str) -> None:
+    def _now(self) -> str:
+        return datetime.utcnow().isoformat() + "Z"
+
+    def _serialize(self, obj: Any) -> str:
+        return json.dumps(obj, default=_make_json_serializable, ensure_ascii=False)
+
+    def _deserialize(self, s: Optional[str]) -> Any:
+        if not s:
+            return None
         try:
-            conn = sqlite3.connect(path, check_same_thread=False)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS history (
-                    id TEXT PRIMARY KEY,
-                    name TEXT,
-                    query TEXT,
-                    result_json TEXT,
-                    created_at TEXT,
-                    updated_at TEXT
-                )
-                """
+            return json.loads(s)
+        except Exception:
+            return s
+
+    # --------------------------
+    # Conversation API
+    # --------------------------
+    def create_conversation(self, name: str, first_message: Optional[Dict[str, Any]] = None, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Create a new conversation and optionally append a first message."""
+        try:
+            conv_id = uuid.uuid4().hex
+            now = self._now()
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO conversations (id, name, created_at, updated_at, meta_json) VALUES (?, ?, ?, ?, ?)",
+                (conv_id, name, now, now, self._serialize(meta or {})),
             )
-            conn.commit()
-            self._conn = conn
+            if first_message:
+                # normalize message
+                msg = self._normalize_message(first_message)
+                self._insert_message(conv_id, msg, position=0)
+                # update conversation updated_at
+                cur.execute("UPDATE conversations SET updated_at=? WHERE id=?", (self._now(), conv_id))
+            self._conn.commit()
+            return self.get_conversation(conv_id)
         except Exception as e:
-            logger.exception("Failed to initialize sqlite backend; falling back to json")
-            self._conn = None
-            self.backend = "json"
-            # create json file
-            if not os.path.exists(self.json_path):
-                _write_json_file_atomic(self.json_path, [])
-            self._load_from_json()
+            logger.exception("Failed to create conversation")
+            raise CustomException(e, sys)
 
-    # --------------------------
-    # JSON persistence helpers
-    # --------------------------
-    def _load_from_json(self) -> None:
-        try:
-            if os.path.exists(self.json_path):
-                with open(self.json_path, "r", encoding="utf-8") as f:
-                    items = json.load(f)
-                    if isinstance(items, list):
-                        self._mem = items
-                    else:
-                        # unexpected shape; reset
-                        self._mem = []
-            else:
-                self._mem = []
-        except Exception as e:
-            logger.exception("Failed to load history JSON; using empty in-memory store")
-            self._mem = []
-
-    def _persist_json(self) -> None:
-        try:
-            _write_json_file_atomic(self.json_path, self._mem)
-        except Exception as e:
-            logger.exception("Failed to persist history JSON")
-            # surface exception to caller as CustomException
-            raise
-
-    # --------------------------
-    # CRUD operations
-    # --------------------------
-    def add_entry(self, name: str, query: str, result: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Add an entry and persist. Returns the stored entry.
+    def list_conversations(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """Return conversation summaries (id, name, snippet, last_message_at, updated_at).
+        Keep payload small so UI can render the left sidebar quickly.
         """
         try:
-            now = datetime.utcnow().isoformat() + "Z"
-            entry_id = uuid.uuid4().hex
-            entry = {
-                "id": entry_id,
-                "name": name,
-                "query": query,
-                "result": result,
-                "created_at": now,
-                "updated_at": now,
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT id, name, created_at, updated_at, meta_json FROM conversations ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+            rows = cur.fetchall()
+            result = []
+            for r in rows:
+                conv_id = r["id"]
+                # fetch last message snippet
+                last_msg = self._get_last_message_snippet(conv_id)
+                result.append(
+                    {
+                        "id": conv_id,
+                        "name": r["name"],
+                        "created_at": r["created_at"],
+                        "updated_at": r["updated_at"],
+                        "meta": self._deserialize(r["meta_json"]),
+                        "last_message_snippet": last_msg,
+                    }
+                )
+            return result
+        except Exception as e:
+            logger.exception("Failed to list conversations")
+            raise CustomException(e, sys)
+
+    def get_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        """Return full conversation with ordered messages."""
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT id, name, created_at, updated_at, meta_json FROM conversations WHERE id = ?", (conversation_id,))
+            row = cur.fetchone()
+            if not row:
+                raise CustomException(RuntimeError(f"Conversation not found: {conversation_id}"), sys)
+            cur.execute(
+                "SELECT id, role, content, meta_json, created_at, position FROM messages WHERE conversation_id = ? ORDER BY position ASC",
+                (conversation_id,),
+            )
+            messages = []
+            for m in cur.fetchall():
+                messages.append(
+                    {
+                        "id": m["id"],
+                        "role": m["role"],
+                        "content": m["content"],
+                        "meta": self._deserialize(m["meta_json"]),
+                        "created_at": m["created_at"],
+                        "position": m["position"],
+                    }
+                )
+            return {
+                "id": row["id"],
+                "name": row["name"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "meta": self._deserialize(row["meta_json"]),
+                "messages": messages,
             }
-
-            if self.backend == "sqlite" and self._conn:
-                # store result as JSON string (use our serializable helper)
-                result_json = json.dumps(entry["result"], default=_make_json_serializable, ensure_ascii=False)
-                cur = self._conn.cursor()
-                cur.execute(
-                    "INSERT INTO history (id, name, query, result_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (entry_id, name, query, result_json, entry["created_at"], entry["updated_at"]),
-                )
-                self._conn.commit()
-                return entry
-            else:
-                # JSON backend
-                self._mem.append(entry)
-                try:
-                    self._persist_json()
-                except Exception:
-                    logger.exception("Persisting to JSON failed; entry remains in memory")
-                return entry
+        except CustomException:
+            raise
         except Exception as e:
-            logger.exception("Failed to add history entry")
+            logger.exception("Failed to get conversation %s", conversation_id)
             raise CustomException(e, sys)
 
-    def update_entry(self, entry_id: str, **fields) -> Optional[Dict[str, Any]]:
-        """
-        Update an existing entry (name/query/result). Returns updated entry or None.
+    def append_message(self, conversation_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Append a message to an existing conversation.
+
+        Message expected shape: {"id":..., "role":"user|assistant", "content":..., "meta": {...}, "created_at": ...}
+        If message.id is missing, one will be generated. Position is computed automatically.
         """
         try:
-            if self.backend == "sqlite" and self._conn:
-                cur = self._conn.cursor()
-                # load existing
-                cur.execute("SELECT name, query, result_json, created_at FROM history WHERE id = ?", (entry_id,))
-                row = cur.fetchone()
-                if not row:
-                    return None
-                name, query, result_json, created_at = row
-                result_obj = json.loads(result_json)
-                # apply fields
-                name = fields.get("name", name)
-                query = fields.get("query", query)
-                if "result" in fields:
-                    result_obj = fields["result"]
-                updated_at = datetime.utcnow().isoformat() + "Z"
-                cur.execute(
-                    "UPDATE history SET name=?, query=?, result_json=?, updated_at=? WHERE id=?",
-                    (name, query, json.dumps(result_obj, default=_make_json_serializable, ensure_ascii=False), updated_at, entry_id),
-                )
-                self._conn.commit()
-                return {
-                    "id": entry_id,
-                    "name": name,
-                    "query": query,
-                    "result": result_obj,
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                }
-            else:
-                for e in self._mem:
-                    if e.get("id") == entry_id:
-                        for k, v in fields.items():
-                            if k == "result":
-                                e["result"] = v
-                            elif k in ("name", "query"):
-                                e[k] = v
-                        e["updated_at"] = datetime.utcnow().isoformat() + "Z"
-                        try:
-                            self._persist_json()
-                        except Exception:
-                            logger.exception("Failed to persist history update to JSON")
-                        return e
-                return None
+            msg = self._normalize_message(message)
+            # compute next position
+            cur = self._conn.cursor()
+            cur.execute("SELECT MAX(position) FROM messages WHERE conversation_id = ?", (conversation_id,))
+            row = cur.fetchone()
+            max_pos = 0 if row is None or row[0] is None else int(row[0]) + 1
+            self._insert_message(conversation_id, msg, position=max_pos)
+            # update conversation updated_at
+            cur.execute("UPDATE conversations SET updated_at=? WHERE id=?", (self._now(), conversation_id))
+            self._conn.commit()
+            # return the inserted message dict
+            return msg
         except Exception as e:
-            logger.exception("Failed to update history entry")
+            logger.exception("Failed to append message to conversation %s", conversation_id)
             raise CustomException(e, sys)
 
-    def delete_entry(self, entry_id: str) -> bool:
-        """
-        Delete the entry; return True if deleted, False if not found.
-        """
+    def update_conversation_name(self, conversation_id: str, new_name: str) -> bool:
         try:
-            if self.backend == "sqlite" and self._conn:
-                cur = self._conn.cursor()
-                cur.execute("DELETE FROM history WHERE id = ?", (entry_id,))
-                self._conn.commit()
-                return cur.rowcount > 0
-            else:
-                for i, e in enumerate(self._mem):
-                    if e.get("id") == entry_id:
-                        self._mem.pop(i)
-                        try:
-                            self._persist_json()
-                        except Exception:
-                            logger.exception("Failed to persist history deletion to JSON")
-                        return True
-                return False
+            cur = self._conn.cursor()
+            cur.execute("UPDATE conversations SET name=?, updated_at=? WHERE id=?", (new_name, self._now(), conversation_id))
+            self._conn.commit()
+            return cur.rowcount > 0
         except Exception as e:
-            logger.exception("Failed to delete history entry")
+            logger.exception("Failed to update conversation name %s", conversation_id)
             raise CustomException(e, sys)
 
-    def list_entries(self) -> List[Dict[str, Any]]:
-        """
-        Return all entries (JSON-deserialized objects).
-        """
+    def delete_conversation(self, conversation_id: str) -> bool:
         try:
-            if self.backend == "sqlite" and self._conn:
-                cur = self._conn.cursor()
-                cur.execute("SELECT id, name, query, result_json, created_at, updated_at FROM history ORDER BY created_at ASC")
-                rows = cur.fetchall()
-                result = []
-                for r in rows:
-                    id_, name, query, result_json, created_at, updated_at = r
-                    try:
-                        result_obj = json.loads(result_json)
-                    except Exception:
-                        result_obj = result_json
-                    result.append({
-                        "id": id_,
-                        "name": name,
-                        "query": query,
-                        "result": result_obj,
-                        "created_at": created_at,
-                        "updated_at": updated_at,
-                    })
-                return result
-            else:
-                # ensure in-memory has been loaded
-                if self._mem is None:
-                    self._load_from_json()
-                return list(self._mem)
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
         except Exception as e:
-            logger.exception("Failed to list history entries")
+            logger.exception("Failed to delete conversation %s", conversation_id)
             raise CustomException(e, sys)
 
-    def export_json(self, path: Optional[str] = None) -> str:
-        """
-        Export history to a JSON file. If path is None, export to data/history_export_<ts>.json
-        Returns the path written.
-        """
+    def export_conversation(self, conversation_id: str, path: Optional[str] = None) -> str:
         try:
+            conv = self.get_conversation(conversation_id)
             ts = int(time.time())
             data_dir = getattr(config_module, "DATA_DIR", "./data")
             os.makedirs(data_dir, exist_ok=True)
-            out_path = path or os.path.join(data_dir, f"history_export_{ts}.json")
-            entries = self.list_entries()
-            _write_json_file_atomic(out_path, entries)
+            out_path = path or os.path.join(data_dir, f"conversation_export_{conversation_id[:8]}_{ts}.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(conv, f, ensure_ascii=False, indent=2)
             return out_path
         except Exception as e:
-            logger.exception("Failed to export history to JSON")
+            logger.exception("Failed to export conversation %s", conversation_id)
             raise CustomException(e, sys)
 
-    # Backwards-compatibility alias: older callers may call add_entry_and_return(...)
-    # Keep add_entry as the canonical method and alias the older name to it.
-    add_entry_and_return = add_entry
+    # --------------------------
+    # Backwards compatibility: add_entry -> create a conversation
+    # --------------------------
+    def add_entry(self, name: str, query: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Backwards-compatible helper: create a conversation with two messages:
+          - user query
+          - assistant result (stored in meta)
+        Returns the created conversation.
+        """
+        try:
+            user_msg = {"id": uuid.uuid4().hex, "role": "user", "content": query, "meta": {}, "created_at": self._now()}
+            assistant_msg = {"id": uuid.uuid4().hex, "role": "assistant", "content": (result.get("formatted") or {}).get("output") if isinstance(result, dict) else str(result), "meta": result, "created_at": self._now()}
+            conv = self.create_conversation(name=name, first_message=user_msg)
+            # append assistant message
+            self.append_message(conv["id"], assistant_msg)
+            return self.get_conversation(conv["id"])
+        except Exception as e:
+            logger.exception("Failed to add_entry compatibility path")
+            raise CustomException(e, sys)
+
+    # --------------------------
+    # Legacy migration
+    # --------------------------
+    def migrate_from_legacy_json(self, json_path: str) -> int:
+        """Migrate old history.json entries (per-query) into conversations.
+        Returns number of records migrated.
+        """
+        if not os.path.exists(json_path):
+            return 0
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                items = json.load(f)
+        except Exception as e:
+            logger.exception("Failed to load legacy JSON for migration")
+            raise CustomException(e, sys)
+        migrated = 0
+        for item in items:
+            try:
+                name = item.get("name") or f"Conversation {migrated+1}"
+                query = item.get("query") or ""
+                result = item.get("result") or {}
+                user_msg = {"id": uuid.uuid4().hex, "role": "user", "content": query, "meta": {}, "created_at": item.get("created_at") or self._now()}
+                assistant_msg = {"id": uuid.uuid4().hex, "role": "assistant", "content": (result.get("formatted") or {}).get("output") if isinstance(result, dict) else str(result), "meta": result, "created_at": item.get("updated_at") or self._now()}
+                conv = self.create_conversation(name=name, first_message=user_msg)
+                self.append_message(conv["id"], assistant_msg)
+                migrated += 1
+            except Exception:
+                logger.exception("Failed migrating item %s", item.get("id"))
+                continue
+        logger.info("Migration completed: %d items migrated from %s", migrated, json_path)
+        return migrated
+
+    # --------------------------
+    # Internal helpers
+    # --------------------------
+    def _normalize_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        m = dict(message)
+        if not m.get("id"):
+            m["id"] = uuid.uuid4().hex
+        if not m.get("created_at"):
+            m["created_at"] = self._now()
+        if "meta" not in m:
+            m["meta"] = {}
+        # ensure role is present
+        if "role" not in m:
+            m["role"] = "assistant"
+        return m
+
+    def _insert_message(self, conversation_id: str, message: Dict[str, Any], position: int) -> None:
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO messages (id, conversation_id, role, content, meta_json, created_at, position) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                message["id"],
+                conversation_id,
+                message.get("role"),
+                message.get("content"),
+                self._serialize(message.get("meta")),
+                message.get("created_at"),
+                position,
+            ),
+        )
+
+    def _get_last_message_snippet(self, conversation_id: str, length: int = 120) -> Optional[str]:
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT content FROM messages WHERE conversation_id = ? ORDER BY position DESC LIMIT 1",
+            (conversation_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        content = row["content"] or ""
+        snippet = content.strip().replace("\n", " ")
+        if len(snippet) > length:
+            snippet = snippet[: length - 1] + "…"
+        return snippet
