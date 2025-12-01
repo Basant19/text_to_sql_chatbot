@@ -1,8 +1,7 @@
-# app/graph/builder.py
 import sys
 import time
 import inspect
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -13,91 +12,69 @@ logger = get_logger("graph_builder")
 def _try_call_run(node: Any, *args, **kwargs) -> Any:
     """
     Resilient caller for node.run:
-      - First attempt to bind args/kwargs to the function signature using inspect.signature.bind_partial.
-        If binding succeeds, call the function directly so runtime TypeErrors inside the function are
-        propagated (and not misinterpreted as signature mismatches).
-      - If binding fails, treat it as a signature mismatch and attempt adaptive calling:
-          * progressively fewer positional args (keeping kwargs)
-          * mapping positional args to parameter names and calling with filtered kwargs
-      - If nothing works, re-raise the last TypeError.
-
-    This prevents masking runtime TypeErrors raised inside a node's implementation.
+      - Bind args/kwargs to signature if possible to allow runtime TypeErrors to propagate.
+      - Otherwise attempt adaptive calling strategies to handle signature variations.
     """
     if node is None:
         raise RuntimeError("Node is None, cannot call run()")
 
-    # allow passing node instance or class with run as attribute
     run_fn = getattr(node, "run", None)
     if run_fn is None or not callable(run_fn):
         raise AttributeError(f"Node {node} has no callable run()")
 
     last_exc = None
 
-    # 0) Try to bind args/kwargs to signature first to distinguish signature mismatch vs runtime TypeError
+    # 0) Try to bind args/kwargs to signature first
     try:
         sig = inspect.signature(run_fn)
         try:
             sig.bind_partial(*args, **kwargs)
-            # binding succeeded -> safe to call directly (let runtime TypeErrors propagate)
             return run_fn(*args, **kwargs)
         except TypeError:
-            # binding failed -> treat as signature mismatch and attempt adaptive calls below
             pass
     except (ValueError, TypeError):
-        # inspect.signature can fail for builtins/C-implemented callables; fall back to a direct attempt
         try:
             return run_fn(*args, **kwargs)
         except TypeError as e:
             last_exc = e
         except Exception:
-            # real runtime exception -> propagate
             raise
 
-    # 1) Try progressively fewer positional args (keep kwargs intact)
+    # 1) Try progressively fewer positional args (keep kwargs)
     for n in range(len(args), -1, -1):
         try:
             return run_fn(*args[:n], **kwargs)
         except TypeError as e:
             last_exc = e
         except Exception:
-            # real runtime error — re-raise so caller/error node handles it
             raise
 
-    # 2) Try calling using signature introspection with matching keyword names
+    # 2) Try mapping positional args by parameter names
     try:
         sig = inspect.signature(run_fn)
         call_kwargs = {}
         params = list(sig.parameters.values())
-        # Map positional args by parameter names when possible
         for i, a in enumerate(args):
             if i < len(params):
                 name = params[i].name
                 call_kwargs[name] = a
-        # Merge explicit kwargs (kwargs override)
         call_kwargs.update(kwargs)
-        # Filter call_kwargs to only those parameters accepted by the function
         accepted = {p.name for p in params if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
         filtered = {k: v for k, v in call_kwargs.items() if k in accepted}
         return run_fn(**filtered)
     except TypeError as e:
         last_exc = e
     except Exception:
-        # real runtime error -> propagate
         raise
 
-    # 3) Nothing worked — raise the last TypeError to indicate signature mismatch
     raise last_exc or RuntimeError("Failed to call node.run() for unknown reasons")
 
 
 class GraphBuilder:
     """
     Orchestrator wiring nodes into a linear flow:
-
         context_node -> retrieve_node -> prompt_node -> generate_node ->
         validate_node -> execute_node -> format_node
-
-    This version is defensive: it adapts to node signature variations and uses an ErrorNode
-    (if provided) to format or handle exceptions.
     """
 
     def __init__(
@@ -124,8 +101,7 @@ class GraphBuilder:
     @staticmethod
     def build_default():
         """
-        Build a default graph using the project's node implementations.
-        Lazy imports so module can be imported without actually having all deps.
+        Build a default graph using the project's node implementations. Lazy imports.
         """
         try:
             from app.graph.nodes.context_node import ContextNode
@@ -144,7 +120,7 @@ class GraphBuilder:
         provider_client = None
         tracer_client = None
 
-        # Try permissive config (don't require provider keys here)
+        # permissive config (don't require provider keys)
         try:
             from app.config import Config
             cfg = Config(require_keys=False)
@@ -195,17 +171,27 @@ class GraphBuilder:
             context_node = ContextNode(tools=tools) if tools is not None else ContextNode()
             retrieve_node = RetrieveNode(tools=tools) if tools is not None else RetrieveNode()
             prompt_node = PromptNode() if tools is None else PromptNode(prompt_builder=None)
+
             # GenerateNode may accept kwargs provider_client/tracer_client/tools — try both ways when constructing
             try:
-                # try modern signature with tools + provider/tracer
                 generate_node = GenerateNode(provider_client=provider_client, tracer_client=tracer_client, tools=tools)
             except TypeError:
                 try:
                     generate_node = GenerateNode(provider_client, tracer_client)
                 except Exception:
                     generate_node = GenerateNode()
+
             validate_node = ValidateNode()
-            execute_node = ExecuteNode(tools=tools) if tools is not None else ExecuteNode()
+
+            # ExecuteNode: try flexible constructor signatures
+            try:
+                execute_node = ExecuteNode(tools=tools) if tools is not None else ExecuteNode()
+            except TypeError:
+                try:
+                    execute_node = ExecuteNode(tools)
+                except TypeError:
+                    execute_node = ExecuteNode()
+
             raw_format = FormatNode()
             format_node = FormatAdapter(raw_format)
             error_node = ErrorNode()
@@ -213,6 +199,7 @@ class GraphBuilder:
             logger.exception("Failed to instantiate nodes for default graph")
             raise CustomException(e, sys)
 
+        # Return the fully constructed GraphBuilder
         return GraphBuilder(
             context_node=context_node,
             retrieve_node=retrieve_node,
@@ -228,8 +215,6 @@ class GraphBuilder:
         """
         Attempt to use the configured error_node to produce a friendly result payload.
         Pass the 'step' to the error_node so it can include it in the formatted output.
-
-        If error_node fails, fall back to a standard error dict.
         """
         logger.exception("GraphBuilder: handling exception at step=%s via error_node: %s", step, exc)
         try:
@@ -239,16 +224,13 @@ class GraphBuilder:
                     try:
                         return self.error_node.run(exc, step=step, context=ctx)
                     except TypeError:
-                        # fallback to positional: run(exc, step, ctx)
                         try:
                             return self.error_node.run(exc, step, ctx)
                         except Exception:
-                            # try single-arg run
                             try:
                                 return self.error_node.run(exc)
                             except Exception:
                                 pass
-                # legacy: handle()
                 if hasattr(self.error_node, "handle"):
                     try:
                         return self.error_node.handle(exc, ctx)
@@ -257,7 +239,6 @@ class GraphBuilder:
         except Exception:
             logger.exception("ErrorNode failed while handling exception at step=%s", step)
 
-        # fallback raw error response (include step in payload)
         return {
             "prompt": None,
             "sql": None,
@@ -273,7 +254,6 @@ class GraphBuilder:
     def run(self, user_query: str, csv_names: list, run_query: bool = False) -> Dict[str, Any]:
         """
         Execute the graph end-to-end in a resilient manner.
-        Each node is called defensively to accommodate different node signatures.
         """
         start_all = time.time()
         timings: Dict[str, float] = {}
@@ -302,9 +282,7 @@ class GraphBuilder:
             # retrieve_node -> retrieved docs
             t1 = time.time()
             try:
-                # try passing (user_query, schemas) first (most implementations expect schemas)
                 retrieved = _try_call_run(self.retrieve_node, user_query, schemas)
-                # normalize
                 if retrieved is None:
                     retrieved = []
             except Exception as e:
@@ -314,14 +292,13 @@ class GraphBuilder:
             # prompt_node -> prompt text
             t2 = time.time()
             try:
-                # try (user_query, schemas, retrieved_docs=retrieved) / (user_query, schemas, retrieved)
                 prompt = _try_call_run(self.prompt_node, user_query, schemas, retrieved_docs=retrieved)
             except Exception as e:
                 return self._handle_error_node(e, ctx_for_error, step="prompt")
             timings["prompt"] = time.time() - t2
             result["prompt"] = prompt
 
-            # generate_node -> generation result (dict|tuple|str)
+            # generate_node -> generation result
             t3 = time.time()
             try:
                 gen = _try_call_run(self.generate_node, prompt)
@@ -331,12 +308,10 @@ class GraphBuilder:
 
             # Normalize generation output
             raw = gen.get("raw") if isinstance(gen, dict) else gen
-            # sql may be in dict key "sql" or "text" or returned as tuple/list
             sql = None
             if isinstance(gen, dict):
                 sql = gen.get("sql") or gen.get("text") or gen.get("output") or ""
             elif isinstance(gen, (list, tuple)) and len(gen) > 0:
-                # prefer first element if tuple (sql, prompt, raw) style
                 sql = gen[0]
             else:
                 sql = str(gen) if gen is not None else ""
@@ -351,17 +326,13 @@ class GraphBuilder:
                 return self._handle_error_node(e, ctx_for_error, step="validate")
             timings["validate"] = time.time() - t4
 
-            # val expected to be dict {"sql":..., "valid":bool, "errors":[...]}
             if isinstance(val, dict):
-                # if validation modified sql (e.g., applied LIMIT), pick it up
                 sql = val.get("sql", sql)
                 result["sql"] = sql
                 result["valid"] = bool(val.get("valid", False))
-                # collect validation errors if present
                 if val.get("errors"):
                     result.setdefault("validation_errors", []).extend(val.get("errors"))
             else:
-                # non-dict return fall back: treat truthiness as validity
                 result["valid"] = bool(val)
 
             # optionally execute SQL
@@ -371,7 +342,6 @@ class GraphBuilder:
                 try:
                     execution_result = _try_call_run(self.execute_node, sql, schemas)
                 except Exception as e:
-                    # execution failure — hand off to error_node for formatting (but include what we have)
                     ctx_for_error.update({"sql": sql, "execution_error": str(e)})
                     return self._handle_error_node(e, ctx_for_error, step="execute")
                 timings["execute"] = time.time() - t5
@@ -380,16 +350,9 @@ class GraphBuilder:
             # format_node -> produce formatted output
             t6 = time.time()
             try:
-                # Try flexible calling patterns for format_node (it might accept fewer args)
                 formatted = _try_call_run(self.format_node, sql, schemas, retrieved, execution_result, raw)
             except Exception as e:
-                # If formatting fails, use error node to produce a response (with partial data)
-                ctx_for_error.update({
-                    "sql": sql,
-                    "raw": raw,
-                    "retrieved": retrieved,
-                    "execution": execution_result,
-                })
+                ctx_for_error.update({"sql": sql, "raw": raw, "retrieved": retrieved, "execution": execution_result})
                 return self._handle_error_node(e, ctx_for_error, step="format")
             timings["format"] = time.time() - t6
             result["formatted"] = formatted

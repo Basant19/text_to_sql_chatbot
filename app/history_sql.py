@@ -1,39 +1,17 @@
-# app/history_sql.py
 """
 SQLite-first HistoryStore with conversation/message model (ChatGPT-style).
 
-Changes made (high level):
-- Uses SQLite only (no JSON backend) and creates two tables: conversations and messages.
-- Conversations store metadata (id, name, created_at, updated_at, meta JSON).
-- Messages are normalized into a messages table: id, conversation_id, role, content,
-  meta JSON, created_at, position (message order).
-- Provides conversation API: create_conversation, list_conversations (summaries),
-  get_conversation (full), append_message, update_conversation_name, delete_conversation,
-  export_conversation, migrate_from_legacy_json.
-- Backwards-compatible helper add_entry that creates a single-message conversation
-  (keeps old callers working).
-
-Design choices:
-- SQLite with WAL journal and foreign keys enabled for safety and concurrency.
-- JSON meta columns stored as TEXT using json.dumps with a safe serializer.
-- Every public method uses transactions and commits; errors raise CustomException.
-- Keep full LLM blobs optional (store them in message.meta under a key; user can
-  control via config flag STORE_FULL_LLM_BLOBS).
-
-This file replaces the previous ad-hoc JSON/sql hybrid and implements a clear
-conversation-first API suitable for the Streamlit chat UI (left sidebar list +
-message stream in main view).
+See module docstring in your repo for full design rationale.
 """
 
 import os
 import sys
 import json
 import sqlite3
-import tempfile
 import uuid
 import time
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -44,8 +22,7 @@ logger = get_logger("history_store")
 
 def _make_json_serializable(obj: Any) -> Any:
     """
-    Convert objects to JSON-serializable forms. Keep identical to prior helper but
-    kept here for json.dumps default.
+    Convert objects to JSON-serializable forms.
     """
     try:
         from langchain.schema import AIMessage, HumanMessage, SystemMessage  # type: ignore
@@ -97,21 +74,16 @@ class HistoryStore:
     """
     Conversation-first history store backed by SQLite.
 
-    Public methods (high-level):
-      - create_conversation(name, first_message) -> conversation dict
-      - list_conversations() -> list of conversation summaries
-      - get_conversation(conversation_id) -> full conversation dict
-      - append_message(conversation_id, message) -> message dict
-      - update_conversation_name(conversation_id, new_name) -> bool
-      - delete_conversation(conversation_id) -> bool
-      - export_conversation(conversation_id, path=None) -> path
-      - migrate_from_legacy_json(path) -> int (count migrated)
-
-    Message format expected by append_message:
-      {"id": "<uuid>", "role":"user|assistant", "content":"...", "meta": {...}, "created_at":"..."}
-
-    Conversation dict returned from get_conversation:
-      {"id":..., "name":..., "messages": [...], "created_at":..., "updated_at":..., "meta": {...}}
+    Public methods:
+      - create_conversation
+      - list_conversations
+      - get_conversation
+      - append_message
+      - update_conversation_name
+      - delete_conversation
+      - export_conversation
+      - migrate_from_legacy_json
+      - add_entry (back-compat)
     """
 
     def __init__(self, db_path: Optional[str] = None):
@@ -119,21 +91,57 @@ class HistoryStore:
             data_dir = getattr(config_module, "DATA_DIR", "./data")
             os.makedirs(data_dir, exist_ok=True)
             self.db_path = db_path or os.path.join(data_dir, "history.db")
-            # sqlite connection
-            self._conn: sqlite3.Connection = sqlite3.connect(
-                self.db_path, check_same_thread=False, isolation_level=None
-            )
-            # pragmas for durability and concurrency
-            cur = self._conn.cursor()
-            cur.execute("PRAGMA journal_mode=WAL;")
-            cur.execute("PRAGMA foreign_keys=ON;")
-            cur.execute("PRAGMA busy_timeout=5000;")
+
+            # Use a reasonable timeout to wait for locks to clear (seconds)
+            # check_same_thread=False for Streamlit threads; isolation_level=None -> autocommit mode
+            connect_kwargs = {"check_same_thread": False, "isolation_level": None, "timeout": 30.0}
+            self._conn: sqlite3.Connection = sqlite3.connect(self.db_path, **connect_kwargs)
+
+            # set row factory early
             self._conn.row_factory = sqlite3.Row
+
+            # Try to set PRAGMAs with a short retry loop to handle transient "database is locked"
+            cur = self._conn.cursor()
+            max_attempts = 5
+            attempt = 0
+            backoff = 0.05
+            last_exc = None
+            while attempt < max_attempts:
+                try:
+                    cur.execute("PRAGMA journal_mode=WAL;")
+                    cur.execute("PRAGMA foreign_keys=ON;")
+                    # busy_timeout as PRAGMA for SQLite; also keep connect timeout above
+                    cur.execute("PRAGMA busy_timeout=5000;")
+                    break
+                except sqlite3.OperationalError as oe:
+                    last_exc = oe
+                    attempt += 1
+                    logger.warning("SQLite PRAGMA attempt %d failed (will retry): %s", attempt, oe)
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+            else:
+                # all attempts failed
+                logger.exception("SQLite PRAGMA setup failed after %d attempts: %s", max_attempts, last_exc)
+                raise last_exc
+
+            # initialize schema
             self._init_schema()
             logger.info("HistoryStore (sqlite) initialized at %s", self.db_path)
+        except CustomException:
+            # pass through CustomException unchanged
+            raise
         except Exception as e:
             logger.exception("HistoryStore initialization failed")
-            raise CustomException(e, sys)
+            # ensure we close connection if partially initialized
+            try:
+                if hasattr(self, "_conn") and self._conn:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+            finally:
+                raise CustomException(e, sys)
 
     def _init_schema(self) -> None:
         cur = self._conn.cursor()
@@ -208,9 +216,7 @@ class HistoryStore:
             raise CustomException(e, sys)
 
     def list_conversations(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """Return conversation summaries (id, name, snippet, last_message_at, updated_at).
-        Keep payload small so UI can render the left sidebar quickly.
-        """
+        """Return conversation summaries (id, name, snippet, last_message_at, updated_at)."""
         try:
             cur = self._conn.cursor()
             cur.execute(
@@ -277,11 +283,7 @@ class HistoryStore:
             raise CustomException(e, sys)
 
     def append_message(self, conversation_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
-        """Append a message to an existing conversation.
-
-        Message expected shape: {"id":..., "role":"user|assistant", "content":..., "meta": {...}, "created_at": ...}
-        If message.id is missing, one will be generated. Position is computed automatically.
-        """
+        """Append a message to an existing conversation."""
         try:
             msg = self._normalize_message(message)
             # compute next position
@@ -337,15 +339,15 @@ class HistoryStore:
     # Backwards compatibility: add_entry -> create a conversation
     # --------------------------
     def add_entry(self, name: str, query: str, result: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Backwards-compatible helper: create a conversation with two messages:
-          - user query
-          - assistant result (stored in meta)
-        Returns the created conversation.
-        """
         try:
             user_msg = {"id": uuid.uuid4().hex, "role": "user", "content": query, "meta": {}, "created_at": self._now()}
-            assistant_msg = {"id": uuid.uuid4().hex, "role": "assistant", "content": (result.get("formatted") or {}).get("output") if isinstance(result, dict) else str(result), "meta": result, "created_at": self._now()}
+            assistant_msg = {
+                "id": uuid.uuid4().hex,
+                "role": "assistant",
+                "content": (result.get("formatted") or {}).get("output") if isinstance(result, dict) else str(result),
+                "meta": result,
+                "created_at": self._now(),
+            }
             conv = self.create_conversation(name=name, first_message=user_msg)
             # append assistant message
             self.append_message(conv["id"], assistant_msg)
@@ -358,9 +360,6 @@ class HistoryStore:
     # Legacy migration
     # --------------------------
     def migrate_from_legacy_json(self, json_path: str) -> int:
-        """Migrate old history.json entries (per-query) into conversations.
-        Returns number of records migrated.
-        """
         if not os.path.exists(json_path):
             return 0
         try:
@@ -376,7 +375,13 @@ class HistoryStore:
                 query = item.get("query") or ""
                 result = item.get("result") or {}
                 user_msg = {"id": uuid.uuid4().hex, "role": "user", "content": query, "meta": {}, "created_at": item.get("created_at") or self._now()}
-                assistant_msg = {"id": uuid.uuid4().hex, "role": "assistant", "content": (result.get("formatted") or {}).get("output") if isinstance(result, dict) else str(result), "meta": result, "created_at": item.get("updated_at") or self._now()}
+                assistant_msg = {
+                    "id": uuid.uuid4().hex,
+                    "role": "assistant",
+                    "content": (result.get("formatted") or {}).get("output") if isinstance(result, dict) else str(result),
+                    "meta": result,
+                    "created_at": item.get("updated_at") or self._now(),
+                }
                 conv = self.create_conversation(name=name, first_message=user_msg)
                 self.append_message(conv["id"], assistant_msg)
                 migrated += 1
