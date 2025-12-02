@@ -1,4 +1,4 @@
-# app.py (updated: safe rerun, set_page_config at top, top-level error handling)
+# app.py 
 import streamlit as st
 import os
 import json
@@ -47,17 +47,13 @@ def _sanitize_for_history(obj: Any) -> Any:
 
 
 # helper: safe rerun (Streamlit builds differ)
-# New behavior: prefer experimental_rerun(); if unavailable or it errors, set a session flag
-# and let the top-of-script handler call experimental_rerun() on the next run.
 def _safe_rerun():
     rerun = getattr(st, "experimental_rerun", None)
     if callable(rerun):
         try:
-            # try best-effort immediate rerun
             rerun()
             return
         except Exception:
-            # mark that a rerun is desired; do not call st.stop()
             st.session_state["_needs_rerun"] = True
             return
     else:
@@ -87,8 +83,8 @@ history_store = HistoryStore()  # uses DATA_DIR path from config/data dir by def
 st.session_state.setdefault("selected_conversation_id", None)
 st.session_state.setdefault("conversations_meta", [])
 st.session_state.setdefault("conversation_cache", {})
-st.session_state.setdefault("csv_label_to_path", {})
-st.session_state.setdefault("csv_path_to_table", {})
+st.session_state.setdefault("csv_label_to_path", {})   # label -> path
+st.session_state.setdefault("csv_path_to_table", {})   # path -> canonical table name
 
 # If a previous run requested a rerun, trigger it now (best-effort)
 if st.session_state.pop("_needs_rerun", False):
@@ -97,8 +93,49 @@ if st.session_state.pop("_needs_rerun", False):
         try:
             rerun()
         except Exception:
-            # nothing more to do; continue rendering the page gracefully
             pass
+
+# ---------------------------
+# Utility: rebuild session mappings from SchemaStore
+# ---------------------------
+def _sync_session_mappings_from_store():
+    """
+    Rebuild st.session_state['csv_label_to_path'] and ['csv_path_to_table']
+    from schema_store.list_csvs_meta(). This is the canonical sync function.
+    """
+    try:
+        st.session_state["csv_label_to_path"] = st.session_state.get("csv_label_to_path", {}) or {}
+        st.session_state["csv_path_to_table"] = st.session_state.get("csv_path_to_table", {}) or {}
+
+        store_meta = schema_store.list_csvs_meta() or []
+        for entry in store_meta:
+            try:
+                path = entry.get("path") or ""
+                if not path:
+                    continue
+                canonical = entry.get("canonical") or entry.get("friendly") or entry.get("key") or os.path.splitext(os.path.basename(path))[0]
+                aliases = entry.get("aliases") or []
+                orig = os.path.basename(path)
+                # ensure canonical present
+                if canonical and canonical not in aliases:
+                    aliases.insert(0, canonical)
+                # register labels
+                for alias in aliases:
+                    if not alias:
+                        continue
+                    label = f"{alias} — {orig}"
+                    # preserve / prefer existing mapping only if it points to same path
+                    existing = st.session_state["csv_label_to_path"].get(label)
+                    if not existing or existing == path:
+                        st.session_state["csv_label_to_path"][label] = path
+                # register path->canonical mapping
+                st.session_state["csv_path_to_table"][path] = canonical
+            except Exception:
+                logger.exception("Failed to register schema_store entry %s", entry)
+        logger.info("Session mappings synced from SchemaStore (entries=%d)", len(store_meta))
+    except Exception:
+        logger.exception("Failed to sync session mappings from SchemaStore")
+
 
 # Wrap main UI logic in a top-level try/except so exceptions are visible instead of leaving a partial page.
 try:
@@ -113,7 +150,7 @@ try:
             st.session_state.conversations_meta = []
 
     # ---------------------------
-    # Sidebar: Conversations + CSV Management
+    # Sidebar: Conversations + CSV Management + Schema Viewer
     # ---------------------------
     with st.sidebar:
         st.header("Conversations")
@@ -131,7 +168,6 @@ try:
                 st.session_state.selected_conversation_id = conv["id"]
                 # cache the freshly created conversation to avoid immediate DB round-trip
                 st.session_state.conversation_cache[conv["id"]] = conv
-                # request a safe rerun (will be best-effort)
                 _safe_rerun()
             except Exception:
                 logger.exception("Failed to create new conversation")
@@ -149,13 +185,11 @@ try:
 
         # Render list (compact)
         for c in convs:
-            # Build a safe display label (avoid embedding raw newlines into button text)
             name = c.get("name") or "Untitled"
             snippet = c.get("last_message_snippet") or ""
             display_label = name if not snippet else f"{name} — {snippet}"
             if st.button(display_label, key=f"select_{c['id']}"):
                 st.session_state.selected_conversation_id = c["id"]
-                # load into cache
                 try:
                     st.session_state.conversation_cache[c["id"]] = history_store.get_conversation(c["id"])
                 except Exception:
@@ -172,62 +206,93 @@ try:
                     saved_path = csv_loader.save_csv(file)
                     st.success(f"Uploaded {file.name}")
                     logger.info(f"Saved {file.name} -> {saved_path}")
+
                     # auto-register schema with canonical name so context_node and validate_node will find it
                     try:
                         metadata_list = csv_loader.load_and_extract([saved_path])
                         if metadata_list and isinstance(metadata_list, list):
                             for meta in metadata_list:
-                                # CSVLoader may return dicts; handle gracefully
-                                csv_name = None
+                                # CSVLoader returns dicts; prefer canonical_name and aliases
                                 orig_name = os.path.basename(saved_path)
+                                canonical = None
+                                aliases = []
+
                                 if isinstance(meta, dict):
-                                    csv_name = meta.get("table_name") or meta.get("table") or os.path.splitext(os.path.basename(saved_path))[0]
+                                    canonical = meta.get("canonical_name") or meta.get("table_name") or os.path.splitext(os.path.basename(saved_path))[0]
+                                    aliases = meta.get("aliases") or meta.get("aliases") or []
+                                    # csv_loader provides 'original_name' key in newer versions
                                     orig_name = meta.get("original_name") or orig_name
-                                if not csv_name:
-                                    csv_name = os.path.splitext(os.path.basename(saved_path))[0]
-                                schema_store.add_csv(saved_path, csv_name=csv_name)
-                                display_label = f"{csv_name} — {orig_name}"
-                                st.session_state["csv_label_to_path"][display_label] = saved_path
-                                st.session_state["csv_path_to_table"][saved_path] = csv_name
-                                logger.info("Registered schema for %s (path=%s)", csv_name, saved_path)
+
+                                if not canonical:
+                                    canonical = os.path.splitext(os.path.basename(saved_path))[0]
+
+                                # Persist schema under the canonical name and pass aliases so SchemaStore can store them
+                                try:
+                                    schema_store.add_csv(saved_path, csv_name=canonical, aliases=aliases)
+                                except Exception:
+                                    # fallback: try storing without aliases / custom name
+                                    logger.exception("schema_store.add_csv failed for %s (canonical=%s aliases=%s)", saved_path, canonical, aliases)
+                                    try:
+                                        schema_store.add_csv(saved_path)
+                                    except Exception:
+                                        logger.exception("schema_store.add_csv fallback failed for %s", saved_path)
+
+                                # Ensure canonical is present in aliases (friendly-first)
+                                if canonical not in aliases:
+                                    aliases.insert(0, canonical)
+
+                                # Register display labels for each alias so users can select friendly names
+                                for alias in aliases:
+                                    if not alias:
+                                        continue
+                                    label = f"{alias} — {orig_name}"
+                                    existing = st.session_state["csv_label_to_path"].get(label)
+                                    if not existing or existing == saved_path:
+                                        st.session_state["csv_label_to_path"][label] = saved_path
+
+                                # map the saved path to canonical table name used in schema_store
+                                st.session_state["csv_path_to_table"][saved_path] = canonical
+                                logger.info("Registered schema for %s (canonical=%s, aliases=%s)", saved_path, canonical, aliases)
                     except Exception:
                         logger.exception("Failed to auto-register schema for uploaded CSV")
                 except Exception as e:
                     st.error(f"Failed to save {file.name}: {e}")
                     logger.exception("CSV upload failed")
 
-        # List uploaded CSVs (friendly labels)
+        # --------------------------------------------------------------------
+        # Build labels from SchemaStore (preferred source of truth)
+        # --------------------------------------------------------------------
         try:
-            uploaded_meta = csv_loader.list_uploaded_csvs() or []
+            # Sync once from SchemaStore to session maps if store has entries
+            _sync_session_mappings_from_store()
+        except Exception:
+            logger.exception("Failed to read schema_store metadata")
+
+        # Defensive fallback: include raw uploaded files (older behaviour)
+        try:
+            uploaded_paths = csv_loader.list_uploaded_csvs() or []
         except Exception:
             logger.exception("Failed to list uploaded CSVs")
-            uploaded_meta = []
+            uploaded_paths = []
 
-        # Ensure session mappings include any previously uploaded meta (defensive)
-        for m in uploaded_meta:
-            p = None
-            table = None
-            orig = None
-
-            if isinstance(m, str):
-                p = m
-                table = os.path.splitext(os.path.basename(p))[0]
-                orig = os.path.basename(p)
-            elif isinstance(m, dict):
-                p = m.get("path") or m.get("filepath") or m.get("file") or m.get("filename") or ""
-                if not p:
+        for p in uploaded_paths:
+            try:
+                path = p if isinstance(p, str) else (p.get("path") or p.get("filepath") or p.get("file") or p.get("filename") or "")
+                if not path:
                     continue
-                table = m.get("table_name") or m.get("table") or os.path.splitext(os.path.basename(p))[0]
-                orig = m.get("original_name") or m.get("original") or os.path.basename(p)
-            else:
-                continue
+                if path in st.session_state["csv_path_to_table"]:
+                    continue
+                table = os.path.splitext(os.path.basename(path))[0]
+                orig = os.path.basename(path)
+                label = f"{table} — {orig}"
+                if label not in st.session_state["csv_label_to_path"]:
+                    st.session_state["csv_label_to_path"][label] = path
+                if path not in st.session_state["csv_path_to_table"]:
+                    st.session_state["csv_path_to_table"][path] = table
+            except Exception:
+                logger.exception("Failed to register fallback uploaded path %s", p)
 
-            label = f"{table} — {orig}"
-            if label not in st.session_state["csv_label_to_path"]:
-                st.session_state["csv_label_to_path"][label] = p
-            if p not in st.session_state["csv_path_to_table"]:
-                st.session_state["csv_path_to_table"][p] = table
-
+        # Build final display options
         csv_display_options = list(st.session_state["csv_label_to_path"].keys())
         csv_display_options.sort()
 
@@ -237,6 +302,58 @@ try:
             default=[],
             key="selected_csvs_sidebar",
         )
+
+        st.markdown("---")
+
+        # ---------------------------
+        # Schema viewer + sync control
+        # ---------------------------
+        with st.expander("Schema viewer (inspect canonical names, aliases, columns)"):
+            try:
+                store_meta = schema_store.list_csvs_meta() or []
+                if not store_meta:
+                    st.info("No schemas available. Upload CSVs to populate the SchemaStore.")
+                else:
+                    for entry in store_meta:
+                        try:
+                            key = entry.get("key") or "<key>"
+                            canonical = entry.get("canonical") or entry.get("friendly") or key
+                            path = entry.get("path") or ""
+                            columns = entry.get("columns") or []
+                            aliases = entry.get("aliases") or []
+                            sample_rows = entry.get("sample_rows") or []
+                            header = f"{canonical}  —  {os.path.basename(path) if path else key}"
+                            with st.expander(header):
+                                st.write("Store key:", key)
+                                st.write("Canonical:", canonical)
+                                st.write("Path:", path)
+                                if aliases:
+                                    st.write("Aliases:", ", ".join(aliases))
+                                if columns:
+                                    st.write("Columns:")
+                                    st.write(columns)
+                                if sample_rows:
+                                    st.write("Sample rows (up to 3):")
+                                    try:
+                                        # show up to 3 sample rows nicely
+                                        for r in sample_rows[:3]:
+                                            st.write(r)
+                                    except Exception:
+                                        st.write(sample_rows[:3])
+                        except Exception:
+                            logger.exception("Failed to render schema entry %s", entry)
+                # sync button to rebuild session_state mappings from store (explicit user action)
+                if st.button("Sync schemas to UI (refresh labels)"):
+                    try:
+                        _sync_session_mappings_from_store()
+                        st.success("Synced schema mappings from SchemaStore.")
+                        _safe_rerun()
+                    except Exception:
+                        logger.exception("Schema sync failed")
+                        st.error("Schema sync failed; check logs.")
+            except Exception:
+                logger.exception("Failed to display Schema viewer")
+                st.write("Could not load schema metadata.")
 
         st.markdown("---")
         if st.button("Refresh Conversations"):
@@ -464,6 +581,5 @@ try:
         logger.exception("Failed to refresh conversations_meta at end of request")
 
 except Exception as e:
-    # Top-level catch so the page doesn't render partially and to show a user-facing error.
     logger.exception("Top-level error in app.py")
     st.error(f"An internal error occurred while rendering the app: {e}")

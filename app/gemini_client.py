@@ -126,6 +126,12 @@ class GeminiClient:
             raise CustomException(e, sys)
 
     def _normalize_model_name(self, model: str) -> str:
+        """
+        Return a model identifier in a stable form.
+        This function returns either:
+          - 'models/xxx' (if caller passed 'xxx' or 'models/xxx')
+          - preserves 'tunedModels/...' if present
+        """
         try:
             if not isinstance(model, str) or not model:
                 return model
@@ -134,6 +140,17 @@ class GeminiClient:
             return f"models/{model}"
         except Exception:
             return model
+
+    def _build_model_path(self, norm_model: str) -> str:
+        """
+        Derive the model path segment to embed into REST url WITHOUT duplicating 'models/'.
+        If norm_model already contains 'models/' or 'tunedModels/', use it as-is.
+        """
+        if not isinstance(norm_model, str) or not norm_model:
+            return norm_model
+        if norm_model.startswith("models/") or norm_model.startswith("tunedModels/"):
+            return norm_model
+        return f"models/{norm_model}"
 
     def generate(self, prompt: str, model: Optional[str] = None, max_tokens: int = 512, timeout: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -147,6 +164,7 @@ class GeminiClient:
         try:
             model = model or self.default_model
             norm_model = self._normalize_model_name(model)
+            model_path = self._build_model_path(norm_model)
 
             # 1) LangChain wrapper path
             if self._use_langchain_llm and self._llm is not None:
@@ -248,11 +266,24 @@ class GeminiClient:
 
             # 3) REST fallback with requests.Session + retry
             base = self.endpoint.rstrip("/") if self.endpoint else "https://generativelanguage.googleapis.com/v1beta2"
-            url = f"{base}/models/{norm_model}:generate"
+
+            # model_path already includes 'models/' or 'tunedModels/' where appropriate
+            url = f"{base}/{model_path}:generate"
             payload = {"input": prompt, "max_output_tokens": int(max_tokens)}
+
+            # Headers and params: support both Bearer token (Authorization) and plain API key (query param)
             headers = {"Content-Type": "application/json"}
+            params = {}
             if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
+                # Heuristic: if api_key looks like an OAuth access token or starts with 'Bearer ' use Authorization header.
+                ak = str(self.api_key).strip()
+                if ak.lower().startswith("bearer ") or ak.startswith("ya29.") or ak.count(".") >= 2:
+                    # Common Google access tokens start with 'ya29.'; also accept explicit 'Bearer ' prefix
+                    token = ak.replace("Bearer ", "").strip()
+                    headers["Authorization"] = f"Bearer {token}"
+                else:
+                    # Otherwise send as query param (API key)
+                    params["key"] = ak
 
             # local import to allow mocking in tests
             import requests
@@ -260,20 +291,27 @@ class GeminiClient:
             from urllib3.util.retry import Retry
 
             session = requests.Session()
-            retries = Retry(total=_DEFAULT_RETRIES, backoff_factor=_DEFAULT_BACKOFF_FACTOR, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=frozenset(["POST", "GET"]))
+            retries = Retry(
+                total=_DEFAULT_RETRIES,
+                backoff_factor=_DEFAULT_BACKOFF_FACTOR,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=frozenset(["POST", "GET"]),
+            )
             session.mount("https://", HTTPAdapter(max_retries=retries))
             session.mount("http://", HTTPAdapter(max_retries=retries))
 
             if self.tracing:
-                logger.info("GeminiClient (REST) POST %s", url)
+                logger.info("GeminiClient (REST) POST %s params=%s payload_len=%d headers=%s", url, params, len(json.dumps(payload)), list(headers.keys()))
 
-            resp = session.post(url, json=payload, headers=headers, timeout=timeout)
+            resp = session.post(url, json=payload, headers=headers, params=params, timeout=timeout)
+
             if resp.status_code >= 400:
+                # include response body in logs for debugging
                 try:
                     detail = resp.json()
                 except Exception:
                     detail = resp.text
-                logger.error("GeminiClient REST error status=%s detail=%s", resp.status_code, detail)
+                logger.error("GeminiClient REST error status=%s url=%s params=%s detail=%s", resp.status_code, url, params, detail)
                 raise RuntimeError(f"Gemini API error: {resp.status_code} {detail}")
 
             try:
@@ -284,7 +322,7 @@ class GeminiClient:
             text = None
             raw = data
             if isinstance(data, dict):
-                # candidates / outputs shapes
+                # support multiple possible response shapes
                 if "candidates" in data and isinstance(data["candidates"], list) and data["candidates"]:
                     first = data["candidates"][0]
                     if isinstance(first, dict) and "output" in first:
@@ -298,6 +336,7 @@ class GeminiClient:
                             text = " ".join(map(str, val))
                         else:
                             text = val
+                # older SDK/REST shapes sometimes have 'outputs' array
                 if text is None and "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
                     first = data["outputs"][0]
                     if isinstance(first, dict):

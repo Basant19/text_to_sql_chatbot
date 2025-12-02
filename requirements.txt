@@ -1,12 +1,10 @@
+
+
 # LangChain Core
-langchain
-langchain-core
+langchain==1.0.7
+langchain-core==1.1.0
+langchain-google-genai==3.2.0
 
-
-
-# Google Gemini (PaLM) Integration
-langchain-google-genai
-google-generativeai
 
 
 
@@ -17,10 +15,10 @@ python-dotenv
 numpy
 scikit-learn
 
-#database
-sqlite-utils 
+# database
+sqlite-utils
 duckdb
-
+sqlglot
 # Web Interface
 streamlit
 
@@ -43,19 +41,17 @@ requests
 langchain-experimental
 
 # Vector Store Backends
-
 faiss-cpu
 ipykernel
-
 
 
 # Web Search
 duckduckgo-search
 
-#  Training
+# Training
 datasets
 # Additional LangChain Integrations
-langchain-groq 
+langchain-groq
 langchain_tavily
 
 langgraph
@@ -63,7 +59,5 @@ langgraph
 langsmith
 langgraph-cli[inmem]
 
-#test
+# test
 pytest
-
-

@@ -1,8 +1,10 @@
-#D:\text_to_sql_bot\app\schema_store.py
+# app/schema_store.py
 import os
 import sys
 import json
 from typing import List, Dict, Any, Optional
+import csv
+import uuid
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -12,39 +14,20 @@ logger = get_logger("schema_store")
 
 
 def _ensure_dir(path: str) -> None:
-    """Ensure the given directory exists."""
     os.makedirs(path, exist_ok=True)
 
 
 def _canonical_name(name: str) -> str:
-    """
-    Produce a normalized canonical form for comparing CSV/table names.
-    - strip directory components
-    - strip file extension
-    - lower-case
-    """
     base = os.path.basename(name)
     no_ext = os.path.splitext(base)[0]
     return no_ext.lower().strip()
 
 
+def uuid4_hex() -> str:
+    return uuid.uuid4().hex[:8]
+
+
 class SchemaStore:
-    """
-    Manages CSV metadata: schemas, sample rows, and column info.
-    Stores metadata persistently in JSON files.
-
-    Backwards-compatible public API:
-      - add_csv(csv_path, csv_name=None)
-      - get_schema(csv_name) -> Optional[List[str]]
-      - get_sample_rows(csv_name) -> Optional[List[Dict[str, Any]]]
-      - list_csvs() -> List[str]  (list of store keys)
-      - clear()
-
-    Added utilities:
-      - get_internal_key(csv_name) -> Optional[str]
-      - list_csvs_meta() -> List[Dict[str, Any]] (useful for UI)
-    """
-
     def __init__(self, store_path: Optional[str] = None, sample_limit: int = 5):
         try:
             data_dir = getattr(config, "DATA_DIR", "./data")
@@ -58,18 +41,33 @@ class SchemaStore:
             logger.exception("Failed to initialize SchemaStore")
             raise CustomException(e, sys)
 
-    # ---------------------------
-    # Persistence
-    # ---------------------------
     def _load_store(self) -> None:
-        """Load schema metadata from JSON file if exists."""
         try:
             if os.path.exists(self.store_path):
                 with open(self.store_path, "r", encoding="utf-8") as f:
                     items = json.load(f)
-                    # Basic validation: expect dict
                     if isinstance(items, dict):
-                        self._store = items
+                        normalized: Dict[str, Dict[str, Any]] = {}
+                        for k, v in items.items():
+                            if not isinstance(v, dict):
+                                continue
+                            # if already new shape
+                            if "canonical" in v or "aliases" in v:
+                                normalized[k] = v
+                            else:
+                                canonical = _canonical_name(k)
+                                friendly = canonical
+                                aliases = [k, canonical]
+                                rec = {
+                                    "path": v.get("path"),
+                                    "columns": v.get("columns", []),
+                                    "sample_rows": v.get("sample_rows", []),
+                                    "canonical": canonical,
+                                    "friendly": friendly,
+                                    "aliases": aliases,
+                                }
+                                normalized[k] = rec
+                        self._store = normalized
                     else:
                         logger.warning("SchemaStore file has unexpected shape; resetting store.")
                         self._store = {}
@@ -80,7 +78,6 @@ class SchemaStore:
             raise CustomException(e, sys)
 
     def _save_store(self) -> None:
-        """Persist schema metadata to JSON file (atomic replace)."""
         try:
             dirpath = os.path.dirname(self.store_path) or "."
             _ensure_dir(dirpath)
@@ -94,80 +91,98 @@ class SchemaStore:
             logger.exception("Failed to save schema store")
             raise CustomException(e, sys)
 
-    # ---------------------------
-    # Public API
-    # ---------------------------
-    def add_csv(self, csv_path: str, csv_name: Optional[str] = None) -> None:
+    def add_csv(self, csv_path: str, csv_name: Optional[str] = None, aliases: Optional[List[str]] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
         """
-        Read CSV file, store column names and sample rows.
-        Updates internal store and persists to disk.
+        Add a CSV schema to the store.
 
-        csv_name: the key under which to save this CSV's metadata. If None, we use the filename.
-        In addition to saving under csv_name, we attempt to save a canonical key
-        (filename without extension, lower-cased) unless it would conflict with an existing
-        canonical mapping that points to a different path.
+        Accepts:
+          - csv_path: path to file
+          - csv_name: optional friendly/key name
+          - aliases: optional aliases list
+          - metadata: optional metadata dict (as returned by CSVLoader.load_and_extract)
+            If metadata is provided, it is used directly to populate columns/aliases/sample_rows.
         """
         try:
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
-            import csv
+            provided_key = csv_name or os.path.basename(csv_path)
 
-            csv_name = csv_name or os.path.basename(csv_path)
-            columns: List[str] = []
-            samples: List[Dict[str, Any]] = []
+            if metadata and isinstance(metadata, dict):
+                # Prefer metadata fields when provided (compat with CSVLoader output)
+                columns = metadata.get("columns", [])
+                sample_rows = metadata.get("sample_rows", [])[: self.sample_limit]
+                canonical = metadata.get("canonical_name") or metadata.get("canonical") or _canonical_name(provided_key)
+                friendly = metadata.get("table_name") or canonical
+                aliases_list = metadata.get("aliases") or []
+            else:
+                # read the CSV to get header & samples
+                columns: List[str] = []
+                sample_rows: List[Dict[str, Any]] = []
+                with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+                    reader = csv.DictReader(f)
+                    columns = reader.fieldnames or []
+                    for i, row in enumerate(reader):
+                        if i >= self.sample_limit:
+                            break
+                        sample_rows.append(row)
+                canonical = _canonical_name(provided_key)
+                friendly = csv_name or canonical
+                aliases_list = aliases or []
 
-            with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
-                reader = csv.DictReader(f)
-                columns = reader.fieldnames or []
-                for i, row in enumerate(reader):
-                    if i >= self.sample_limit:
-                        break
-                    samples.append(row)
+            # build alias set (normalize)
+            alias_set = set()
+            for a in aliases_list:
+                if a:
+                    alias_set.add(_canonical_name(a))
+            alias_set.add(_canonical_name(provided_key))
+            alias_set.add(_canonical_name(os.path.splitext(os.path.basename(csv_path))[0]))
+            alias_set.add(canonical)
+            alias_list = [a for a in alias_set if a]
 
             meta = {
                 "path": csv_path,
                 "columns": columns,
-                "sample_rows": samples,
+                "sample_rows": sample_rows,
+                "canonical": canonical,
+                "friendly": friendly,
+                "aliases": alias_list,
             }
 
-            # Store under provided key (explicit)
-            self._store[csv_name] = meta
+            store_key = provided_key
+            if _canonical_name(store_key) == canonical:
+                store_key = canonical
 
-            # Attempt to create canonical alias
-            canonical = _canonical_name(csv_name)
-            # If canonical equals the literal key we just added, it's already present.
-            if canonical != csv_name:
-                existing_key_for_canonical = None
-                # check if there already exists a key whose canonical form equals this canonical
-                for k, v in list(self._store.items()):
-                    if _canonical_name(k) == canonical and k != csv_name:
-                        existing_key_for_canonical = k
+            # conflict detection: if canonical already exists but different path, avoid overwrite
+            conflict_key = None
+            for k, v in list(self._store.items()):
+                try:
+                    if _canonical_name(k) == canonical and v.get("path") != csv_path:
+                        conflict_key = k
                         break
+                except Exception:
+                    continue
 
-                if existing_key_for_canonical is None:
-                    # no existing canonical mapping -> create alias
-                    if canonical not in self._store:
+            if conflict_key:
+                unique_store_key = f"{store_key}_{uuid4_hex()}"
+                self._store[unique_store_key] = meta
+                logger.warning("SchemaStore: canonical conflict detected for '%s'. Stored under '%s' instead.", canonical, unique_store_key)
+            else:
+                self._store[store_key] = meta
+                # ensure canonical key exists and points to same meta
+                try:
+                    existing = self._store.get(canonical)
+                    if not existing:
                         self._store[canonical] = meta
-                        logger.debug("SchemaStore: created canonical alias '%s' -> %s", canonical, csv_name)
-                else:
-                    # existing key present; if it points to same path, ok; otherwise do not overwrite
-                    existing_path = self._store.get(existing_key_for_canonical, {}).get("path")
-                    if existing_path and os.path.samefile(existing_path, csv_path) if os.path.exists(existing_path) and os.path.exists(csv_path) else existing_path == csv_path:
-                        # same file under different names: we can safely create canonical pointing to same meta
-                        if canonical not in self._store:
-                            self._store[canonical] = meta
                     else:
-                        # conflict: different files share same canonical name - avoid overwrite
-                        logger.warning(
-                            "SchemaStore canonical name conflict for '%s' (existing key '%s' -> %s, new path=%s). "
-                            "Skipping canonical alias creation to avoid overwrite.",
-                            canonical, existing_key_for_canonical, existing_path, csv_path
-                        )
+                        # prefer identical path; otherwise preserve existing
+                        if existing.get("path") == csv_path:
+                            self._store[canonical] = meta
+                except Exception:
+                    pass
 
-            # persist
             self._save_store()
-            logger.info("CSV schema stored for %s (canonical=%s)", csv_name, canonical)
+            logger.info("CSV schema stored for %s (key=%s canonical=%s)", provided_key, store_key, canonical)
         except CustomException:
             raise
         except Exception as e:
@@ -175,38 +190,27 @@ class SchemaStore:
             raise CustomException(e, sys)
 
     def _find_matching_key(self, csv_name: str) -> Optional[str]:
-        """
-        Try to locate a store key that corresponds to csv_name.
-        Strategies (in order):
-          1) exact key match
-          2) canonicalized exact match (strip path + extension, lower)
-          3) prefix / contains matches (deterministic)
-          4) substring match
-
-        Returns the *store key* if found, otherwise None.
-        """
         if not csv_name:
             return None
-
-        # 1) exact key
         if csv_name in self._store:
             return csv_name
 
         target = _canonical_name(csv_name)
 
-        # 2) canonical exact
-        for k in self._store.keys():
-            if _canonical_name(k) == target:
+        for k, v in self._store.items():
+            if v.get("canonical") == target or _canonical_name(k) == target:
                 return k
 
-        # 3) prefix / contains (deterministic pass over keys)
-        for k in self._store.keys():
-            k_can = _canonical_name(k)
-            # prefer keys where canonical startswith target (e.g. googleplaystore_v2 vs googleplaystore)
+        for k, v in self._store.items():
+            aliases = v.get("aliases") or []
+            if any(_canonical_name(a) == target for a in aliases):
+                return k
+
+        for k, v in self._store.items():
+            k_can = v.get("canonical") or _canonical_name(k)
             if k_can.startswith(target) or target.startswith(k_can) or target in k_can or k_can in target:
                 return k
 
-        # 4) fallback substring match
         for k in self._store.keys():
             if target in _canonical_name(k) or _canonical_name(k) in target:
                 return k
@@ -214,51 +218,52 @@ class SchemaStore:
         return None
 
     def get_schema(self, csv_name: str) -> Optional[List[str]]:
-        """Return column names for a given CSV/table name. Tries tolerant matching."""
         match = self._find_matching_key(csv_name)
         if match:
             return self._store.get(match, {}).get("columns")
         return None
 
     def get_sample_rows(self, csv_name: str) -> Optional[List[Dict[str, Any]]]:
-        """Return sample rows for a given CSV. Tries tolerant matching."""
         match = self._find_matching_key(csv_name)
         if match:
             return self._store.get(match, {}).get("sample_rows")
         return None
 
     def get_internal_key(self, csv_name: str) -> Optional[str]:
-        """
-        Return the actual internal store key that matches csv_name (or None).
-        Useful for debugging/inspecting which key was selected by tolerant matching.
-        """
         return self._find_matching_key(csv_name)
 
+    def find_canonical_for(self, name: str) -> Optional[str]:
+        if not name:
+            return None
+        match = self._find_matching_key(name)
+        if not match:
+            return None
+        rec = self._store.get(match)
+        if not rec:
+            return None
+        return rec.get("canonical") or _canonical_name(match)
+
     def list_csvs(self) -> List[str]:
-        """Return a list of all CSV store keys."""
         return list(self._store.keys())
 
     def list_csvs_meta(self) -> List[Dict[str, Any]]:
-        """
-        Return list of metadata entries for UI consumption.
-        Each element is: {"key": key, "canonical": canonical_name, "path": path, "columns": [...]}.
-        """
         out = []
         for k, v in self._store.items():
             try:
                 out.append({
                     "key": k,
-                    "canonical": _canonical_name(k),
+                    "canonical": v.get("canonical") or _canonical_name(k),
+                    "friendly": v.get("friendly"),
                     "path": v.get("path"),
                     "columns": v.get("columns", []),
                     "sample_rows": v.get("sample_rows", []),
+                    "aliases": v.get("aliases", []),
                 })
             except Exception:
                 out.append({"key": k})
         return out
 
     def clear(self) -> None:
-        """Clear in-memory store and remove persisted JSON file."""
         try:
             self._store = {}
             if os.path.exists(self.store_path):

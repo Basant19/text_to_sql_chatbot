@@ -1,4 +1,4 @@
-# app/vector_search.py
+#D:\text_to_sql_bot\app\vector_search.py
 import os
 import sys
 import json

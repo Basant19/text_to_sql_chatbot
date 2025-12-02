@@ -2,6 +2,7 @@
 import os
 import io
 import csv
+import re
 import uuid
 from typing import Dict, List, Any, Union, TextIO, Optional
 
@@ -13,20 +14,12 @@ logger = get_logger("csv_loader")
 
 
 def _sanitize_filename(name: str) -> str:
-    """
-    Make a filename safe by replacing unsafe characters.
-    Keeps alphanumeric, dot, underscore, dash, and replaces spaces with underscores.
-    """
     keepchars = (".", "_", "-")
     safe = "".join(c if c.isalnum() or c in keepchars else "_" for c in name)
     return safe.strip().replace(" ", "_")
 
 
 def _unique_path(dest_dir: str, filename: str) -> str:
-    """
-    Ensure a filename is unique in the destination directory.
-    Appends a UUID if file exists.
-    """
     base, ext = os.path.splitext(filename)
     candidate = os.path.join(dest_dir, filename)
     if not os.path.exists(candidate):
@@ -35,38 +28,40 @@ def _unique_path(dest_dir: str, filename: str) -> str:
     return os.path.join(dest_dir, unique_name)
 
 
+def _normalize_table_name_from_filename(filename: str) -> str:
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    m = re.match(r"^(.+?)_[0-9a-fA-F]{8,32}$", stem)
+    if m:
+        candidate = m.group(1)
+    else:
+        candidate = stem
+    candidate = _sanitize_filename(candidate)
+    if candidate.isdigit():
+        candidate = f"t_{candidate}"
+    return candidate.lower()
+
+
 def save_uploaded_csv(fileobj: Union[bytes, TextIO, io.StringIO, io.BytesIO], filename: str) -> str:
-    """
-    Save an uploaded CSV to disk safely.
-    Supports bytes, file-like objects, and StringIO/BytesIO.
-    Returns the final path of the saved file.
-    """
     try:
         upload_dir = getattr(config, "UPLOAD_DIR", os.path.join(os.getcwd(), "uploads"))
         os.makedirs(upload_dir, exist_ok=True)
 
         safe_name = _sanitize_filename(filename)
         if not safe_name.lower().endswith(".csv"):
-            # ensure extension for clarity
             safe_name = safe_name + ".csv"
 
         dest_path = _unique_path(upload_dir, safe_name)
 
-        # handle bytes-like
         if isinstance(fileobj, (bytes, bytearray)):
             with open(dest_path, "wb") as f:
                 f.write(fileobj)
-        # BytesIO
         elif isinstance(fileobj, io.BytesIO):
             with open(dest_path, "wb") as f:
                 f.write(fileobj.getvalue())
-        # TextIO / file-like (e.g., Streamlit UploadedFile object has .read())
         elif hasattr(fileobj, "read"):
-            # Read content; if bytes, decode
             content = fileobj.read()
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
-            # ensure newline handling is normalized
             with open(dest_path, "w", newline="", encoding="utf-8") as f:
                 f.write(content)
         else:
@@ -80,60 +75,123 @@ def save_uploaded_csv(fileobj: Union[bytes, TextIO, io.StringIO, io.BytesIO], fi
 
 
 def _canonical_table_name_from_path(path: str) -> str:
-    """Return sanitized canonical table name (filename without extension)."""
     base = os.path.basename(path)
     name = os.path.splitext(base)[0]
-    return _sanitize_filename(name)
+    return _sanitize_filename(name).lower()
+
+
+def _strip_bom_and_normalize(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s or "")
+    for bom in ("\ufeff", "\ufffe"):
+        s = s.replace(bom, "")
+    return s.strip()
+
+
+def _to_snake_case(s: str) -> str:
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", "_", s.strip())
+    return s.lower()
+
+
+def _detect_dialect_and_header(sample: str) -> Dict[str, Any]:
+    result = {"delimiter": ",", "has_header": True}
+    try:
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(sample)
+        result["delimiter"] = dialect.delimiter
+        try:
+            result["has_header"] = sniffer.has_header(sample)
+        except Exception:
+            result["has_header"] = True
+    except Exception:
+        result["delimiter"] = ","
+        result["has_header"] = True
+    return result
 
 
 def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
-    """
-    Load CSV metadata: columns, sample rows, and total row count.
-    Returns a dict suitable for schema display or ingestion into SchemaStore.
-
-    Returned structure:
-      {
-        "table_name": "<sanitized basename>",
-        "path": "<path>",
-        "columns": [list of header names],
-        "sample_rows": [list of sample row dicts or lists],
-        "row_count": <int>
-      }
-    """
     try:
         if not os.path.exists(path):
             raise FileNotFoundError(f"CSV file not found: {path}")
 
-        with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
-            reader = csv.reader(f)
+        with open(path, "rb") as bf:
+            raw_start = bf.read(8192)
             try:
-                header = next(reader)
+                start_text = raw_start.decode("utf-8", errors="replace")
+            except Exception:
+                start_text = raw_start.decode("latin-1", errors="replace")
+
+        sniff = _detect_dialect_and_header(start_text)
+        delimiter = sniff.get("delimiter", ",")
+        has_header = sniff.get("has_header", True)
+
+        with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            try:
+                first_row = next(reader)
             except StopIteration:
-                # Empty CSV
+                table_name = _normalize_table_name_from_filename(os.path.basename(path))
+                canonical = _canonical_table_name_from_path(path)
+                aliases = list({canonical, table_name})
                 return {
-                    "table_name": _canonical_table_name_from_path(path),
+                    "table_name": table_name,
+                    "canonical_name": canonical,
+                    "aliases": aliases,
                     "path": path,
+                    "original_name": os.path.basename(path),
                     "columns": [],
+                    "columns_normalized": [],
                     "sample_rows": [],
                     "row_count": 0,
+                    "file_size_bytes": os.path.getsize(path),
                 }
 
-            samples: List[List[str]] = []
+            if has_header:
+                raw_headers = [_strip_bom_and_normalize(h) for h in first_row]
+            else:
+                raw_headers = [f"col_{i+1}" for i in range(len(first_row))]
+                reader = iter([first_row] + list(reader))
+
+            headers = [h if isinstance(h, str) else str(h) for h in raw_headers]
+            headers = [h.strip() for h in headers]
+            columns_normalized = [_to_snake_case(h) for h in headers]
+
+            samples: List[Dict[str, Any]] = []
             row_count = 0
             for row in reader:
                 row_count += 1
                 if len(samples) < sample_rows:
-                    samples.append(row)
+                    values = [v for v in row]
+                    if len(values) < len(headers):
+                        values = values + [None] * (len(headers) - len(values))
+                    elif len(values) > len(headers):
+                        values = values[:len(headers)]
+                    row_dict = {headers[i]: values[i] for i in range(len(headers))}
+                    samples.append(row_dict)
 
-        table_name = _canonical_table_name_from_path(path)
-        metadata = {
-            "table_name": table_name,
-            "path": path,
-            "columns": header,
-            "sample_rows": samples,
-            "row_count": row_count,
-        }
-        logger.info("Loaded metadata for %s: columns=%d, rows=%d", path, len(header), row_count)
+            table_name = _normalize_table_name_from_filename(os.path.basename(path))
+            canonical = _canonical_table_name_from_path(path)
+            orig_stem = os.path.splitext(os.path.basename(path))[0]
+            aliases = []
+            for a in (table_name, orig_stem, canonical):
+                if a and a not in aliases:
+                    aliases.append(a)
+
+            metadata = {
+                "table_name": table_name,
+                "canonical_name": canonical,
+                "aliases": aliases,
+                "path": path,
+                "original_name": os.path.basename(path),
+                "columns": headers,
+                "columns_normalized": columns_normalized,
+                "sample_rows": samples,
+                "row_count": row_count,
+                "file_size_bytes": os.path.getsize(path),
+            }
+
+        logger.info("Loaded metadata for %s: columns=%d, rows=%d", path, len(headers), row_count)
         return metadata
     except Exception as e:
         logger.exception("Failed to load CSV metadata for %s", path)
@@ -141,27 +199,11 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
 
 
 class CSVLoader:
-    """
-    Centralized CSV management class.
-    Tracks uploaded files and exposes metadata extraction.
-
-    Notes:
-      - upload directory is controlled by config.UPLOAD_DIR (defaults to ./uploads)
-      - list_uploaded_csvs() scans the upload dir so results persist across restarts
-    """
-
     def __init__(self, upload_dir: Optional[str] = None):
         self.upload_dir = upload_dir or getattr(config, "UPLOAD_DIR", os.path.join(os.getcwd(), "uploads"))
         os.makedirs(self.upload_dir, exist_ok=True)
 
     def save_csv(self, file) -> str:
-        """
-        Save a file object to disk and return its path.
-
-        Accepts:
-          - Streamlit UploadedFile (has .name and .read())
-          - bytes / BytesIO / StringIO / file-like
-        """
         try:
             filename = getattr(file, "name", None) or f"upload_{uuid.uuid4().hex}.csv"
             path = save_uploaded_csv(file, filename)
@@ -172,14 +214,12 @@ class CSVLoader:
             raise CustomException(e)
 
     def list_uploaded_csvs(self) -> List[str]:
-        """Return the list of saved CSV paths by scanning the upload directory."""
         try:
             out: List[str] = []
             for entry in os.listdir(self.upload_dir):
                 p = os.path.join(self.upload_dir, entry)
                 if os.path.isfile(p) and entry.lower().endswith(".csv"):
                     out.append(p)
-            # sort by mtime (most recent first)
             out.sort(key=lambda p: os.path.getmtime(p), reverse=False)
             return out
         except Exception as e:
@@ -187,10 +227,6 @@ class CSVLoader:
             raise CustomException(e)
 
     def load_and_extract(self, file_paths: List[str]) -> List[Dict[str, Any]]:
-        """
-        Load metadata for multiple CSV files.
-        Returns list of dicts containing columns, samples, row counts, and table_name.
-        """
         schemas: List[Dict[str, Any]] = []
         for path in file_paths:
             try:
