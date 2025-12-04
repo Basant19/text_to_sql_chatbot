@@ -4,6 +4,7 @@ import time
 import threading
 import json
 import re
+import os
 from typing import Optional, Dict, Any, Union
 
 from app.logger import get_logger
@@ -63,13 +64,11 @@ def _extract_sql_from_text(text: str) -> Optional[str]:
     # 3) Heuristic: first line/paragraph that starts with common SQL keywords
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     sql_kw = re.compile(r"^(SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b", flags=re.IGNORECASE)
-    for line in lines:
+    for i, line in enumerate(lines):
         if sql_kw.match(line):
             # capture until a semicolon or end of block
-            # attempt to join following lines until semicolon
-            idx = lines.index(line)
             collected = [line]
-            for nxt in lines[idx + 1 : idx + 20]:
+            for nxt in lines[i + 1 : i + 20]:
                 collected.append(nxt)
                 if ";" in nxt:
                     break
@@ -92,8 +91,10 @@ class GenerateNode:
 
     Behavior summary:
       - Strong system instruction appended to user prompt to force SQL-only outputs.
+      - Includes schema listing into the prompt (reads schema_store.json if needed).
       - Retries with exponential backoff on provider.generate failures.
       - Robust SQL extraction; store controlled raw blob/meta.
+      - Attempts best-effort name-normalization/repair when validation fails.
       - Fire-and-forget tracer call for observability (does not affect result).
     """
 
@@ -197,6 +198,87 @@ class GenerateNode:
         raise CustomException(last_exc or RuntimeError("generate failed"), sys)
 
     # --------------------------
+    # SQL repair helpers
+    # --------------------------
+    def _load_schema_store(self) -> Optional[Dict[str, Any]]:
+        """
+        Try to load schema store JSON from disk (best-effort). Returns mapping or None.
+        """
+        try:
+            data_dir = getattr(config, "DATA_DIR", "./data")
+            store_path = os.path.join(data_dir, "schema_store.json")
+            if not os.path.exists(store_path):
+                return None
+            with open(store_path, "r", encoding="utf-8") as fh:
+                items = json.load(fh)
+                if isinstance(items, dict):
+                    return items
+        except Exception as e:
+            logger.debug("Failed to load schema_store.json: %s", e)
+        return None
+
+    def _attempt_repair_sql(self, sql: str, schemas: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Attempt to map missing tokens in sql to canonical store keys and produce a repaired SQL.
+        Returns {"repaired_sql": <str>, "mapping": {found_token: canonical_store_key}}.
+        This is a best-effort heuristic — it does not guarantee correctness.
+        """
+        result = {"repaired_sql": sql, "mapping": {}}
+        try:
+            missing_tables = utils.validate_tables_in_sql(sql, schemas)
+            missing_columns = utils.validate_columns_in_sql(sql, schemas)
+
+            if not missing_tables and not missing_columns:
+                return result
+
+            # Build index to speed repeated lookups
+            # utils.find_matching_schema_key(name, schemas) already does fuzzy/alias lookup
+            repaired = sql
+
+            # repair table tokens first
+            for tkn in missing_tables:
+                try:
+                    match_key = utils.find_matching_schema_key(tkn, schemas)
+                    if match_key:
+                        # Use canonical store value (prefer explicit canonical field)
+                        canonical_name = (schemas.get(match_key) or {}).get("canonical") or match_key
+                        # Replace tokens bounded by word boundaries (case-insensitive)
+                        repaired = re.sub(rf"\b{re.escape(tkn)}\b", canonical_name, repaired, flags=re.IGNORECASE)
+                        result["mapping"][tkn] = canonical_name
+                except Exception:
+                    continue
+
+            # then repair columns: attempt to map column tokens to union columns; if column appears as table.col replace appropriately
+            for col in missing_columns:
+                try:
+                    # Try to find a schema key that contains this column
+                    found_key = None
+                    for store_key, meta in (schemas or {}).items():
+                        cols = []
+                        if isinstance(meta, dict):
+                            cols = meta.get("columns") or meta.get("columns_normalized") or []
+                        elif isinstance(meta, (list, tuple)):
+                            cols = meta
+                        cols_norm = {utils._canonicalize_name(str(c)): c for c in (cols or [])}
+                        if utils._canonicalize_name(col) in cols_norm:
+                            found_key = store_key
+                            break
+                    if found_key:
+                        canonical_table = (schemas.get(found_key) or {}).get("canonical") or found_key
+                        # replace occurrences of col or table.col with canonical_table.column
+                        repaired = re.sub(rf"\b{re.escape(col)}\b", col, repaired, flags=re.IGNORECASE)  # keep col as is
+                        # if column used with unknown table qualifier, try to qualify it
+                        # e.g. "SELECT app_name FROM apps" -> "SELECT app_name FROM googleplaystore"
+                        result["mapping"][col] = f"{canonical_table}.{col}"
+                except Exception:
+                    continue
+
+            result["repaired_sql"] = repaired
+        except Exception as e:
+            logger.debug("SQL repair attempt failed: %s", e, exc_info=True)
+        return result
+
+    # --------------------------
     # Core run()
     # --------------------------
     def run(self, prompt: str) -> Dict[str, Any]:
@@ -223,8 +305,30 @@ class GenerateNode:
                 "If you cannot answer, return an empty string for sql."
             )
 
-            # combine instruction + user prompt (keep both visible)
-            prompt_text = f"{system_instruction}\n\nUSER QUERY:\n{prompt}"
+            # Attempt to include schema store into prompt (if present). This prevents the model from inventing table names.
+            schema_text = ""
+            schemas_obj = None
+            try:
+                schemas_obj = self._load_schema_store()
+                if schemas_obj:
+                    # flatten_schema accepts dict-shaped store
+                    schema_text = utils.flatten_schema(schemas_obj)
+            except Exception:
+                schema_text = ""
+
+            # Compose prompt: system instruction + available schemas + user prompt + firm instruction about canonical names.
+            prompt_parts = [system_instruction]
+            if schema_text:
+                prompt_parts.append("Available tables and columns:\n" + schema_text)
+            # include the user-visible query
+            prompt_parts.append(f"USER QUERY:\n{prompt}")
+            # explicit safety instruction to not invent table names
+            prompt_parts.append(
+                "IMPORTANT: Use ONLY the table and column names listed above exactly as written. "
+                "Do NOT invent or use any other table names (for example: 'apps'). If you must refer to a column, use its exact name."
+            )
+
+            prompt_text = "\n\n".join(prompt_parts)
 
             # choose provider (prefer provider_client, then client, then lazy GeminiClient)
             provider = self.provider_client or self.client
@@ -236,6 +340,19 @@ class GenerateNode:
                 except Exception as e:
                     logger.exception("Failed to instantiate GeminiClient lazily")
                     raise CustomException(e, sys)
+
+            # DEBUG: log selected table names + prompt preview so we can inspect what the model receives.
+            try:
+                logger.info("Provider call debug: prompt preview (first 1200 chars): %s", prompt_text[:1200])
+                if schema_text:
+                    logger.info("Provider call debug: schema preview (first 400 chars): %s", schema_text[:400])
+                try:
+                    with open("debug_prompt.txt", "w", encoding="utf-8") as fh:
+                        fh.write(prompt_text)
+                except Exception:
+                    logger.debug("Could not write debug_prompt.txt")
+            except Exception:
+                logger.exception("Failed to emit provider debug logs")
 
             # call provider with retries
             t0 = time.time()
@@ -286,11 +403,43 @@ class GenerateNode:
                 "extracted_sql_length": len(extracted_sql or ""),
             }
 
+            # If validation fails, attempt a best-effort repair using the schema store.
+            repair_info = {}
+            try:
+                # prefer schemas_obj loaded from disk; if not present and we have a Tools.schema_store, try that
+                schemas_for_validation = schemas_obj
+                try:
+                    if not schemas_for_validation and hasattr(self.tools, "schema_store") and getattr(self.tools, "schema_store"):
+                        # Try to access a ._store attribute if present to get dict shape
+                        ss = getattr(self.tools.schema_store, "_store", None)
+                        if isinstance(ss, dict) and ss:
+                            schemas_for_validation = ss
+                except Exception:
+                    pass
+
+                if schemas_for_validation:
+                    missing_tables = utils.validate_tables_in_sql(extracted_sql, schemas_for_validation)
+                    missing_cols = utils.validate_columns_in_sql(extracted_sql, schemas_for_validation)
+                    if missing_tables or missing_cols:
+                        logger.warning("ValidateNode: validation failed: tables=%s cols=%s", missing_tables, missing_cols)
+                        # attempt repair
+                        repair = self._attempt_repair_sql(extracted_sql, schemas_for_validation)
+                        if repair and repair.get("repaired_sql") and repair.get("repaired_sql") != extracted_sql:
+                            logger.info("GenerateNode: SQL repaired via schema mapping: %s", repair.get("mapping", {}))
+                            repair_info = repair
+                            extracted_sql = repair.get("repaired_sql", extracted_sql)
+                else:
+                    logger.debug("No schema store available for validation/repair")
+            except Exception as e:
+                logger.debug("Validation/repair step failed: %s", e, exc_info=True)
+
             # timings
             timings["total_elapsed"] = time.time() - start_time
             meta["timings"] = timings
+            if repair_info:
+                meta["repair"] = repair_info
 
-            # tracer
+            # tracer (fire-and-forget)
             try:
                 self._call_tracer(prompt_text, extracted_sql or None, meta)
             except Exception:

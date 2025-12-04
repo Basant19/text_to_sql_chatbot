@@ -102,6 +102,8 @@ class GraphBuilder:
     def build_default():
         """
         Build a default graph using the project's node implementations. Lazy imports.
+        This function is defensive: nodes may have different constructor signatures,
+        and provider/tracer clients are optional.
         """
         try:
             from app.graph.nodes.context_node import ContextNode
@@ -168,18 +170,41 @@ class GraphBuilder:
 
         # Instantiate nodes; prefer passing tools so nodes share same SchemaStore/VectorSearch
         try:
-            context_node = ContextNode(tools=tools) if tools is not None else ContextNode()
-            retrieve_node = RetrieveNode(tools=tools) if tools is not None else RetrieveNode()
-            prompt_node = PromptNode() if tools is None else PromptNode(prompt_builder=None)
+            # Context & Retrieve accept tools in many implementations
+            try:
+                context_node = ContextNode(tools=tools) if tools is not None else ContextNode()
+            except TypeError:
+                context_node = ContextNode()
 
-            # GenerateNode may accept kwargs provider_client/tracer_client/tools — try both ways when constructing
+            try:
+                retrieve_node = RetrieveNode(tools=tools) if tools is not None else RetrieveNode()
+            except TypeError:
+                retrieve_node = RetrieveNode()
+
+            # PromptNode: prefer to pass tools when available; handle varied constructors
+            try:
+                if tools is not None:
+                    # many PromptNode implementations accept tools or prompt_builder
+                    prompt_node = PromptNode(tools=tools)
+                else:
+                    prompt_node = PromptNode()
+            except TypeError:
+                try:
+                    prompt_node = PromptNode(prompt_builder=None)
+                except Exception:
+                    prompt_node = PromptNode()
+
+            # GenerateNode may accept kwargs provider_client/tracer_client/tools — try flexible instantiation
             try:
                 generate_node = GenerateNode(provider_client=provider_client, tracer_client=tracer_client, tools=tools)
             except TypeError:
                 try:
                     generate_node = GenerateNode(provider_client, tracer_client)
                 except Exception:
-                    generate_node = GenerateNode()
+                    try:
+                        generate_node = GenerateNode(provider_client)
+                    except Exception:
+                        generate_node = GenerateNode()
 
             validate_node = ValidateNode()
 
@@ -292,7 +317,8 @@ class GraphBuilder:
             # prompt_node -> prompt text
             t2 = time.time()
             try:
-                prompt = _try_call_run(self.prompt_node, user_query, schemas, retrieved_docs=retrieved)
+                # be permissive: try several common argument combos via _try_call_run
+                prompt = _try_call_run(self.prompt_node, user_query, schemas, retrieved)
             except Exception as e:
                 return self._handle_error_node(e, ctx_for_error, step="prompt")
             timings["prompt"] = time.time() - t2
@@ -301,7 +327,8 @@ class GraphBuilder:
             # generate_node -> generation result
             t3 = time.time()
             try:
-                gen = _try_call_run(self.generate_node, prompt)
+                # Provide prompt + context to generate_node; _try_call_run will adapt if signature differs.
+                gen = _try_call_run(self.generate_node, prompt, schemas, retrieved)
             except Exception as e:
                 return self._handle_error_node(e, ctx_for_error, step="generate")
             timings["generate"] = time.time() - t3
@@ -350,6 +377,7 @@ class GraphBuilder:
             # format_node -> produce formatted output
             t6 = time.time()
             try:
+                # pass (sql, schemas, retrieved, execution_result, raw) — adaptively called
                 formatted = _try_call_run(self.format_node, sql, schemas, retrieved, execution_result, raw)
             except Exception as e:
                 ctx_for_error.update({"sql": sql, "raw": raw, "retrieved": retrieved, "execution": execution_result})

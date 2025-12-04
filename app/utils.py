@@ -1,7 +1,6 @@
-# app/utils.py
 import re
 import logging
-from typing import List, Dict, Optional, Any, Set, Tuple, Iterable
+from typing import List, Dict, Optional, Any, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +11,7 @@ def _have_sqlglot() -> bool:
         return True
     except Exception:
         return False
+
 
 _SQLGLOT_AVAILABLE = _have_sqlglot()
 
@@ -43,8 +43,8 @@ def _canonicalize_name(name: str) -> str:
     # drop schema prefixes
     if "." in name:
         name = name.split(".")[-1]
-    # drop trailing punctuation
-    name = re.sub(r"[^\w\-]", "_", name)
+    # replace any non-word sequences with underscore
+    name = re.sub(r"[^\w]+", "_", name)
     return name.lower().strip()
 
 
@@ -139,13 +139,19 @@ def extract_table_and_column_tokens(sql: str) -> Tuple[Set[str], Set[str]]:
                 for a in parsed.find_all(Alias):
                     try:
                         alias_name = None
-                        # alias object may vary by sqlglot version
-                        # prefer .alias or args['alias']
-                        if hasattr(a, "alias"):
-                            alias_name = a.alias
-                        elif "alias" in getattr(a, "args", {}):
+                        try:
+                            # sqlglot >=23: a.alias is Identifier
+                            if hasattr(a, "alias") and a.alias:
+                                alias_name = getattr(a.alias, "name", None) or str(a.alias)
+                        except Exception:
+                            alias_name = None
+
+                        # sqlglot older versions: alias under args
+                        if not alias_name and "alias" in getattr(a, "args", {}):
                             alias_arg = a.args.get("alias")
-                            alias_name = getattr(alias_arg, "name", None) or str(alias_arg)
+                            if alias_arg:
+                                alias_name = getattr(alias_arg, "name", None) or str(alias_arg)
+
                         if alias_name:
                             alias_name = _canonicalize_name(str(alias_name))
                             if alias_name:
@@ -168,13 +174,15 @@ def extract_table_and_column_tokens(sql: str) -> Tuple[Set[str], Set[str]]:
                         col_name = _canonicalize_name(str(col_name))
                         if col_name:
                             cols.add(col_name)
-                        # if qualifier present, add to tables set
+                        # if qualifier present, add to tables set (use only Column.table)
                         try:
-                            qual = getattr(c, "table", None) or getattr(c, "this", None)
+                            qual = getattr(c, "table", None)
                             if qual:
-                                qual_name = _canonicalize_name(str(qual))
-                                if qual_name:
-                                    tables.add(qual_name)
+                                # qual may be Identifier; extract .name if present
+                                qname = getattr(qual, "name", None) or str(qual)
+                                qname = _canonicalize_name(str(qname))
+                                if qname:
+                                    tables.add(qname)
                         except Exception:
                             pass
                     except Exception:
@@ -202,15 +210,29 @@ def extract_table_and_column_tokens(sql: str) -> Tuple[Set[str], Set[str]]:
             p = p.strip()
             # remove trailing "AS alias" or aliasing
             p = re.sub(r"\s+AS\s+.+$", "", p, flags=re.IGNORECASE)
-            # remove function wrappers like COUNT(col) -> col
-            m = re.search(r"([A-Za-z_][\w\.]*)\b", p)
-            if m:
-                token = m.group(1)
-                # take last part of qualified token
-                token = token.split(".")[-1]
-                token = _canonicalize_name(token)
-                if token:
-                    cols.add(token)
+            # remove function wrappers like COUNT(col) -> col (take inner token)
+            fn_inner = re.search(r"[A-Za-z_][\w]*\s*\(\s*([A-Za-z0-9_\.\*]+)\s*\)", p)
+            token = None
+            if fn_inner:
+                token = fn_inner.group(1)
+            else:
+                m = re.search(r"([A-Za-z_][A-Za-z0-9_\.]*)\b", p)
+                if m:
+                    token = m.group(1)
+
+            if not token:
+                continue
+
+            # ignore wildcards & function names
+            token_l = token.lower()
+            if token_l == "*" or token_l in {"count", "sum", "avg", "max", "min", "distinct"}:
+                continue
+
+            # take last part of qualified token (table.col -> col)
+            token = token.split(".")[-1]
+            token = _canonicalize_name(token)
+            if token:
+                cols.add(token)
 
     return tables, cols
 
@@ -348,7 +370,8 @@ def validate_columns_in_sql(sql: str, schemas: Dict[str, Dict[str, Any]]) -> Lis
         try:
             cols = []
             if isinstance(meta, dict):
-                cols = meta.get("columns") or meta.get("columns_normalized") or []
+                # Prefer normalized tokens for matching; fall back to original column names
+                cols = meta.get("columns_normalized") or [ _canonicalize_name(str(c)) for c in (meta.get("columns") or []) ]
             elif isinstance(meta, (list, tuple)):
                 cols = meta
             cols_map[store_key] = { _canonicalize_name(str(c)) for c in cols if c is not None }
@@ -360,8 +383,10 @@ def validate_columns_in_sql(sql: str, schemas: Dict[str, Dict[str, Any]]) -> Lis
 
     missing = []
     for col in referenced_cols:
-        # skip wildcard and obvious functions
-        if not col or col == "*" or "(" in col or col.endswith(")"):
+        # skip wildcard and obvious functions or numeric tokens
+        if not col or col == "*" or col.isdigit():
+            continue
+        if col.lower() in {"count", "sum", "avg", "max", "min", "distinct"}:
             continue
         if col in union_cols:
             continue
@@ -516,8 +541,9 @@ def flatten_schema(schema: Any) -> str:
         for table, meta in schema.items():
             try:
                 if isinstance(meta, dict):
-                    cols = meta.get("columns") or meta.get("columns_normalized") or []
-                    parts.append(f"Table: {meta.get('canonical') or table} | Columns: {', '.join(map(str, cols))}")
+                    # show human-readable original column names if available, otherwise normalized tokens
+                    cols_display = meta.get("columns") or meta.get("columns_normalized") or []
+                    parts.append(f"Table: {meta.get('canonical') or table} | Columns: {', '.join(map(str, cols_display))}")
                     sample_rows = meta.get("sample_rows") or []
                     if sample_rows:
                         parts.append("  sample rows: " + preview_sample_rows(sample_rows, max_preview=2))
@@ -582,5 +608,13 @@ def build_prompt(
         parts.append("Retrieved Documents:\n" + docs_text)
 
     parts.append(f"User Query: {user_query}\nSQL:")
+
+    # Safety instruction: force model to use only canonical table/column names provided above.
+    # This reduces hallucination where the model invents table names such as `apps`.
+    parts.append(
+        "IMPORTANT: Use ONLY the table and column names listed above exactly as written. "
+        "Do NOT invent or use any other table names (for example: 'apps')."
+    )
+
     prompt = "\n\n".join(parts)
     return prompt
