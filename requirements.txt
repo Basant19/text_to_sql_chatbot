@@ -5,6 +5,7 @@ langchain==1.0.7
 langchain-core==1.1.0
 langchain-google-genai==3.2.0
 
+langchain-text-splitters>=1.0.0
 
 
 

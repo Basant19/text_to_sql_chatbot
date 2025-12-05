@@ -10,7 +10,6 @@ from app import config
 
 logger = get_logger("gemini_client")
 
-
 # Config-driven defaults (fall back to safe values)
 _DEFAULT_TIMEOUT = getattr(config, "GEMINI_REST_TIMEOUT", 30)
 _DEFAULT_RETRIES = getattr(config, "GEMINI_REST_RETRIES", 2)
@@ -24,7 +23,6 @@ def _safe_serialize_raw(raw: Any) -> Any:
     If not possible, return a truncated string preview.
     """
     try:
-        # first try a full dump (when raw is dict-like or has __dict__)
         return json.loads(json.dumps(raw, default=lambda o: getattr(o, "__dict__", str(o))))
     except Exception:
         try:
@@ -58,7 +56,6 @@ class GeminiClient:
             self.default_model = default_model or getattr(config, "GEMINI_MODEL", "gemini-2.5-flash")
             self.tracing = tracing if tracing is not None else getattr(config, "LANGSMITH_TRACING", False)
 
-            # do not force raising here — some flows may stub GeminiClient during tests.
             if not self.api_key:
                 logger.warning("GeminiClient initialized without API key; REST/SDK calls will fail if invoked.")
 
@@ -96,7 +93,6 @@ class GeminiClient:
                     except Exception:
                         import generativeai as genai  # type: ignore
 
-                    # configure SDK if possible
                     try:
                         genai.configure(api_key=self.api_key)
                     except Exception:
@@ -126,12 +122,6 @@ class GeminiClient:
             raise CustomException(e, sys)
 
     def _normalize_model_name(self, model: str) -> str:
-        """
-        Return a model identifier in a stable form.
-        This function returns either:
-          - 'models/xxx' (if caller passed 'xxx' or 'models/xxx')
-          - preserves 'tunedModels/...' if present
-        """
         try:
             if not isinstance(model, str) or not model:
                 return model
@@ -142,10 +132,6 @@ class GeminiClient:
             return model
 
     def _build_model_path(self, norm_model: str) -> str:
-        """
-        Derive the model path segment to embed into REST url WITHOUT duplicating 'models/'.
-        If norm_model already contains 'models/' or 'tunedModels/', use it as-is.
-        """
         if not isinstance(norm_model, str) or not norm_model:
             return norm_model
         if norm_model.startswith("models/") or norm_model.startswith("tunedModels/"):
@@ -219,7 +205,6 @@ class GeminiClient:
                     try:
                         resp = gen.generate_text(model=norm_model, prompt=prompt, max_output_tokens=int(max_tokens))
                     except Exception:
-                        # some SDK versions have different function signatures; try a generic call
                         resp = gen.generate(prompt, model=norm_model, max_output_tokens=int(max_tokens))
 
                     text = None
@@ -267,25 +252,19 @@ class GeminiClient:
             # 3) REST fallback with requests.Session + retry
             base = self.endpoint.rstrip("/") if self.endpoint else "https://generativelanguage.googleapis.com/v1beta2"
 
-            # model_path already includes 'models/' or 'tunedModels/' where appropriate
             url = f"{base}/{model_path}:generate"
             payload = {"input": prompt, "max_output_tokens": int(max_tokens)}
 
-            # Headers and params: support both Bearer token (Authorization) and plain API key (query param)
             headers = {"Content-Type": "application/json"}
             params = {}
             if self.api_key:
-                # Heuristic: if api_key looks like an OAuth access token or starts with 'Bearer ' use Authorization header.
                 ak = str(self.api_key).strip()
                 if ak.lower().startswith("bearer ") or ak.startswith("ya29.") or ak.count(".") >= 2:
-                    # Common Google access tokens start with 'ya29.'; also accept explicit 'Bearer ' prefix
                     token = ak.replace("Bearer ", "").strip()
                     headers["Authorization"] = f"Bearer {token}"
                 else:
-                    # Otherwise send as query param (API key)
                     params["key"] = ak
 
-            # local import to allow mocking in tests
             import requests
             from requests.adapters import HTTPAdapter
             from urllib3.util.retry import Retry
@@ -306,7 +285,6 @@ class GeminiClient:
             resp = session.post(url, json=payload, headers=headers, params=params, timeout=timeout)
 
             if resp.status_code >= 400:
-                # include response body in logs for debugging
                 try:
                     detail = resp.json()
                 except Exception:
@@ -322,7 +300,6 @@ class GeminiClient:
             text = None
             raw = data
             if isinstance(data, dict):
-                # support multiple possible response shapes
                 if "candidates" in data and isinstance(data["candidates"], list) and data["candidates"]:
                     first = data["candidates"][0]
                     if isinstance(first, dict) and "output" in first:
@@ -336,7 +313,6 @@ class GeminiClient:
                             text = " ".join(map(str, val))
                         else:
                             text = val
-                # older SDK/REST shapes sometimes have 'outputs' array
                 if text is None and "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
                     first = data["outputs"][0]
                     if isinstance(first, dict):

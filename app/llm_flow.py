@@ -1,17 +1,76 @@
 # app/llm_flow.py
-
 import sys
 import time
 from typing import List, Dict, Any, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
-from app import schema_store, vector_search, sql_executor, config
+from app import schema_store, sql_executor, config
 from app.langsmith_client import LangSmithClient
 from app.utils import build_prompt
-from app.graph.agent import LangGraphAgent
+
+# Prefer the singleton accessor for VectorSearch
+try:
+    from app.vector_search import get_instance as get_vector_search_instance
+except Exception:
+    get_vector_search_instance = None  # type: ignore
+
+# Try to get a packaged helper that returns a usable embedding function (tools.py may expose it)
+_EMBEDDING_FN_PROVIDER = None
+try:
+    from app import tools  # type: ignore
+
+    if hasattr(tools, "get_embedding_fn"):
+        _EMBEDDING_FN_PROVIDER = getattr(tools, "get_embedding_fn")
+    elif hasattr(tools, "embedding_fn"):
+        _EMBEDDING_FN_PROVIDER = lambda: getattr(tools, "embedding_fn")
+except Exception:
+    _EMBEDDING_FN_PROVIDER = None
+
+# LangGraphAgent import (optional)
+try:
+    from app.graph.agent import LangGraphAgent  # type: ignore
+except Exception:
+    LangGraphAgent = None  # type: ignore
 
 logger = get_logger("llm_flow")
+
+
+def _init_vector_search():
+    """
+    Initialize / return a VectorSearch singleton instance.
+    Tries to obtain an embedding_fn from tools if available and sets dim if tools publish it.
+    """
+    if get_vector_search_instance is None:
+        return None
+    embedding_fn = None
+    dim = None
+    try:
+        if _EMBEDDING_FN_PROVIDER:
+            # provider may be callable that returns a function or the function itself
+            ef = _EMBEDDING_FN_PROVIDER()
+            if callable(ef):
+                embedding_fn = ef
+            elif callable(_EMBEDDING_FN_PROVIDER):
+                embedding_fn = _EMBEDDING_FN_PROVIDER
+        # If tools exposes a DIM constant, pick it up
+        try:
+            dim = getattr(__import__("app.tools", fromlist=[""]), "EMBEDDING_DIM", None)
+        except Exception:
+            dim = None
+    except Exception:
+        embedding_fn = None
+        dim = None
+    # instantiate singleton (get_instance handles None embedding_fn)
+    try:
+        if dim:
+            vs = get_vector_search_instance(embedding_fn=embedding_fn, index_path=getattr(config, "FAISS_INDEX_PATH", "./faiss/index.faiss"), dim=dim)
+        else:
+            vs = get_vector_search_instance(embedding_fn=embedding_fn, index_path=getattr(config, "FAISS_INDEX_PATH", "./faiss/index.faiss"))
+        return vs
+    except Exception:
+        logger.exception("Failed to initialize VectorSearch singleton")
+        return None
 
 
 def generate_sql_from_query(
@@ -39,15 +98,14 @@ def generate_sql_from_query(
     """
     start_time = time.time()
     try:
-        # --- Construct LangSmith tracing client (used only for observability) ---
-        # If not provided, create a local client (it may be a noop if no key/endpoint configured).
+        # --- LangSmith tracing client (observability) ---
         try:
             langsmith_client = langsmith_client or LangSmithClient()
         except Exception as e:
             logger.warning("Failed to initialize LangSmithClient for tracing: %s", e)
             langsmith_client = None
 
-        # --- Construct provider client (Gemini) lazily ---
+        # --- Provider client (Gemini) lazily imported in LangGraphAgent or later when needed ---
         provider_client = None
         try:
             from app.gemini_client import GeminiClient  # type: ignore
@@ -64,11 +122,11 @@ def generate_sql_from_query(
             logger.debug("GeminiClient import not available; provider_client remains None")
 
         # ----------------------
-        # Load Schemas
+        # Load Schemas from SchemaStore
         # ----------------------
         ss = schema_store.SchemaStore()
         schemas_map: Dict[str, Dict[str, Any]] = {}
-        for name in csv_names:
+        for name in csv_names or []:
             cols = ss.get_schema(name) or []
             samples = ss.get_sample_rows(name) or []
             schemas_map[name] = {"columns": cols, "sample_rows": samples}
@@ -76,14 +134,17 @@ def generate_sql_from_query(
                 logger.warning("Schema not found for CSV/table '%s'", name)
 
         # ----------------------
-        # Retrieve relevant docs (RAG)
+        # Retrieve relevant docs (RAG) using VectorSearch singleton
         # ----------------------
         retrieved_docs: List[Dict[str, Any]] = []
         try:
-            vs = vector_search.VectorSearch(embedding_fn=None)
-            docs = vs.search(user_query, top_k=top_k) or []
+            vs = _init_vector_search()
+            if vs is not None:
+                docs = vs.search(user_query, top_k=top_k) or []
+            else:
+                docs = []
+            # docs are expected to be list of {"id":..., "score":..., "meta": {...}}
             if docs:
-                # Filter by csv_names if provided (best-effort matching against metadata)
                 if csv_names:
                     filtered = [
                         d
@@ -104,8 +165,11 @@ def generate_sql_from_query(
         # Build prompt
         # ----------------------
         built_prompt = build_prompt(user_query, schemas_map, retrieved_docs, few_shot=few_shot)
+        prompt_text: str = ""
+        sql: str = ""
+        raw_response: Any = None
 
-        # Trace start of the flow (observability only)
+        # Trace start
         try:
             if langsmith_client and hasattr(langsmith_client, "trace_run"):
                 langsmith_client.trace_run(
@@ -118,14 +182,11 @@ def generate_sql_from_query(
             logger.debug("llm_flow: trace_run(start) failed (ignored)")
 
         # ----------------------
-        # Generate SQL (LangGraph preferred)
+        # Generate SQL (prefer LangGraphAgent)
         # ----------------------
-        sql: str = ""
-        prompt_text: str = ""
-        raw_response: Any = None
         try:
-            if use_langgraph:
-                # Provide both provider and tracer to LangGraphAgent; agent itself handles preferred provider vs tracer fallback logic.
+            if use_langgraph and LangGraphAgent is not None:
+                # agent handles provider/tracer internally
                 agent = LangGraphAgent(
                     schema_map=schemas_map,
                     retrieved_docs=retrieved_docs,
@@ -134,7 +195,6 @@ def generate_sql_from_query(
                     langsmith_client=langsmith_client,
                 )
                 gen_out = agent.run(user_query)
-                # Agent returns (sql, prompt_text, raw_response) as documented
                 if isinstance(gen_out, tuple):
                     sql, prompt_text, raw_response = gen_out
                 elif isinstance(gen_out, dict):
@@ -143,9 +203,9 @@ def generate_sql_from_query(
                     raw_response = gen_out
                 else:
                     raw_response = gen_out
-                    sql = str(gen_out).strip()
+                    sql = str(gen_out or "").strip()
             else:
-                # Direct provider path (no LangGraph)
+                # Direct provider path
                 prompt_text = built_prompt
                 gen_start = time.time()
                 # Primary: Gemini provider
@@ -154,13 +214,11 @@ def generate_sql_from_query(
                         raw_response = provider_client.generate(prompt_text, model=getattr(config, "GEMINI_MODEL", "gemini-2.5-flash"), max_tokens=512)
                     except Exception:
                         logger.exception("Gemini provider.generate failed; attempting LangSmith fallback (if enabled)")
-                        # Only call LangSmith.generate if operator explicitly opted-in
                         if langsmith_client and getattr(config, "USE_LANGSMITH_FOR_GEN", False) and hasattr(langsmith_client, "generate"):
                             raw_response = langsmith_client.generate(prompt_text, model=getattr(config, "GEMINI_MODEL", "gemini-2.5-flash"), max_tokens=512)
                         else:
                             raw_response = {"text": ""}
                 else:
-                    # No provider: only use LangSmith.generate if operator opted-in
                     if langsmith_client and getattr(config, "USE_LANGSMITH_FOR_GEN", False) and hasattr(langsmith_client, "generate"):
                         raw_response = langsmith_client.generate(prompt_text, model=getattr(config, "GEMINI_MODEL", "gemini-2.5-flash"), max_tokens=512)
                     else:
@@ -172,7 +230,7 @@ def generate_sql_from_query(
                 else:
                     sql = str(raw_response).strip()
 
-                # Trace direct generation result (observability)
+                # Trace direct generation
                 try:
                     if langsmith_client and hasattr(langsmith_client, "trace_run"):
                         langsmith_client.trace_run(
@@ -189,7 +247,7 @@ def generate_sql_from_query(
             raw_response = {"error": str(e)}
             sql = ""
 
-        # Final trace indicating completion
+        # Final trace complete
         try:
             if langsmith_client and hasattr(langsmith_client, "trace_run"):
                 langsmith_client.trace_run(

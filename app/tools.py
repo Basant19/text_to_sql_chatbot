@@ -32,10 +32,16 @@ class Tools:
         executor: Optional[Any] = None,
         provider_client: Optional[Any] = None,
         tracer_client: Optional[Any] = None,
+        *,
+        # Add explicit opt-in for auto-initializing heavy vector backend
+        auto_init_vector: bool = False,
+        # optional index path override for auto-initialized vector backend (useful for tests)
+        vector_index_path: Optional[str] = None,
     ):
         """
         Initialize tool adapters. If a component is not provided, attempt to import a default
-        implementation. Fail gracefully if defaults aren't available (set to None) — callers
+        implementation **only where explicitly desired** (auto_init_vector default False).
+        Fail gracefully if defaults aren't available (set to None) — callers
         should handle missing backends via CustomException.
         """
         try:
@@ -46,14 +52,21 @@ class Tools:
                 _config = None
 
             # Database backend
+            # NOTE: If an executor is explicitly provided and db is None, skip auto-importing the DB backend.
+            # This prevents surprising behavior in tests that want executor to handle CSV loading.
             if db is None:
-                try:
-                    # expects module or object with required interface
-                    from app import database as _database  # type: ignore
-                    self._db = _database
-                except Exception:
-                    logger.warning("Tools: default database backend not available; inject db for DB features.")
+                if executor is not None:
+                    # explicit executor was provided — prefer executor for CSV loading & keep db unset
                     self._db = None
+                    logger.debug("Tools: executor provided and db not specified — skipping auto-import of default DB backend.")
+                else:
+                    try:
+                        # expects module or object with required interface
+                        from app import database as _database  # type: ignore
+                        self._db = _database
+                    except Exception:
+                        logger.warning("Tools: default database backend not available; inject db for DB features.")
+                        self._db = None
             else:
                 self._db = db
 
@@ -69,26 +82,33 @@ class Tools:
                 self._schema_store = schema_store
 
             # VectorSearch backend
+            # NOTE: do NOT auto-initialize VectorSearch by default in order to keep test determinism.
             if vector_search is None:
-                try:
-                    from app.vector_search import VectorSearch  # type: ignore
-
-                    # Determine index path and inferred dim from config if possible
-                    index_path = getattr(_config, "VECTOR_INDEX_PATH", None) if _config else None
-                    index_path = index_path or "./faiss/index.faiss"
+                if auto_init_vector:
                     try:
-                        inferred_dim = int(getattr(_config, "VECTOR_DIM", 128)) if _config else 128
-                    except Exception:
-                        inferred_dim = 128
+                        # use the singleton accessor to ensure consistent behavior across code/tests
+                        from app.vector_search import get_vector_search  # type: ignore
 
-                    # Build safe embedding wrapper (tries langchain embedding, falls back to deterministic)
-                    embedding_fn_wrapper = self._build_embedding_wrapper(inferred_dim, _config)
+                        # Determine index path and inferred dim from config if possible
+                        index_path = vector_index_path or (getattr(_config, "VECTOR_INDEX_PATH", None) if _config else None)
+                        index_path = index_path or "./faiss/index.faiss"
+                        try:
+                            inferred_dim = int(getattr(_config, "VECTOR_DIM", 128)) if _config else 128
+                        except Exception:
+                            inferred_dim = 128
 
-                    self._vector_search = VectorSearch(index_path=index_path, embedding_fn=embedding_fn_wrapper, dim=inferred_dim)
-                    logger.info("Tools: initialized default VectorSearch with safe embedding_fn")
-                except Exception as e:
-                    logger.warning("Tools: default VectorSearch initialization failed; vector_search must be injected. Error: %s", e)
+                        # Build safe embedding wrapper (tries langchain embedding, falls back to deterministic)
+                        embedding_fn_wrapper = self._build_embedding_wrapper(inferred_dim, _config)
+
+                        self._vector_search = get_vector_search(index_path=index_path, embedding_fn=embedding_fn_wrapper, dim=inferred_dim)
+                        logger.info("Tools: initialized default VectorSearch with safe embedding_fn (auto_init_vector=True)")
+                    except Exception as e:
+                        logger.warning("Tools: default VectorSearch initialization failed; vector_search must be injected. Error: %s", e)
+                        self._vector_search = None
+                else:
+                    # Explicitly leave vector backend uninitialized — caller must inject or opt-in.
                     self._vector_search = None
+                    logger.debug("Tools: vector_search not provided and auto_init_vector=False; skipping default initialization.")
             else:
                 self._vector_search = vector_search
 
@@ -126,11 +146,46 @@ class Tools:
     def _build_embedding_wrapper(self, dim: int, config_module: Optional[Any]) -> Callable[[Union[str, List[str]]], Union[List[float], List[List[float]]]]:
         """
         Build an embedding function that accepts either a single string or a list of strings.
-
         Strategy:
           - Try LangChain GoogleGenerativeAIEmbeddings (if available) lazily.
           - Otherwise use a deterministic char-based fallback (stable, fast, no network).
+        Important: Returned vectors are always adjusted to `dim` (pad/truncate + normalize).
         """
+        def _adjust_and_normalize_vec(vec: List[float], target_dim: int) -> List[float]:
+            # Convert to list of floats, pad/truncate, then normalize to unit L2 norm
+            try:
+                import numpy as _np
+            except Exception:
+                _np = None
+
+            if _np is not None:
+                arr = _np.asarray(vec, dtype=_np.float32)
+                if arr.size < target_dim:
+                    padded = _np.zeros(target_dim, dtype=_np.float32)
+                    padded[: arr.size] = arr
+                    arr = padded
+                elif arr.size > target_dim:
+                    arr = arr[:target_dim]
+                norm = _np.linalg.norm(arr)
+                if norm > 0:
+                    arr = (arr / norm).astype(float)
+                else:
+                    arr = arr.astype(float)
+                return arr.tolist()
+            else:
+                # pure-python fallback
+                lst = list(map(float, vec))
+                if len(lst) < target_dim:
+                    lst = lst + [0.0] * (target_dim - len(lst))
+                else:
+                    lst = lst[:target_dim]
+                # normalize
+                import math
+                norm = math.sqrt(sum(x * x for x in lst))
+                if norm > 0:
+                    lst = [x / norm for x in lst]
+                return lst
+
         # Try langchain provider lazily
         try:
             # try the "langchain_google_genai" package first, then fall back to "langchain.embeddings"
@@ -143,28 +198,69 @@ class Tools:
                 emb_model = getattr(config_module, "EMBEDDING_MODEL", "models/gemini-embedding-001") if config_module else "models/gemini-embedding-001"
                 emb_client = GoogleGenerativeAIEmbeddings(model=emb_model)
 
-            logger.info("Tools: using GoogleGenerativeAIEmbeddings for embedding_fn")
+            logger.info("Tools: using GoogleGenerativeAIEmbeddings for embedding_fn (will adjust to dim=%d)", dim)
 
             def _lc_emb(x: Union[str, List[str]]):
+                # call provider and then adjust each vector to requested dim
                 if isinstance(x, (list, tuple)):
-                    res = emb_client.embed_documents(list(x))
-                    return [list(map(float, r)) for r in res]
+                    # provider may return nested list-like structures; normalize
+                    raw = emb_client.embed_documents(list(x))
+                    out = []
+                    for r in raw:
+                        # r may be numpy or other types; convert to list
+                        try:
+                            vec = list(map(float, r))
+                        except Exception:
+                            # last-resort: stringify and generate deterministic fallback
+                            vec = _deterministic_vec_from_text(str(r), dim)
+                        out.append(_adjust_and_normalize_vec(vec, dim))
+                    return out
                 else:
-                    res = emb_client.embed_query(x)
-                    return list(map(float, res)) if res is not None else [0.0] * dim
+                    raw = emb_client.embed_query(x)
+                    try:
+                        vec = list(map(float, raw))
+                    except Exception:
+                        vec = _deterministic_vec_from_text(str(raw or x), dim)
+                    return _adjust_and_normalize_vec(vec, dim)
+
+            # Deterministic fallback generator used if provider returns unusable shape
+            def _deterministic_vec_from_text(text: str, d: int):
+                # simple char-based deterministic vector (same as fallback below)
+                try:
+                    import numpy as _np
+                except Exception:
+                    _np = None
+                if _np is not None:
+                    arr = _np.zeros(d, dtype=_np.float32)
+                    s = str(text or "")
+                    for i, ch in enumerate(s.lower()):
+                        arr[i % d] += (ord(ch) % 97) * 0.001
+                    norm = _np.linalg.norm(arr)
+                    if norm > 0:
+                        arr = arr / norm
+                    return arr.tolist()
+                else:
+                    vec = [0.0] * d
+                    s = str(text or "")
+                    for i, ch in enumerate(s.lower()):
+                        vec[i % d] += (ord(ch) % 97) * 0.001
+                    import math
+                    norm = math.sqrt(sum(x * x for x in vec))
+                    if norm > 0:
+                        vec = [x / norm for x in vec]
+                    return vec
 
             return _lc_emb
         except Exception as e:
             logger.debug("Tools: LangChain embeddings not available or failed to initialize: %s", e)
 
-        # Deterministic fallback
+        # Deterministic fallback (provider not present)
         try:
             import numpy as _np
         except Exception:
-            # If numpy missing, raise clear error (VectorSearch expects numpy). Keep fallback but will likely fail later.
             _np = None
 
-        logger.info("Tools: using deterministic fallback embedding for embedding_fn")
+        logger.info("Tools: using deterministic fallback embedding for embedding_fn (dim=%d)", dim)
 
         def _single_default_emb(text: str) -> List[float]:
             d = dim or 128
@@ -174,16 +270,20 @@ class Tools:
                 s = str(text or "")
                 for i, ch in enumerate(s.lower()):
                     vec[i % d] += (ord(ch) % 97) * 0.001
-                # no normalization
+                # normalize
+                import math
+                norm = math.sqrt(sum(x * x for x in vec))
+                if norm > 0:
+                    vec = [x / norm for x in vec]
                 return vec
-            vec = _np.zeros(d, dtype=float)
+            arr = _np.zeros(d, dtype=_np.float32)
             s = str(text or "")
             for i, ch in enumerate(s.lower()):
-                vec[i % d] += (ord(ch) % 97) * 0.001
-            norm = _np.linalg.norm(vec)
+                arr[i % d] += (ord(ch) % 97) * 0.001
+            norm = _np.linalg.norm(arr)
             if norm > 0:
-                vec = vec / norm
-            return vec.tolist()
+                arr = arr / norm
+            return arr.tolist()
 
         def _wrapper(input_texts: Union[str, List[str]]):
             if isinstance(input_texts, (list, tuple)):
@@ -328,13 +428,23 @@ class Tools:
     # Database / SQL execution adapters
     # ---------------------
     def load_table(self, csv_path: str, table_name: str, force_reload: bool = False) -> None:
+        """
+        Load CSV into DB. Prefer DB backend. If DB missing, try executor.load_csv_table (fallback).
+        """
         try:
-            if not self._db:
-                raise CustomException("Database backend not configured", sys)
-            if not hasattr(self._db, "load_csv_table"):
-                raise CustomException("Database backend missing 'load_csv_table' method", sys)
-            self._db.load_csv_table(csv_path, table_name, force_reload=force_reload)
-            logger.info("Tools: loaded table %s from %s", table_name, csv_path)
+            # Prefer explicit DB backend if available
+            if self._db and hasattr(self._db, "load_csv_table"):
+                self._db.load_csv_table(csv_path, table_name, force_reload=force_reload)
+                logger.info("Tools: loaded table %s from %s via db backend", table_name, csv_path)
+                return
+
+            # Fallback: let executor perform CSV loading if it implements load_csv_table
+            if self._executor and hasattr(self._executor, "load_csv_table"):
+                self._executor.load_csv_table(csv_path, table_name, force_reload=force_reload)
+                logger.info("Tools: loaded table %s from %s via executor backend", table_name, csv_path)
+                return
+
+            raise CustomException("Database backend not configured and executor cannot load CSVs", sys)
         except CustomException:
             raise
         except Exception as e:
@@ -342,12 +452,18 @@ class Tools:
             raise CustomException(e, sys)
 
     def list_tables(self) -> List[str]:
+        """
+        List tables. Prefer DB backend; if DB missing but executor supports listing, use executor.list_tables().
+        """
         try:
-            if not self._db:
-                raise CustomException("Database backend not configured", sys)
-            if not hasattr(self._db, "list_tables"):
-                raise CustomException("Database backend missing 'list_tables' method", sys)
-            return self._db.list_tables()
+            if self._db and hasattr(self._db, "list_tables"):
+                return self._db.list_tables()
+
+            # fallback to executor's list_tables if available
+            if self._executor and hasattr(self._executor, "list_tables"):
+                return self._executor.list_tables()
+
+            raise CustomException("Database backend not configured and executor cannot list tables", sys)
         except CustomException:
             raise
         except Exception as e:

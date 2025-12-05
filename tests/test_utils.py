@@ -1,5 +1,7 @@
+# tests/test_utils.py
 import unittest
 from app import utils
+
 
 class TestUtils(unittest.TestCase):
 
@@ -11,6 +13,7 @@ class TestUtils(unittest.TestCase):
     def test_extract_sql_from_text_select(self):
         text = "Please run this query: SELECT id, name FROM people;"
         sql = utils.extract_sql_from_text(text)
+        # inline SELECT extraction strips trailing semicolon
         self.assertEqual(sql, "SELECT id, name FROM people")
 
     def test_is_safe_sql(self):
@@ -31,14 +34,17 @@ class TestUtils(unittest.TestCase):
         self.assertIn("A: SELECT * FROM people", formatted)
 
     def test_format_retrieved_docs(self):
-        docs = [{"title": "Doc1", "content": "Content of doc1"}]
+        # use shape supported by utils.format_retrieved_docs (id/text/meta)
+        docs = [{"id": "doc1", "text": "Content of doc1", "meta": {"table_name": "Doc1"}}]
         formatted = utils.format_retrieved_docs(docs)
         self.assertIn("Doc1:", formatted)
         self.assertIn("Content of doc1", formatted)
 
     def test_build_prompt(self):
+        # schema can be simple dict mapping table->list of cols
         schemas = {"people": ["id", "name"]}
-        docs = [{"title": "Doc1", "content": "Info"}]
+        # retrieved docs use meta/title/text shape
+        docs = [{"id": "doc1", "text": "Info", "meta": {"table_name": "Doc1"}}]
         few_shot = [{"query": "Get names", "sql": "SELECT name FROM people"}]
         prompt = utils.build_prompt("List all people", schemas, docs, few_shot)
         self.assertIn("User Query: List all people", prompt)
@@ -57,6 +63,7 @@ class TestUtils(unittest.TestCase):
         preview = utils.preview_sample_rows(rows)
         self.assertIn("id=1, name=Alice", preview)
         self.assertIn("id=2, name=Bob", preview)
+
 
 if __name__ == "__main__":
     unittest.main()

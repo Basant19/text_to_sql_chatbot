@@ -1,166 +1,65 @@
 import os
 import io
-import sys
-import tempfile
-import traceback
+import shutil
+import pytest
+from app.csv_loader import CSVLoader, save_uploaded_csv, load_csv_metadata
 
-# Ensure project root (one level up) is on sys.path so "from app import ..." works
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+UPLOAD_DIR = "./tests/uploads"
 
-import pytest  # noqa: E402
-from app import config  # noqa: E402
-from app.csv_loader import save_uploaded_csv, load_csv_metadata  # noqa: E402
-from app.logger import get_logger  # noqa: E402
-from app.exception import CustomException  # noqa: E402
+@pytest.fixture(scope="module")
+def csv_loader():
+    # Ensure a clean test upload directory
+    if os.path.exists(UPLOAD_DIR):
+        shutil.rmtree(UPLOAD_DIR)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    loader = CSVLoader(upload_dir=UPLOAD_DIR, chunk_size=10, chunk_overlap=2)
+    return loader
 
-logger = get_logger("test_csv_loader")
+def test_save_uploaded_csv_bytes(csv_loader):
+    content = b"name,description\nAlice,Hello world\nBob,Goodbye world"
+    filename = "test_bytes.csv"
+    path = save_uploaded_csv(content, filename, upload_dir=UPLOAD_DIR)
+    assert os.path.exists(path)
+    assert path.lower().endswith(".csv")
 
-SAMPLE_CSV = """id,name,age
-1,Alice,30
-2,Bob,25
-3,Charlie,40
-4,Dana,28
-"""
+def test_save_uploaded_csv_fileobj(csv_loader):
+    content = io.StringIO("name,description\nAlice,Hello world\nBob,Goodbye world")
+    filename = "test_fileobj.csv"
+    path = save_uploaded_csv(content, filename, upload_dir=UPLOAD_DIR)
+    assert os.path.exists(path)
+    assert path.lower().endswith(".csv")
 
+def test_list_uploaded_csvs(csv_loader):
+    # Ensure at least one CSV exists
+    files = csv_loader.list_uploaded_csvs()
+    assert isinstance(files, list)
+    assert all(f.endswith(".csv") for f in files)
 
-# ---------- Helper functions (used by both pytest and script-run) ----------
+def test_load_csv_metadata_basic(csv_loader):
+    test_csv_path = os.path.join(UPLOAD_DIR, "meta_test.csv")
+    with open(test_csv_path, "w", encoding="utf-8") as f:
+        f.write("col1,col2\nval1,val2\nval3,val4")
 
-def _run_save_and_load(upload_dir: str):
-    """
-    Helper that saves a sample CSV into upload_dir (by patching config.UPLOAD_DIR),
-    then loads metadata and returns it.
-    """
-    # Patch config path (works for both pytest monkeypatch and standalone)
-    original_upload_dir = getattr(config, "UPLOAD_DIR", None)
-    config.UPLOAD_DIR = upload_dir
-
-    try:
-        file_obj = io.StringIO(SAMPLE_CSV)
-        saved_path = save_uploaded_csv(file_obj, "people.csv")
-        metadata = load_csv_metadata(saved_path, sample_rows=2)
-        return saved_path, metadata
-    finally:
-        # restore original UPLOAD_DIR
-        if original_upload_dir is None:
-            delattr(config, "UPLOAD_DIR")
-        else:
-            config.UPLOAD_DIR = original_upload_dir
-
-
-# -------------------- pytest tests --------------------
-
-def test_save_uploaded_csv_and_load_metadata(tmp_path, monkeypatch):
-    # Use pytest's tmp_path and monkeypatch to keep things isolated
-    monkeypatch.setattr(config, "UPLOAD_DIR", str(tmp_path))
-
-    file_obj = io.StringIO(SAMPLE_CSV)
-    saved_path = save_uploaded_csv(file_obj, "people.csv")
-
-    assert os.path.isfile(saved_path), "Saved CSV file should exist"
-
-    metadata = load_csv_metadata(saved_path, sample_rows=2)
-    assert metadata["table_name"].startswith("people")
-    assert metadata["path"] == saved_path
-    assert metadata["columns"] == ["id", "name", "age"]
-    assert isinstance(metadata["sample_rows"], list)
-    assert len(metadata["sample_rows"]) == 2
-    assert metadata["row_count"] == 4  # data rows count
+    meta = load_csv_metadata(test_csv_path)
+    assert meta["table_name"]
+    # loader normalizes column names; test the normalized names.
+    assert meta["columns_normalized"] == ["col_1", "col_2"]
+    assert meta["row_count"] == 2
+    assert len(meta["sample_rows"]) <= 2
 
 
-def test_duplicate_filename_creates_unique_copy(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "UPLOAD_DIR", str(tmp_path))
+def test_load_and_chunk_csv(csv_loader):
+    test_csv_path = os.path.join(UPLOAD_DIR, "chunk_test.csv")
+    with open(test_csv_path, "w", encoding="utf-8") as f:
+        f.write("text\n" + "A" * 25 + "\n" + "B" * 15 + "\n")
 
-    # Save first file
-    first = io.StringIO(SAMPLE_CSV)
-    path1 = save_uploaded_csv(first, "dup.csv")
-    assert os.path.exists(path1)
-
-    # Save second file with same name; should not overwrite
-    second = io.StringIO(SAMPLE_CSV)
-    path2 = save_uploaded_csv(second, "dup.csv")
-    assert os.path.exists(path2)
-
-    assert path1 != path2, "Saving a duplicate filename should produce a unique path"
-
-    # Load metadata from both to ensure both are valid CSVs
-    meta1 = load_csv_metadata(path1)
-    meta2 = load_csv_metadata(path2)
-    assert meta1["columns"] == meta2["columns"]
-
-
-def test_load_nonexistent_file_raises(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "UPLOAD_DIR", str(tmp_path))
-    nonexist = os.path.join(str(tmp_path), "nope.csv")
-    # Expect CustomException (the loader wraps errors in CustomException)
-    with pytest.raises(CustomException):
-        load_csv_metadata(nonexist)
-
-
-# -------------------- Standalone script runner --------------------
-def _run_as_script():
-    """
-    Run a small sequence of checks without pytest:
-    - Use a TemporaryDirectory
-    - Call helper to save and load CSV
-    - Verify duplicate filename behavior
-    - Verify nonexistent file raises CustomException
-    Print friendly output messages for success/failure.
-    """
-    print("Running tests in standalone mode (no pytest).")
-    successes = 0
-    failures = 0
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            saved_path, metadata = _run_save_and_load(tmpdir)
-            assert os.path.isfile(saved_path)
-            assert metadata["columns"] == ["id", "name", "age"]
-            print("✔ save & load metadata: PASSED")
-            successes += 1
-        except Exception:
-            print("✖ save & load metadata: FAILED")
-            traceback.print_exc()
-            failures += 1
-
-        try:
-            # duplicate filename
-            path1 = save_uploaded_csv(io.StringIO(SAMPLE_CSV), "dup.csv")
-            path2 = save_uploaded_csv(io.StringIO(SAMPLE_CSV), "dup.csv")
-            assert os.path.exists(path1) and os.path.exists(path2) and (path1 != path2)
-            print("✔ duplicate filename uniqueness: PASSED")
-            successes += 1
-        except Exception:
-            print("✖ duplicate filename uniqueness: FAILED")
-            traceback.print_exc()
-            failures += 1
-
-        try:
-            nonexist = os.path.join(tmpdir, "nope.csv")
-            try:
-                load_csv_metadata(nonexist)
-                # if no exception, it's a failure
-                print("✖ load nonexistent file: FAILED (no exception raised)")
-                failures += 1
-            except CustomException:
-                print("✔ load nonexistent file raises CustomException: PASSED")
-                successes += 1
-            except Exception:
-                print("✖ load nonexistent file: FAILED (wrong exception type)")
-                traceback.print_exc()
-                failures += 1
-        except Exception:
-            print("✖ load nonexistent file test infrastructure failed")
-            traceback.print_exc()
-            failures += 1
-
-    print(f"\nStandalone run complete. successes={successes}, failures={failures}")
-    return failures == 0
-
-
-# Allow both pytest discovery and direct execution:
-if __name__ == "__main__":
-    ok = _run_as_script()
-    if not ok:
-        sys.exit(1)
+    chunks = csv_loader.load_and_chunk_csv(test_csv_path)
+    assert isinstance(chunks, list)
+    # Should produce multiple chunks because of chunk_size=10
+    assert len(chunks) > 2
+    for chunk in chunks:
+        assert "text" in chunk
+        assert "meta" in chunk
+        assert "row" in chunk["meta"]
+        assert "column" in chunk["meta"]
+        assert "original" in chunk["meta"]

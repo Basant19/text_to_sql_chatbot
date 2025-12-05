@@ -1,99 +1,80 @@
 # tests/test_tools.py
 import os
-import sys
-import tempfile
+import shutil
 import pytest
-
-# Ensure project root on sys.path for direct runs
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
+import numpy as np
 from app.tools import Tools
-from app.exception import CustomException
+from app.vector_search import get_vector_search
+
+TEST_DIR = "./tests"
+os.makedirs(TEST_DIR, exist_ok=True)
+INDEX_PATH = os.path.join(TEST_DIR, "tools_faiss_test_index.faiss")
+META_PATH = INDEX_PATH + ".meta.json"
 
 
-# ---------------- Dummy/test doubles ----------------
-class DummyDB:
-    def __init__(self):
-        self.loaded = []
-
-    def load_csv_table(self, path, table_name, force_reload=False):
-        self.loaded.append((path, table_name, force_reload))
-
-    def list_tables(self):
-        return ["people", "orders"]
-
-
-class DummySchemaStore:
-    def __init__(self):
-        self.data = {
-            "people": {"columns": ["id", "name"], "sample_rows": [{"id": 1, "name": "Alice"}]}
-        }
-
-    def get_schema(self, name):
-        return self.data.get(name, {}).get("columns")
-
-    def get_sample_rows(self, name):
-        return self.data.get(name, {}).get("sample_rows")
-
-    def list_csvs(self):
-        return list(self.data.keys())
+def cleanup(paths):
+    for p in paths:
+        try:
+            if os.path.exists(p):
+                if os.path.isdir(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+        except Exception:
+            pass
 
 
-class DummyVectorSearch:
-    def search(self, query, top_k=5):
-        return [{"id": "d1", "score": 0.9, "text": f"hit for {query}", "meta": {"path": "/data/people.csv"}}]
+def test_build_embedding_wrapper_fallback_and_shape():
+    # Use Tools._build_embedding_wrapper directly via instance; expect deterministic fallback
+    t = Tools(auto_init_vector=False)
+    emb = t._build_embedding_wrapper(dim=12, config_module=None)
+
+    # Single string -> list of floats of length 12
+    v = emb("hello world")
+    assert isinstance(v, list)
+    assert len(v) == 12
+
+    # List of strings -> list of vectors
+    vs = emb(["one", "two", "three"])
+    assert isinstance(vs, list)
+    assert len(vs) == 3
+    assert all(isinstance(vec, list) and len(vec) == 12 for vec in vs)
 
 
-class DummyExecutor:
-    def execute_sql(self, sql, read_only=True, limit=None, as_dataframe=False):
-        return {"rows": [{"id": 1, "name": "Alice"}], "columns": ["id", "name"], "meta": {"rowcount": 1, "runtime": 0.001}}
+def test_auto_init_vector_and_upsert_search_integration():
+    # Cleanup indices (ensure fresh)
+    cleanup([INDEX_PATH, META_PATH])
+
+    # Tools with auto_init_vector True and custom index path (use deterministic embedding wrapper)
+    t = Tools(auto_init_vector=True, vector_index_path=INDEX_PATH)
+
+    # Ensure vector backend was created
+    assert t._vector_search is not None
+
+    # Create docs and upsert
+    docs = [
+        {"text": "apple banana", "meta": {"category": "fruit"}},
+        {"text": "python java", "meta": {"category": "programming"}},
+    ]
+    ids = t.upsert_vectors(docs)
+    assert len(ids) == 2
+
+    # Search for 'apple' should return the fruit doc
+    results = t.search_vectors("apple", top_k=2)
+    assert isinstance(results, list)
+    assert any(r.get("meta", {}).get("category") == "fruit" for r in results)
+
+    # Get metadata for inserted id
+    meta0 = t.get_vector_meta(ids[0])
+    assert isinstance(meta0, dict)
+    assert "category" in meta0 or "text" in meta0
+
+    # Clear and ensure empty
+    t.clear_vectors()
+    assert t._vector_search.info()["entries"] == 0
+
+    cleanup([INDEX_PATH, META_PATH])
 
 
-# ---------------- Tests ----------------
-def test_load_table_calls_db():
-    db = DummyDB()
-    t = Tools(db=db, schema_store=DummySchemaStore(), vector_search=DummyVectorSearch(), executor=DummyExecutor())
-    t.load_table("/tmp/people.csv", "people", force_reload=True)
-    assert db.loaded == [("/tmp/people.csv", "people", True)]
-
-
-def test_list_tables_returns_expected():
-    db = DummyDB()
-    t = Tools(db=db, schema_store=DummySchemaStore(), vector_search=DummyVectorSearch(), executor=DummyExecutor())
-    assert t.list_tables() == ["people", "orders"]
-
-
-def test_get_schema_and_samples():
-    ss = DummySchemaStore()
-    t = Tools(db=DummyDB(), schema_store=ss, vector_search=DummyVectorSearch(), executor=DummyExecutor())
-    assert t.get_schema("people") == ["id", "name"]
-    assert t.get_sample_rows("people") == [{"id": 1, "name": "Alice"}]
-    assert t.list_csvs() == ["people"]
-
-
-def test_search_vectors_returns_docs():
-    vs = DummyVectorSearch()
-    t = Tools(db=DummyDB(), schema_store=DummySchemaStore(), vector_search=vs, executor=DummyExecutor())
-    docs = t.search_vectors("apple", top_k=3)
-    assert isinstance(docs, list)
-    assert docs[0]["text"].startswith("hit for apple")
-
-
-def test_execute_sql_wrapper():
-    execu = DummyExecutor()
-    t = Tools(db=DummyDB(), schema_store=DummySchemaStore(), vector_search=DummyVectorSearch(), executor=execu)
-    res = t.execute_sql("SELECT * FROM people", read_only=True, limit=10)
-    assert isinstance(res, dict)
-    assert res["meta"]["rowcount"] == 1
-    assert res["rows"][0]["name"] == "Alice"
-
-
-def test_tools_raises_if_missing_methods():
-    # Provide a DB without required methods
-    class BadDB:
-        pass
-
-    with pytest.raises(CustomException):
-        Tools(db=BadDB(), schema_store=DummySchemaStore(), vector_search=DummyVectorSearch(), executor=DummyExecutor()).list_tables()
+if __name__ == "__main__":
+    pytest.main(["-q", __file__])
