@@ -1,4 +1,3 @@
-# app/graph/nodes/validate_node.py
 """
 ValidateNode:
   - Validates incoming SQL (basic safety rules)

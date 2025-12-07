@@ -1,6 +1,7 @@
 # app/csv_loader.py
 import os
 import io
+import sys
 import uuid
 import re
 import csv
@@ -19,8 +20,6 @@ try:
     _USE_TEXT_SPLITTER = True
     logger.info("Using RecursiveCharacterTextSplitter from langchain_text_splitters")
 except Exception as e:
-    # Fail fast — user explicitly requested only this splitter.
-    # Raise a helpful ImportError so CI/devs see what's missing immediately.
     _USE_TEXT_SPLITTER = False
     logger.exception("RecursiveCharacterTextSplitter import failed: %s", e)
     raise ImportError(
@@ -36,7 +35,14 @@ def _sanitize_filename(name: str) -> str:
     return safe.strip().replace(" ", "_")
 
 
-def save_uploaded_csv(fileobj: Union[bytes, io.BytesIO, io.StringIO], filename: str, upload_dir: Optional[str] = None) -> str:
+def save_uploaded_csv(fileobj: Union[bytes, io.BytesIO, io.StringIO, str], filename: str, upload_dir: Optional[str] = None) -> str:
+    """
+    Save uploaded CSV content to upload_dir and return the saved path.
+    fileobj may be:
+      - bytes or bytearray
+      - file-like object with .read()
+      - a path string (then file is copied)
+    """
     upload_dir = upload_dir or getattr(config, "UPLOAD_DIR", "./uploads")
     os.makedirs(upload_dir, exist_ok=True)
 
@@ -47,15 +53,28 @@ def save_uploaded_csv(fileobj: Union[bytes, io.BytesIO, io.StringIO], filename: 
     dest_path = os.path.join(upload_dir, f"{uuid.uuid4().hex}_{safe_name}")
 
     try:
+        # bytes-like
         if isinstance(fileobj, (bytes, bytearray)):
             with open(dest_path, "wb") as f:
                 f.write(fileobj)
+        # path-like string: copy file contents
+        elif isinstance(fileobj, str) and os.path.exists(fileobj):
+            with open(fileobj, "rb") as src, open(dest_path, "wb") as dst:
+                while True:
+                    chunk = src.read(8192)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+        # file-like with read()
         elif hasattr(fileobj, "read"):
             content = fileobj.read()
             if isinstance(content, bytes):
-                content = content.decode("utf-8", errors="replace")
-            with open(dest_path, "w", newline="", encoding="utf-8") as f:
-                f.write(content)
+                with open(dest_path, "wb") as f:
+                    f.write(content)
+            else:
+                # treat as text
+                with open(dest_path, "w", newline="", encoding="utf-8") as f:
+                    f.write(str(content))
         else:
             raise ValueError("Unsupported file object provided to save_uploaded_csv")
 
@@ -63,11 +82,12 @@ def save_uploaded_csv(fileobj: Union[bytes, io.BytesIO, io.StringIO], filename: 
         return dest_path
     except Exception as e:
         logger.exception("Failed to save uploaded CSV")
-        raise CustomException(e)
+        raise CustomException(e, sys)
 
 
 def _normalize_table_name_from_filename(filename: str) -> str:
     stem = os.path.splitext(os.path.basename(filename))[0]
+    # If the filename has a uuid suffix inserted by save_uploaded_csv, strip it (e.g. name_abcdef12)
     m = re.match(r"^(.+?)_[0-9a-fA-F]{8,32}$", stem)
     candidate = m.group(1) if m else stem
     candidate = _sanitize_filename(candidate)
@@ -75,23 +95,19 @@ def _normalize_table_name_from_filename(filename: str) -> str:
         candidate = f"t_{candidate}"
     return candidate.lower()
 
+
 def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
     """
     Reads CSV header & a few sample rows. Also detects delimiter/header heuristically.
     Returns columns (raw), columns_normalized, aliases, etc.
-    Empty rows (all cells empty/whitespace) are ignored for row_count and samples.
 
-    Heuristics:
-    - If Sniffer says no header but the first row contains alphabetic characters,
-      treat the first row as header (fixes Sniffer mis-detections).
-    - Normalized column names insert underscores between letter<->digit boundaries
-      and replace non-word chars with underscores, collapsing repeated underscores.
+    Empty rows (all cells empty/whitespace) are ignored for row_count and samples.
     """
     try:
         if not os.path.exists(path):
             raise FileNotFoundError(f"CSV file not found: {path}")
 
-        # Peek first bytes for sniffing
+        # Read initial bytes for sniffing and to detect encoding quirks
         with open(path, "rb") as bf:
             raw_start = bf.read(8192)
             try:
@@ -99,6 +115,7 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
             except Exception:
                 start_text = raw_start.decode("latin-1", errors="replace")
 
+        # Attempt to sniff delimiter and header. Fall back to sensible defaults.
         from csv import Sniffer
         try:
             sniffer = Sniffer()
@@ -109,11 +126,13 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
             delimiter = ","
             has_header = True
 
+        # Open as text for CSV reader
         with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
             reader = csv.reader(f, delimiter=delimiter)
             try:
                 first_row = next(reader)
             except StopIteration:
+                # file empty
                 table_name = _normalize_table_name_from_filename(os.path.basename(path))
                 canonical = _sanitize_filename(os.path.splitext(os.path.basename(path))[0]).lower()
                 aliases = list({canonical, table_name})
@@ -133,16 +152,23 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
                 }
 
             # If Sniffer says no header, apply heuristic: if the first row contains alphabetic
-            # characters (e.g. "col1", "name") — treat it as a header to avoid miscounting.
+            # characters — treat it as a header to avoid mis-detections.
             if not has_header and any(re.search(r"[A-Za-z]", str(cell or "")) for cell in first_row):
                 has_header = True
 
+            # Handle BOM in first header cell
+            def _clean_cell(h: str) -> str:
+                return h.strip().replace("\ufeff", "")
+
             if has_header:
-                headers = [h.strip().replace("\ufeff", "") for h in first_row]
+                headers = [_clean_cell(h) for h in first_row]
+                # reader continues from second line
+                data_iter = reader
             else:
+                # no header: generate header names, but include first_row as data
                 headers = [f"col_{i+1}" for i in range(len(first_row))]
-                # put first_row back into iteration as data row
-                reader = iter([first_row] + list(reader))
+                # create an iterator with first_row as the first data row
+                data_iter = iter([first_row] + list(reader))
 
             def normalize_col_name(h: str) -> str:
                 # insert underscore between letter->digit and digit->letter boundaries:
@@ -161,13 +187,12 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
 
             samples: List[Dict[str, Any]] = []
             row_count = 0
-            for row in reader:
+            for row in data_iter:
                 # skip rows that are entirely empty (all cells empty or whitespace)
                 if not any((cell or "").strip() for cell in row):
                     continue
                 row_count += 1
                 if len(samples) < sample_rows:
-                    # normalize length of row to headers length
                     values = list(row) + [None] * (len(headers) - len(row))
                     values = values[: len(headers)]
                     row_dict = {headers[i]: values[i] for i in range(len(headers))}
@@ -199,8 +224,7 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
         return metadata
     except Exception as e:
         logger.exception("Failed to load CSV metadata for %s", path)
-        raise CustomException(e)
-
+        raise CustomException(e, sys)
 
 
 class CSVLoader:
@@ -233,7 +257,7 @@ class CSVLoader:
             return out
         except Exception as e:
             logger.exception("Failed to list uploaded CSVs from %s", self.upload_dir)
-            raise CustomException(e)
+            raise CustomException(e, sys)
 
     def load_and_chunk_csv(self, path: str) -> List[Dict[str, Any]]:
         """
@@ -259,9 +283,10 @@ class CSVLoader:
 
             chunks: List[Dict[str, Any]] = []
 
+            # Use DictReader when we have headers, otherwise regular reader.
             with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
-                reader = csv.DictReader(f, delimiter=delimiter) if metadata.get("has_header", True) else csv.reader(f, delimiter=delimiter)
                 if metadata.get("has_header", True):
+                    reader = csv.DictReader(f, delimiter=delimiter)
                     for row_idx, row in enumerate(reader):
                         for col_name, cell in row.items():
                             text = str(cell or "")
@@ -281,7 +306,7 @@ class CSVLoader:
                                     }
                                 })
                 else:
-                    # no header: treat columns as col_1, col_2...
+                    reader = csv.reader(f, delimiter=delimiter)
                     for row_idx, row in enumerate(reader):
                         for i, cell in enumerate(row):
                             col_name = f"col_{i+1}"
@@ -306,7 +331,7 @@ class CSVLoader:
             return chunks
         except Exception as e:
             logger.exception("Failed to load and chunk CSV %s", path)
-            raise CustomException(e)
+            raise CustomException(e, sys)
 
     def chunk_and_index(self, path: str, vector_search_client=None, id_prefix: Optional[str] = None) -> List[str]:
         """
@@ -330,6 +355,7 @@ class CSVLoader:
         if vector_search_client:
             # Upsert in batches (if client supports batch upsert)
             try:
+                # Try single call
                 vector_search_client.upsert_documents(docs)
             except Exception:
                 # try smaller batches if large

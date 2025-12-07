@@ -1,4 +1,3 @@
-# app/graph/nodes/format_node.py
 import sys
 import json
 from typing import Any, Dict, List, Optional, Union

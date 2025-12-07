@@ -17,7 +17,7 @@ class ErrorNode:
         node = ErrorNode()
         payload = node.run(exc, step="generate", context={"user_query": "..."}).
 
-    This implementation returns a GraphBuilder-friendly result dict:
+    Returned payload (GraphBuilder-friendly):
         {
             "prompt": None,
             "sql": None,
@@ -41,15 +41,30 @@ class ErrorNode:
         try:
             short_msg = str(exc) if exc is not None else "Unknown error"
             if isinstance(exc, CustomException):
+                # CustomException may expose an error_message attribute
                 details = getattr(exc, "error_message", None) or short_msg
             else:
+                # repr is safer for preserving type information
                 details = repr(exc)
 
             trace_str = None
             if isinstance(exc, BaseException):
                 trace_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
-            return {"error": short_msg, "details": details, "trace": trace_str}
+            # include any extra attributes if present (but keep minimal)
+            extra = {}
+            try:
+                if hasattr(exc, "__dict__"):
+                    d = {k: v for k, v in vars(exc).items() if k not in ("args", "__traceback__")}
+                    if d:
+                        extra = d
+            except Exception:
+                extra = {}
+
+            result = {"error": short_msg, "details": details, "trace": trace_str}
+            if extra:
+                result["extra"] = extra
+            return result
         except Exception as e:
             # fallback
             logger.exception("ErrorNode._normalize_exception failed")
@@ -75,7 +90,7 @@ class ErrorNode:
         """
         try:
             ctx = context or {}
-            timings = ctx.get("timings", {})
+            timings = ctx.get("timings", {}) if isinstance(ctx, dict) else {}
 
             # Build normalized error dict for logs and developer debug
             norm = self._normalize_exception(exc)
@@ -90,7 +105,7 @@ class ErrorNode:
                 logger.error("ErrorNode caught exception at step=%s: %s", step, short_msg)
 
             # Build a concise user-facing formatted response
-            user_message = f"An error occurred while processing your request."
+            user_message = "An error occurred while processing your request."
             if step:
                 user_message += f" Step: {step}."
             # include a short reason if available (keep it user-friendly)

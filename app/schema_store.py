@@ -1,4 +1,3 @@
-# app/schema_store.py
 """
 SchemaStore: manage CSV schema metadata persisted to JSON.
 

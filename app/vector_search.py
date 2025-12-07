@@ -1,4 +1,3 @@
-# app/vector_search.py
 """
 VectorSearch module: FAISS-only persistent index with singleton pattern,
 embedding dimension normalization, and optional text chunking.
