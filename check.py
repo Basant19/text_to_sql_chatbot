@@ -16,5 +16,5 @@ llm = ChatGoogleGenerativeAI(
 )
 
 # Invoke the model
-response = llm.invoke("What is the captial of Jharkhand?")
+response = llm.invoke("Explain about the Jharkhand?")
 print(response.content)
