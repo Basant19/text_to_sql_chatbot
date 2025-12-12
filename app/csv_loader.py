@@ -259,6 +259,32 @@ class CSVLoader:
             logger.exception("Failed to list uploaded CSVs from %s", self.upload_dir)
             raise CustomException(e, sys)
 
+    def load_and_extract(self, paths: List[str]) -> List[Dict[str, Any]]:
+        """
+        Backwards-compatible convenience used by app.py.
+
+        Accepts a list of file paths (to CSV files), calls load_csv_metadata on each,
+        and returns a list of metadata dicts (one per input path).
+
+        - paths: list of filesystem paths to CSV files
+        """
+        out_meta: List[Dict[str, Any]] = []
+        for p in paths or []:
+            try:
+                if not p or not os.path.exists(p):
+                    logger.warning("load_and_extract: path missing or not found: %s", p)
+                    continue
+                m = load_csv_metadata(p)
+                # ensure 'path' set and canonical/table fields present
+                m.setdefault("path", p)
+                m.setdefault("canonical_name", m.get("canonical_name") or _sanitize_filename(os.path.splitext(os.path.basename(p))[0]).lower())
+                m.setdefault("table_name", m.get("table_name") or _normalize_table_name_from_filename(os.path.basename(p)))
+                out_meta.append(m)
+            except Exception:
+                logger.exception("load_and_extract: failed to extract metadata for %s", p)
+        return out_meta
+
+
     def load_and_chunk_csv(self, path: str) -> List[Dict[str, Any]]:
         """
         Reads CSV using delimiter/header detected by load_csv_metadata, splits long text cells into chunks,

@@ -9,6 +9,7 @@ from app import database
 
 logger = get_logger("sql_executor")
 
+
 # ---------------------------
 # SQL Safety (read-only mode)
 # ---------------------------
@@ -65,6 +66,13 @@ def _strip_trailing_semicolon(sql: str) -> str:
     return s
 
 
+def _strip_surrounding_whitespace(sql: Optional[str]) -> Optional[str]:
+    """Trim surrounding whitespace or return None unchanged."""
+    if sql is None:
+        return sql
+    return sql.strip()
+
+
 # ---------------------------
 # Main SQL Executor
 # ---------------------------
@@ -112,12 +120,18 @@ def execute_sql(
         if not isinstance(sql, str):
             raise CustomException("SQL must be a string", sys)
 
-        # Basic safety
+        # Normalize input
+        sql = _strip_surrounding_whitespace(sql)
+        if not sql:
+            raise CustomException("Empty SQL provided", sys)
+
+        # Basic safety validation (read-only mode)
         _validate_sql(sql, read_only)
 
         # If user provided table_map, ensure those CSVs are loaded into DuckDB
         if table_map:
             try:
+                # database.ensure_tables_loaded will sanitize keys internally
                 database.ensure_tables_loaded(table_map)
             except Exception as e:
                 logger.exception("Failed to ensure tables loaded before execution")
@@ -127,9 +141,12 @@ def execute_sql(
         sql_clean = _strip_trailing_semicolon(sql)
         exec_sql = sql_clean
         if limit is not None:
+            # Wrap the user SQL in a subselect to enforce limit safely
             exec_sql = f"SELECT * FROM ({sql_clean}) AS _texttosql_sub LIMIT {int(limit)}"
 
-        # Execute via database module
+        logger.debug("Prepared exec_sql: %s", exec_sql)
+
+        # Execute via database module (which contains its own normalization attempts)
         rows_or_df, columns, meta = database.execute_query(
             exec_sql,
             read_only=read_only,
@@ -152,7 +169,7 @@ def execute_sql(
                     "rowcount": meta.get("rowcount", len(rows_list)),
                     "runtime": runtime_from_db if runtime_from_db is not None else (time.time() - start),
                 }
-                logger.info(f"Executed SQL in {time.time() - start:.3f}s (as_dataframe)")
+                logger.info("Executed SQL in %.3fs (as_dataframe)", time.time() - start)
                 return {"rows": rows_list, "columns": list(columns or []), "meta": result_meta}
             except Exception:
                 # fallback to list-of-dicts
@@ -161,7 +178,7 @@ def execute_sql(
                     "rowcount": meta.get("rowcount", len(rows_list)),
                     "runtime": runtime_from_db if runtime_from_db is not None else (time.time() - start),
                 }
-                logger.info(f"Executed SQL in {time.time() - start:.3f}s (as_dataframe-fallback)")
+                logger.info("Executed SQL in %.3fs (as_dataframe-fallback)", time.time() - start)
                 return {"rows": rows_list, "columns": list(columns or []), "meta": result_meta}
 
         # Normal path (list of tuples -> list of dicts)
@@ -170,10 +187,11 @@ def execute_sql(
             "rowcount": meta.get("rowcount", len(rows_list)),
             "runtime": runtime_from_db if runtime_from_db is not None else (time.time() - start)
         }
-        logger.info(f"Executed SQL; rows={meta_out['rowcount']} runtime={meta_out['runtime']:.3f}s")
+        logger.info("Executed SQL; rows=%d runtime=%.3fs", meta_out["rowcount"], meta_out["runtime"])
         return {"rows": rows_list, "columns": list(columns or []), "meta": meta_out}
 
     except CustomException:
+        # already well-formed; re-raise
         raise
     except Exception as e:
         logger.exception("Failed to execute SQL in sql_executor")

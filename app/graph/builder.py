@@ -1,3 +1,4 @@
+#D:\text_to_sql_bot\app\graph\builder.py
 import sys
 import time
 import inspect
@@ -163,7 +164,7 @@ class GraphBuilder:
 
         # single Tools instance to share SchemaStore, VectorSearch, etc.
         try:
-            tools = Tools()
+            tools = Tools(provider_client=provider_client, tracer_client=tracer_client)
         except Exception:
             tools = None
             logger.warning("Could not instantiate Tools() for DI; nodes may still work if they don't require it.")
@@ -184,7 +185,6 @@ class GraphBuilder:
             # PromptNode: prefer to pass tools when available; handle varied constructors
             try:
                 if tools is not None:
-                    # many PromptNode implementations accept tools or prompt_builder
                     prompt_node = PromptNode(tools=tools)
                 else:
                     prompt_node = PromptNode()
@@ -194,9 +194,12 @@ class GraphBuilder:
                 except Exception:
                     prompt_node = PromptNode()
 
-            # GenerateNode may accept kwargs provider_client/tracer_client/tools — try flexible instantiation
+            # GenerateNode may accept kwargs provider_client/tracer_client/tools — try flexible instantiation.
             try:
-                generate_node = GenerateNode(provider_client=provider_client, tracer_client=tracer_client, tools=tools)
+                if tools is not None:
+                    generate_node = GenerateNode(tools=tools)
+                else:
+                    generate_node = GenerateNode(provider_client=provider_client, tracer_client=tracer_client, tools=tools)
             except TypeError:
                 try:
                     generate_node = GenerateNode(provider_client, tracer_client)
@@ -314,21 +317,29 @@ class GraphBuilder:
                 return self._handle_error_node(e, ctx_for_error, step="retrieve")
             timings["retrieve"] = time.time() - t1
 
-            # prompt_node -> prompt text
+            # prompt_node -> prompt text (may return dict with 'prompt' key)
             t2 = time.time()
             try:
-                # be permissive: try several common argument combos via _try_call_run
-                prompt = _try_call_run(self.prompt_node, user_query, schemas, retrieved)
+                prompt_ret = _try_call_run(self.prompt_node, user_query, schemas, retrieved)
+                # If prompt_node returned a dict {prompt: ..., pieces: ...}, extract the text
+                prompt_text = None
+                if isinstance(prompt_ret, dict):
+                    prompt_text = prompt_ret.get("prompt") or prompt_ret.get("text") or None
+                else:
+                    prompt_text = str(prompt_ret)
+                # fallback
+                if prompt_text is None:
+                    prompt_text = str(prompt_ret)
+                prompt = prompt_ret  # keep original for debugging/storage
             except Exception as e:
                 return self._handle_error_node(e, ctx_for_error, step="prompt")
             timings["prompt"] = time.time() - t2
             result["prompt"] = prompt
 
-            # generate_node -> generation result
+            # generate_node -> generation result (pass prompt_text)
             t3 = time.time()
             try:
-                # Provide prompt + context to generate_node; _try_call_run will adapt if signature differs.
-                gen = _try_call_run(self.generate_node, prompt, schemas, retrieved)
+                gen = _try_call_run(self.generate_node, prompt_text, schemas, retrieved)
             except Exception as e:
                 return self._handle_error_node(e, ctx_for_error, step="generate")
             timings["generate"] = time.time() - t3
@@ -367,6 +378,7 @@ class GraphBuilder:
             if run_query and result["valid"]:
                 t5 = time.time()
                 try:
+                    # pass schemas as second param so execute_node can auto-load tables when given a mapping
                     execution_result = _try_call_run(self.execute_node, sql, schemas)
                 except Exception as e:
                     ctx_for_error.update({"sql": sql, "execution_error": str(e)})
@@ -377,7 +389,6 @@ class GraphBuilder:
             # format_node -> produce formatted output
             t6 = time.time()
             try:
-                # pass (sql, schemas, retrieved, execution_result, raw) — adaptively called
                 formatted = _try_call_run(self.format_node, sql, schemas, retrieved, execution_result, raw)
             except Exception as e:
                 ctx_for_error.update({"sql": sql, "raw": raw, "retrieved": retrieved, "execution": execution_result})

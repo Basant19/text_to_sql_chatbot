@@ -1,4 +1,4 @@
-# app/graph/nodes/error_node.py
+#D:\text_to_sql_bot\app\graph\nodes\error_node.py
 import sys
 import traceback
 from typing import Any, Dict, Optional
@@ -15,7 +15,7 @@ class ErrorNode:
 
     Usage:
         node = ErrorNode()
-        payload = node.run(exc, step="generate", context={"user_query": "..."}).
+        payload = node.run(exc, step="generate", context={"user_query": "..."})
 
     Returned payload (GraphBuilder-friendly):
         {
@@ -29,6 +29,7 @@ class ErrorNode:
             "timings": context.get("timings", {})
         }
     """
+
     def __init__(self):
         try:
             logger.info("ErrorNode initialized")
@@ -39,29 +40,43 @@ class ErrorNode:
     def _normalize_exception(self, exc: Any) -> Dict[str, Any]:
         """Return a normalized dict with short message, details and stack trace (if available)."""
         try:
-            short_msg = str(exc) if exc is not None else "Unknown error"
-            if isinstance(exc, CustomException):
-                # CustomException may expose an error_message attribute
-                details = getattr(exc, "error_message", None) or short_msg
-            else:
-                # repr is safer for preserving type information
+            short_msg = None
+            details = None
+
+            # If it's our CustomException, try to extract a friendly message
+            try:
+                if isinstance(exc, CustomException):
+                    short_msg = getattr(exc, "error_message", None) or getattr(exc, "message", None) or str(exc)
+                    details = repr(exc)
+                else:
+                    short_msg = str(exc) if exc is not None else "Unknown error"
+                    details = repr(exc)
+            except Exception:
+                short_msg = str(exc) if exc is not None else "Unknown error"
                 details = repr(exc)
 
+            # Get trace if available
             trace_str = None
-            if isinstance(exc, BaseException):
-                trace_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            try:
+                if isinstance(exc, BaseException):
+                    trace_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                else:
+                    # If it's not an exception, we won't have a trace
+                    trace_str = None
+            except Exception:
+                trace_str = None
 
-            # include any extra attributes if present (but keep minimal)
+            # include any extra attributes (non-private) if present
             extra = {}
             try:
                 if hasattr(exc, "__dict__"):
-                    d = {k: v for k, v in vars(exc).items() if k not in ("args", "__traceback__")}
+                    d = {k: v for k, v in vars(exc).items() if not k.startswith("_") and k not in ("args", "__traceback__")}
                     if d:
                         extra = d
             except Exception:
                 extra = {}
 
-            result = {"error": short_msg, "details": details, "trace": trace_str}
+            result: Dict[str, Any] = {"error": short_msg or "Error", "details": details or short_msg, "trace": trace_str}
             if extra:
                 result["extra"] = extra
             return result
@@ -74,7 +89,7 @@ class ErrorNode:
         self,
         exc: Any,
         step: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Normalize the exception and return a GraphBuilder-compatible error payload.
@@ -109,8 +124,17 @@ class ErrorNode:
             if step:
                 user_message += f" Step: {step}."
             # include a short reason if available (keep it user-friendly)
-            if short_msg:
+            if short_msg and short_msg.lower() not in ("", "error"):
                 user_message += f" Reason: {short_msg}"
+
+            # Truncate trace for debug payload to avoid huge dumps
+            trace_preview = None
+            try:
+                if trace:
+                    MAX_TRACE = 20000
+                    trace_preview = trace if len(trace) <= MAX_TRACE else trace[:MAX_TRACE] + "..."
+            except Exception:
+                trace_preview = None
 
             formatted = {
                 "output": user_message,
@@ -120,11 +144,10 @@ class ErrorNode:
                         "step": step,
                         "error_short": short_msg,
                         "error_details": details,
-                        # include truncated trace for dev but avoid huge dumps
-                        "error_trace": trace if trace and len(trace) < 20000 else (trace[:20000] + "..." if trace else None),
-                        "context": {k: v for k, v in (ctx.items() if isinstance(ctx, dict) else [])}
+                        "error_trace": trace_preview,
+                        "context": {k: v for k, v in (ctx.items() if isinstance(ctx, dict) else [])},
                     }
-                }
+                },
             }
 
             # GraphBuilder-compatible error payload

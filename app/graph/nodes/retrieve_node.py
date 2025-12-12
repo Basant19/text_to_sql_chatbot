@@ -1,4 +1,4 @@
-# app/graph/nodes/retrieve_node.py
+#D:\text_to_sql_bot\app\graph\nodes\retrieve_node.py
 from __future__ import annotations
 import sys
 import logging
@@ -10,6 +10,37 @@ from app.tools import Tools
 
 logger = get_logger("retrieve_node")
 LOG = logging.getLogger(__name__)
+
+
+def _normalize_result(item: Any) -> Dict[str, Any]:
+    """Normalize a single vector search hit into a dict with keys: id, score, text, meta."""
+    try:
+        # If it's already a dict-like object
+        if isinstance(item, dict):
+            return {
+                "id": item.get("id") or item.get("key") or item.get("_id"),
+                "score": item.get("score"),
+                "text": item.get("text") or item.get("content") or item.get("output") or "",
+                "meta": item.get("meta") or item.get("metadata") or {},
+            }
+        # If it's a tuple/list like (id, score, text, meta)
+        if isinstance(item, (list, tuple)):
+            # try to map common shapes
+            if len(item) >= 4:
+                return {"id": item[0], "score": item[1], "text": item[2], "meta": item[3]}
+            if len(item) == 3:
+                return {"id": item[0], "score": item[1], "text": item[2], "meta": {}}
+            if len(item) == 2:
+                return {"id": None, "score": item[0], "text": item[1], "meta": {}}
+        # Generic object with attributes
+        id_ = getattr(item, "id", None) or getattr(item, "key", None) or getattr(item, "_id", None)
+        score = getattr(item, "score", None) or getattr(item, "distance", None)
+        text = getattr(item, "text", None) or getattr(item, "content", None) or getattr(item, "output", None)
+        meta = getattr(item, "meta", None) or getattr(item, "metadata", None) or getattr(item, "meta_info", None)
+        return {"id": id_, "score": score, "text": text or "", "meta": meta or {}}
+    except Exception:
+        LOG.debug("_normalize_result failed for item: %s", str(item), exc_info=True)
+        return {"id": None, "score": None, "text": str(item), "meta": {}}
 
 
 class RetrieveNode:
@@ -39,20 +70,80 @@ class RetrieveNode:
                 LOG.warning("RetrieveNode: no vector search client configured")
                 return []
 
-            # prefer standard API: search(query, top_k)
+            # cap top_k to reasonable limits
             try:
-                if hasattr(client, "search"):
-                    return client.search(query, top_k=top_k)
-                # some clients use search_vectors or similar
-                if hasattr(client, "search_vectors"):
-                    return client.search_vectors(query, top_k=top_k)
-                # fallback: if Tools has search_vectors
-                if hasattr(self._tools, "search_vectors"):
-                    return self._tools.search_vectors(query, top_k=top_k)
+                top_k = int(top_k)
+                if top_k <= 0:
+                    top_k = 5
+                if top_k > 100:
+                    top_k = 100
             except Exception:
-                LOG.exception("Vector search failed for query: %s", query)
+                top_k = 5
 
-            return []
+            results: List[Any] = []
+
+            # Attempt several common search method signatures
+            try:
+                # Some clients: search(query, top_k=...)
+                if hasattr(client, "search"):
+                    try:
+                        results = client.search(query, top_k=top_k)
+                    except TypeError:
+                        # maybe signature is search(query, k)
+                        try:
+                            results = client.search(query, k=top_k)
+                        except Exception:
+                            results = client.search(query, top_k)
+
+                # Some: search_vectors(query, top_k=...)
+                elif hasattr(client, "search_vectors"):
+                    try:
+                        results = client.search_vectors(query, top_k=top_k)
+                    except TypeError:
+                        results = client.search_vectors(query, top_k)
+
+                # Tools wrapper fallback
+                elif hasattr(self._tools, "search_vectors"):
+                    results = self._tools.search_vectors(query, top_k=top_k)
+
+                else:
+                    # last-resort: try a generic 'query' method
+                    if hasattr(client, "query"):
+                        results = client.query(query, top_k=top_k)
+                    else:
+                        LOG.warning("RetrieveNode: vector client has no recognized search method: %s", type(client))
+                        return []
+
+            except Exception as e:
+                LOG.exception("Vector search execution failed: %s", e)
+                return []
+
+            # Normalize results into expected dicts
+            normalized: List[Dict[str, Any]] = []
+            try:
+                # Some clients return dict with 'matches' or 'results'
+                if isinstance(results, dict):
+                    for key in ("matches", "results", "hits", "items"):
+                        if key in results and isinstance(results[key], (list, tuple)):
+                            results_list = results[key]
+                            for it in results_list[:top_k]:
+                                normalized.append(_normalize_result(it))
+                            break
+                    else:
+                        # if dict-like but not containing known keys, try to normalize directly
+                        normalized.append(_normalize_result(results))
+                elif isinstance(results, (list, tuple)):
+                    for it in list(results)[:top_k]:
+                        normalized.append(_normalize_result(it))
+                else:
+                    # single object
+                    normalized.append(_normalize_result(results))
+            except Exception:
+                LOG.exception("Failed to normalize vector search results")
+
+            LOG.info("RetrieveNode: returned %d results for query (top_k=%d)", len(normalized), top_k)
+            return normalized
+
         except Exception as e:
             logger.exception("RetrieveNode.run failed")
             raise CustomException(e, sys)

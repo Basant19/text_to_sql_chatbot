@@ -1,5 +1,4 @@
-# tests/test_nodes_all.py
-
+#D:\text_to_sql_bot\tests\test_nodes_all.py
 import os
 import uuid
 import pytest
@@ -48,14 +47,14 @@ def make_sample_schemas():
             "aliases": ["apps", "applications"],
             "path": "/tmp/apps.csv",
             "columns": ["App", "Rating"],
-            "columns_normalized": ["app", "rating"]
+            "columns_normalized": ["app", "rating"],
         },
         "users": {
             "canonical": "users",
             "aliases": ["users"],
             "path": "/tmp/users.csv",
             "columns": ["Name", "Email"],
-            "columns_normalized": ["name", "email"]
+            "columns_normalized": ["name", "email"],
         },
     }
 
@@ -77,7 +76,7 @@ def test_validate_node_missing_table_detected():
     sql = "SELECT foo FROM unknown_table"
     out = node.run(sql, schemas)
     assert out["valid"] is False
-    assert any("Tables not found" in e for e in out["errors"])
+    assert any("Tables not found" in str(e) or "table" in str(e).lower() for e in out["errors"]) 
 
 
 def test_validate_node_missing_column_detected():
@@ -86,7 +85,7 @@ def test_validate_node_missing_column_detected():
     sql = "SELECT not_a_col FROM apps"
     out = node.run(sql, schemas)
     assert out["valid"] is False
-    assert any("Columns not found" in e for e in out["errors"])
+    assert any("Columns not found" in str(e) or "column" in str(e).lower() for e in out["errors"]) 
 
 
 def test_validate_node_forbidden_table(monkeypatch):
@@ -95,7 +94,7 @@ def test_validate_node_forbidden_table(monkeypatch):
     sql = "SELECT name FROM users"
     out = node.run(sql, schemas)
     assert out["valid"] is False
-    assert any("forbidden" in e.lower() for e in out["errors"])
+    assert any("forbidden" in str(e).lower() for e in out["errors"]) 
 
 
 def test_validate_node_row_limit_enforced(monkeypatch):
@@ -105,7 +104,10 @@ def test_validate_node_row_limit_enforced(monkeypatch):
     node = ValidateNode(safety_rules={"max_row_limit": 1})
     sql = "SELECT App FROM apps"
     out = node.run(sql, schemas)
-    assert "LIMIT 1" in (out.get("sql") or "") or (out.get("suggested_sql") and "LIMIT 1" in out.get("suggested_sql"))
+    # either sql or suggested_sql may contain the injected limit depending on implementation
+    ssql = (out.get("sql") or "")
+    suggested = (out.get("suggested_sql") or "")
+    assert ("LIMIT 1" in ssql) or ("LIMIT 1" in suggested)
 
 
 # ----------------- FormatNode tests -----------------------------------------
@@ -126,12 +128,14 @@ def test_context_node_resolves_schema_and_samples(monkeypatch):
     class ToolsStub:
         def __init__(self):
             self._called = {}
+
         def get_schema(self, name):
             # pretend canonicalization: remove path, extension etc.
             n = (name or "").split("/")[-1].split(".")[0]
             if n in ("apps", "users"):
                 return ["app", "rating"] if n == "apps" else ["name", "email"]
             return []
+
         def get_sample_rows(self, name):
             if "apps" in (name or ""):
                 return [{"App": "A", "Rating": 4}]

@@ -1,8 +1,8 @@
-# app/gemini_client.py
+#D:\text_to_sql_bot\app\gemini_client.py
 import sys
 import json
 import time
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
@@ -40,6 +40,8 @@ class GeminiClient:
       1. LangChain ChatGoogleGenerativeAI wrapper (preferred)
       2. google.generativeai SDK
       3. REST fallback to Generative Language API with retry
+
+    Returns a dict: {"text": str, "raw": json-serializable}
     """
 
     def __init__(
@@ -63,21 +65,32 @@ class GeminiClient:
             self._use_langchain_llm = False
             self._llm = None
             try:
+                # Try several import paths to support different langchain versions
                 try:
                     from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
                 except Exception:
                     try:
                         from langchain.google_genai import ChatGoogleGenerativeAI  # type: ignore
                     except Exception:
-                        from langchain.chat_models import ChatGoogleGenerativeAI  # type: ignore
+                        try:
+                            from langchain.chat_models import ChatGoogleGenerativeAI  # type: ignore
+                        except Exception:
+                            ChatGoogleGenerativeAI = None
 
-                try:
-                    # wrapper often expects google_api_key kwarg
-                    self._llm = ChatGoogleGenerativeAI(model=self.default_model, google_api_key=self.api_key)
-                except TypeError:
-                    self._llm = ChatGoogleGenerativeAI(model=self.default_model, api_key=self.api_key)
-                self._use_langchain_llm = True
-                logger.info("GeminiClient: using ChatGoogleGenerativeAI (LangChain wrapper)")
+                if ChatGoogleGenerativeAI:
+                    try:
+                        # wrapper often expects google_api_key kwarg
+                        self._llm = ChatGoogleGenerativeAI(model=self.default_model, google_api_key=self.api_key)
+                    except TypeError:
+                        # some wrappers expect `api_key` or `openai_api_key` style
+                        try:
+                            self._llm = ChatGoogleGenerativeAI(model=self.default_model, api_key=self.api_key)
+                        except Exception:
+                            # fallback to model-only init
+                            self._llm = ChatGoogleGenerativeAI(model=self.default_model)
+
+                    self._use_langchain_llm = True
+                    logger.info("GeminiClient: using ChatGoogleGenerativeAI (LangChain wrapper)")
             except Exception as e:
                 self._use_langchain_llm = False
                 self._llm = None
@@ -94,6 +107,7 @@ class GeminiClient:
                         import generativeai as genai  # type: ignore
 
                     try:
+                        # preferred configure pattern
                         genai.configure(api_key=self.api_key)
                     except Exception:
                         try:
@@ -121,15 +135,17 @@ class GeminiClient:
             logger.exception("Failed to initialize GeminiClient")
             raise CustomException(e, sys)
 
-    def _normalize_model_name(self, model: str) -> str:
+    def _normalize_model_name(self, model: Optional[str]) -> str:
         try:
             if not isinstance(model, str) or not model:
-                return model
-            if model.startswith("models/") or model.startswith("tunedModels/"):
-                return model
-            return f"models/{model}"
+                return str(model or "")
+            m = model
+            # If user passed "models/xyz" keep as-is, otherwise prefix
+            if m.startswith("models/") or m.startswith("tunedModels/"):
+                return m
+            return f"models/{m}"
         except Exception:
-            return model
+            return str(model or "")
 
     def _build_model_path(self, norm_model: str) -> str:
         if not isinstance(norm_model, str) or not norm_model:
@@ -137,6 +153,69 @@ class GeminiClient:
         if norm_model.startswith("models/") or norm_model.startswith("tunedModels/"):
             return norm_model
         return f"models/{norm_model}"
+
+    def _try_extract_text(self, resp: Any) -> str:
+        """Try multiple heuristics to extract a text string from a provider response."""
+        text = None
+        # Direct attributes
+        for attr in ("content", "text", "output", "message", "output_text"):
+            try:
+                v = getattr(resp, attr, None)
+                if v:
+                    text = v
+                    break
+            except Exception:
+                continue
+
+        # LangChain LLMResult -> .generations (list of lists or list of Generation objects)
+        if text is None:
+            try:
+                gens = getattr(resp, "generations", None)
+                if isinstance(gens, (list, tuple)) and gens:
+                    first = gens[0]
+                    # first can be list of Generation objects or a Generation object
+                    if isinstance(first, (list, tuple)) and first:
+                        candidate = first[0]
+                    else:
+                        candidate = first
+                    # candidate may have .text or .content
+                    text = getattr(candidate, "text", None) or getattr(candidate, "content", None) or (candidate.get("text") if isinstance(candidate, dict) else None)
+            except Exception:
+                pass
+
+        # If it's a dict-like structure
+        if text is None:
+            try:
+                raw_json = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
+                for key in ("text", "content", "output", "result", "outputs", "candidates"):
+                    if key in raw_json:
+                        val = raw_json[key]
+                        if isinstance(val, str):
+                            text = val
+                            break
+                        if isinstance(val, list) and val:
+                            if isinstance(val[0], dict):
+                                # try common nested keys
+                                for k2 in ("text", "content", "output"):
+                                    if k2 in val[0]:
+                                        text = val[0].get(k2)
+                                        break
+                                if text:
+                                    break
+                            else:
+                                text = " ".join(map(str, val))
+                                break
+            except Exception:
+                pass
+
+        # Final fallback
+        if text is None:
+            try:
+                text = str(resp)
+            except Exception:
+                text = ""
+
+        return str(text or "")
 
     def generate(self, prompt: str, model: Optional[str] = None, max_tokens: int = 512, timeout: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -152,47 +231,55 @@ class GeminiClient:
             norm_model = self._normalize_model_name(model)
             model_path = self._build_model_path(norm_model)
 
+            # Sanity: ensure max_tokens is a positive integer
+            try:
+                max_tokens = int(max_tokens)
+                if max_tokens <= 0:
+                    max_tokens = 1
+            except Exception:
+                max_tokens = 512
+
+            # Log prompt preview for debugging
+            try:
+                logger.info("GeminiClient.generate: prompt preview (len=%d): %s", len(prompt or ""), (prompt or "")[: _DEFAULT_MAX_RAW_PREVIEW].replace("\n", "\\n"))
+            except Exception:
+                logger.debug("GeminiClient.generate: prompt preview unavailable")
+
             # 1) LangChain wrapper path
             if self._use_langchain_llm and self._llm is not None:
                 try:
-                    resp = self._llm.invoke(prompt)
-                    text = None
-                    raw = resp
-
-                    # Common extraction heuristics
-                    text = getattr(resp, "content", None) or getattr(resp, "text", None)
-                    if text is None:
-                        gens = getattr(resp, "generations", None)
-                        if isinstance(gens, (list, tuple)) and len(gens) > 0:
-                            first = gens[0]
-                            text = getattr(first, "text", None) or getattr(first, "content", None)
-                            if text is None and isinstance(first, dict):
-                                text = first.get("text") or first.get("content")
-
-                    if text is None:
+                    # Try several common call patterns for langchain wrappers
+                    resp = None
+                    try:
+                        # Some wrappers implement .generate or .generate_messages
+                        if hasattr(self._llm, "generate"):
+                            # build a minimal interface if required
+                            try:
+                                resp = self._llm.generate([{"content": prompt}])
+                            except Exception:
+                                resp = self._llm.generate(prompt)
+                        elif hasattr(self._llm, "__call__"):
+                            resp = self._llm(prompt)
+                        elif hasattr(self._llm, "invoke"):
+                            resp = self._llm.invoke(prompt)
+                        else:
+                            # Last resort: call as function
+                            resp = self._llm(prompt)
+                    except Exception:
+                        # As a safe fallback try invoke
                         try:
-                            raw_json = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
-                            raw = raw_json
-                            for key in ("content", "text", "output", "candidates"):
-                                if key in raw_json:
-                                    val = raw_json[key]
-                                    if isinstance(val, str):
-                                        text = val
-                                        break
-                                    if isinstance(val, list) and val:
-                                        if isinstance(val[0], dict):
-                                            text = val[0].get("content") or val[0].get("output") or val[0].get("text")
-                                            if text:
-                                                break
-                                        else:
-                                            text = " ".join(map(str, val))
-                                            break
-                        except Exception:
-                            text = str(resp)
+                            resp = self._llm.invoke(prompt)
+                        except Exception as inner:
+                            logger.exception("LangChain wrapper call patterns failed: %s", inner)
+                            raise
+
+                    raw = resp
+                    text = self._try_extract_text(resp)
 
                     runtime = time.time() - start
-                    logger.info("GeminiClient (LangChain wrapper) completed in %.3fs", runtime)
-                    return {"text": str(text or ""), "raw": _safe_serialize_raw(raw)}
+                    logger.info("GeminiClient (LangChain wrapper) completed in %.3fs text_len=%d", runtime, len(text or ""))
+                    logger.debug("GeminiClient (LangChain wrapper) raw=%s", _safe_serialize_raw(raw))
+                    return {"text": text, "raw": _safe_serialize_raw(raw)}
                 except Exception as e:
                     logger.exception("LangChain wrapper invoke failed, falling back: %s", e)
                     # fall through to SDK/REST
@@ -201,50 +288,50 @@ class GeminiClient:
             if self._use_genai_sdk and self._genai is not None:
                 try:
                     gen = self._genai
-                    # attempt to call a common generate_text API shape
+                    resp = None
                     try:
-                        resp = gen.generate_text(model=norm_model, prompt=prompt, max_output_tokens=int(max_tokens))
-                    except Exception:
-                        resp = gen.generate(prompt, model=norm_model, max_output_tokens=int(max_tokens))
+                        # Try multiple known SDK call shapes
+                        if hasattr(gen, "generate_text"):
+                            resp = gen.generate_text(model=norm_model, prompt=prompt, max_output_tokens=max_tokens)
+                        elif hasattr(gen, "generate"):
+                            resp = gen.generate(prompt=prompt, model=norm_model, max_output_tokens=max_tokens)
+                        else:
+                            # best-effort call
+                            resp = gen.generate(prompt, model=norm_model, max_output_tokens=max_tokens)
+                    except Exception as inner:
+                        logger.exception("genai SDK call shape failed: %s", inner)
+                        raise
 
-                    text = None
                     raw = resp
-                    if isinstance(resp, dict):
-                        raw = resp
-                        for key in ("output", "text", "content", "candidates"):
-                            if key in resp:
-                                val = resp[key]
-                                if isinstance(val, str):
-                                    text = val
-                                    break
-                                if isinstance(val, list) and val:
-                                    if isinstance(val[0], dict):
-                                        text = val[0].get("output") or val[0].get("content") or val[0].get("text")
-                                        if text:
-                                            break
-                                    else:
-                                        text = " ".join(map(str, val))
+                    text = ""
+                    try:
+                        if isinstance(resp, dict):
+                            for key in ("output", "text", "content", "candidates"):
+                                if key in resp:
+                                    val = resp[key]
+                                    if isinstance(val, str):
+                                        text = val
                                         break
-                    else:
-                        text = getattr(resp, "text", None) or getattr(resp, "output", None)
-                        if not text:
-                            try:
-                                raw_json = json.loads(json.dumps(resp, default=lambda o: getattr(o, "__dict__", str(o))))
-                                raw = raw_json
-                                for key in ("output", "text", "content"):
-                                    if key in raw_json:
-                                        v = raw_json[key]
-                                        text = v if isinstance(v, str) else " ".join(map(str, v)) if isinstance(v, list) else None
-                                        if text:
+                                    if isinstance(val, list) and val:
+                                        if isinstance(val[0], dict):
+                                            text = val[0].get("output") or val[0].get("content") or val[0].get("text") or ""
+                                            if text:
+                                                break
+                                        else:
+                                            text = " ".join(map(str, val))
                                             break
-                            except Exception:
-                                pass
+                        else:
+                            text = self._try_extract_text(resp)
+                    except Exception:
+                        text = self._try_extract_text(resp)
 
-                    if text is None:
+                    if not text:
                         text = str(raw)
+
                     runtime = time.time() - start
-                    logger.info("GeminiClient (genai SDK) completed in %.3fs", runtime)
-                    return {"text": str(text), "raw": _safe_serialize_raw(raw)}
+                    logger.info("GeminiClient (genai SDK) completed in %.3fs text_len=%d", runtime, len(text or ""))
+                    logger.debug("GeminiClient (genai SDK) raw=%s", _safe_serialize_raw(raw))
+                    return {"text": text, "raw": _safe_serialize_raw(raw)}
                 except Exception as e:
                     logger.exception("genai SDK call failed; falling back to REST: %s", e)
                     # fall through to REST
@@ -280,7 +367,10 @@ class GeminiClient:
             session.mount("http://", HTTPAdapter(max_retries=retries))
 
             if self.tracing:
-                logger.info("GeminiClient (REST) POST %s params=%s payload_len=%d headers=%s", url, params, len(json.dumps(payload)), list(headers.keys()))
+                try:
+                    logger.info("GeminiClient (REST) POST %s params=%s payload_len=%d headers=%s", url, params, len(json.dumps(payload)), list(headers.keys()))
+                except Exception:
+                    logger.info("GeminiClient (REST) POST %s", url)
 
             resp = session.post(url, json=payload, headers=headers, params=params, timeout=timeout)
 
@@ -297,32 +387,36 @@ class GeminiClient:
             except Exception:
                 data = {"text": resp.text}
 
-            text = None
+            text = ""
             raw = data
-            if isinstance(data, dict):
-                if "candidates" in data and isinstance(data["candidates"], list) and data["candidates"]:
-                    first = data["candidates"][0]
-                    if isinstance(first, dict) and "output" in first:
-                        text = first["output"]
-                for key in ("output", "text", "content", "result"):
-                    if text:
-                        break
-                    if key in data and isinstance(data[key], (str, list)):
-                        val = data[key]
-                        if isinstance(val, list):
-                            text = " ".join(map(str, val))
-                        else:
-                            text = val
-                if text is None and "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
-                    first = data["outputs"][0]
-                    if isinstance(first, dict):
-                        text = first.get("text") or first.get("content") or first.get("output")
-            if text is None:
-                text = json.dumps(data)
+            try:
+                if isinstance(data, dict):
+                    if "candidates" in data and isinstance(data["candidates"], list) and data["candidates"]:
+                        first = data["candidates"][0]
+                        if isinstance(first, dict) and "output" in first:
+                            text = first["output"]
+                    for key in ("output", "text", "content", "result"):
+                        if text:
+                            break
+                        if key in data and isinstance(data[key], (str, list)):
+                            val = data[key]
+                            if isinstance(val, list):
+                                text = " ".join(map(str, val))
+                            else:
+                                text = val
+                    if not text and "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
+                        first = data["outputs"][0]
+                        if isinstance(first, dict):
+                            text = first.get("text") or first.get("content") or first.get("output") or ""
+                if not text:
+                    text = json.dumps(data)
+            except Exception:
+                text = str(data)
 
             runtime = time.time() - start
-            logger.info("GeminiClient (REST) completed in %.3fs", runtime)
-            return {"text": str(text), "raw": _safe_serialize_raw(raw)}
+            logger.info("GeminiClient (REST) completed in %.3fs text_len=%d", runtime, len(text or ""))
+            logger.debug("GeminiClient (REST) raw=%s", _safe_serialize_raw(raw))
+            return {"text": str(text or ""), "raw": _safe_serialize_raw(raw)}
 
         except CustomException:
             raise

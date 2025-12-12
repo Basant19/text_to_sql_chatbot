@@ -1,3 +1,4 @@
+# D:\text_to_sql_bot\app.py
 """
 Streamlit app entrypoint for Text-to-SQL Bot.
 
@@ -10,6 +11,7 @@ This updated version:
 import os
 import json
 import time
+import traceback
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
@@ -26,7 +28,6 @@ from app.logger import get_logger
 import app.config as config_module
 
 logger = get_logger("app")
-
 
 # ---------------------------
 # Utilities
@@ -69,53 +70,84 @@ def _safe_rerun():
             return
         except Exception:
             st.session_state["_needs_rerun"] = True
+            logger.debug("experimental_rerun failed, marking session for rerun")
             return
     else:
         st.session_state["_needs_rerun"] = True
+        logger.debug("experimental_rerun not available, setting _needs_rerun")
         return
+
+
+def _render_exception_ui(exc: Exception, hint: Optional[str] = None) -> None:
+    """
+    Show a friendly error message in UI plus an expandable detailed stack trace.
+    """
+    msg = f"{type(exc).__name__}: {str(exc)}"
+    if hint:
+        st.error(f"{hint} — {msg}")
+    else:
+        st.error(msg)
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    with st.expander("Show details"):
+        st.code(tb)
 
 
 # ---------------------------
 # Initialize core components (defensive)
 # ---------------------------
+logger.info("Starting app initialization")
+
 # Config module (keep as module for backward compatibility)
 config = config_module
 
 # CSV loader
+csv_loader = None
 try:
     csv_loader = CSVLoader()
-except Exception:
+    logger.info("CSVLoader initialized at upload_dir=%s", getattr(csv_loader, "upload_dir", "<unknown>"))
+except Exception as e:
     logger.exception("Failed to initialize CSVLoader; CSV features may be limited.")
     csv_loader = None
 
 # Schema store
+schema_store = None
 try:
     schema_store = SchemaStore()
-except Exception:
+    logger.info("SchemaStore initialized with store_path=%s", getattr(schema_store, "store_path", "<unknown>"))
+except Exception as e:
     logger.exception("Failed to initialize SchemaStore; schema features may be limited.")
     schema_store = None
 
 # VectorSearch (optional: may depend on faiss/numpy)
+vector_search = None
 try:
     vector_search = VectorSearch()
-except Exception:
+    logger.info("VectorSearch initialized (dim=%s)", getattr(vector_search, "dim", "<unknown>"))
+except Exception as e:
     logger.exception("Failed to initialize VectorSearch; vector features may be limited.")
     vector_search = None
 
 # Graph builder (agent)
+graph = None
 try:
     # GraphBuilder.build_default may rely on other components; wrap to avoid crash
     graph = GraphBuilder.build_default()
-except Exception:
+    logger.info("GraphBuilder built successfully")
+except Exception as e:
     logger.exception("Failed to build default GraphBuilder. Agent/graph features will be unavailable.")
     graph = None
 
 # Persistent conversation-first history store (SQLite)
+history_store = None
 try:
     history_store = HistoryStore()
-except Exception:
+    logger.info("HistoryStore initialized")
+except Exception as e:
     logger.exception("Failed to initialize HistoryStore; conversation persistence will be disabled.")
     history_store = None
+
+logger.info("App initialization complete")
+
 
 # ---------------------------
 # Streamlit session-state defaults
@@ -132,8 +164,9 @@ if st.session_state.pop("_needs_rerun", False):
         rerun = getattr(st, "experimental_rerun", None)
         if callable(rerun):
             rerun()
+            logger.debug("Performed delayed experimental_rerun")
     except Exception:
-        pass
+        logger.debug("Delayed rerun failed")
 
 
 # ---------------------------
@@ -146,6 +179,7 @@ def _sync_session_mappings_from_store():
     It overwrites session mappings for the entries present in the SchemaStore,
     but won't clobber unrelated session mappings.
     """
+    logger.debug("Syncing session mappings from SchemaStore")
     try:
         st.session_state["csv_label_to_path"] = st.session_state.get("csv_label_to_path", {}) or {}
         st.session_state["csv_path_to_table"] = st.session_state.get("csv_path_to_table", {}) or {}
@@ -159,21 +193,19 @@ def _sync_session_mappings_from_store():
             try:
                 path = entry.get("path") or ""
                 if not path:
+                    logger.debug("Skipping schema entry with no path: %s", entry)
                     continue
                 canonical = entry.get("canonical") or entry.get("friendly") or entry.get("key") or os.path.splitext(os.path.basename(path))[0]
                 aliases = entry.get("aliases") or []
                 orig = os.path.basename(path)
-                # ensure canonical present as first alias (but do not duplicate)
-                aliases = [a for a in aliases if a]  # filter empties
+                aliases = [a for a in aliases if a]
                 if canonical and canonical not in aliases:
                     aliases.insert(0, canonical)
-                # register labels (avoid duplicates)
                 for alias in aliases:
                     label = f"{alias} — {orig}"
                     existing = st.session_state["csv_label_to_path"].get(label)
                     if not existing or existing == path:
                         st.session_state["csv_label_to_path"][label] = path
-                # register path->canonical mapping (authoritative from store)
                 st.session_state["csv_path_to_table"][path] = canonical
             except Exception:
                 logger.exception("Failed to register schema_store entry %s", entry)
@@ -197,7 +229,6 @@ def _find_store_meta_by_path(path: str) -> Optional[Dict[str, Any]]:
             p = e.get("path") or ""
             if not p:
                 continue
-            # normalize absolute paths for comparison
             try:
                 if os.path.abspath(p) == os.path.abspath(path):
                     return e
@@ -217,10 +248,10 @@ def _ensure_label_registered(label: str, path: str):
     cmap = st.session_state.setdefault("csv_label_to_path", {})
     existing = cmap.get(label)
     if existing and existing != path:
-        # conflicting label already present — don't overwrite
         logger.debug("Label %s already maps to different path (%s); skipping registration for %s", label, existing, path)
         return
     cmap[label] = path
+    logger.debug("Registered label '%s' -> %s", label, path)
 
 
 # ---------------------------
@@ -233,6 +264,7 @@ try:
     if history_store and not st.session_state.get("conversations_meta"):
         try:
             st.session_state.conversations_meta = history_store.list_conversations()
+            logger.debug("Loaded conversations_meta (count=%d)", len(st.session_state.conversations_meta))
         except Exception:
             logger.exception("Initial list_conversations failed")
             st.session_state.conversations_meta = []
@@ -250,6 +282,7 @@ try:
         if st.button("➕ New Conversation"):
             if not history_store:
                 st.error("History backend not available; cannot create conversations.")
+                logger.warning("New conversation requested but HistoryStore unavailable")
             else:
                 default_name = f"Conversation {len(st.session_state.conversations_meta) + 1}"
                 try:
@@ -257,10 +290,11 @@ try:
                     st.session_state.conversations_meta = history_store.list_conversations()
                     st.session_state.selected_conversation_id = conv["id"]
                     st.session_state.conversation_cache[conv["id"]] = conv
+                    logger.info("Created conversation id=%s name=%s", conv["id"], default_name)
                     _safe_rerun()
-                except Exception:
+                except Exception as e:
                     logger.exception("Failed to create new conversation")
-                    st.error("Could not create a new conversation. Check logs.")
+                    _render_exception_ui(e, hint="Could not create a new conversation")
 
         # Conversation list (filtered)
         convs = st.session_state.conversations_meta or []
@@ -281,9 +315,10 @@ try:
                 if history_store:
                     try:
                         st.session_state.conversation_cache[c["id"]] = history_store.get_conversation(c["id"])
-                    except Exception:
+                        logger.debug("Loaded conversation %s into cache", c["id"])
+                    except Exception as e:
                         logger.exception("Failed to load conversation %s", c["id"])
-                        st.error("Failed to load conversation from storage.")
+                        _render_exception_ui(e, hint="Failed to load conversation from storage")
                 _safe_rerun()
 
         st.markdown("---")
@@ -298,7 +333,9 @@ try:
 
                     # try to extract metadata and register schema
                     try:
+                        t0 = time.time()
                         metadata_list = csv_loader.load_and_extract([saved_path])
+                        logger.debug("Extracted metadata for %s in %.3fs", saved_path, time.time() - t0)
                         if metadata_list and isinstance(metadata_list, list):
                             for meta in metadata_list:
                                 orig_name = os.path.basename(saved_path)
@@ -311,23 +348,21 @@ try:
                                 if not canonical:
                                     canonical = os.path.splitext(os.path.basename(saved_path))[0]
 
-                                # Check whether this path is already present in SchemaStore
                                 existing_meta = _find_store_meta_by_path(saved_path)
                                 if schema_store and not existing_meta:
-                                    # Persist schema trying with provided canonical & aliases
                                     try:
+                                        t_start = time.time()
                                         store_key = schema_store.add_csv(saved_path, csv_name=canonical, aliases=aliases)
-                                        logger.info("schema_store.add_csv returned key=%s for path=%s", store_key, saved_path)
-                                        # read back authoritative meta for this path
+                                        logger.info("schema_store.add_csv returned key=%s for path=%s (t=%.3fs)", store_key, saved_path, time.time()-t_start)
                                         existing_meta = _find_store_meta_by_path(saved_path)
-                                    except Exception:
+                                    except Exception as e:
                                         logger.exception("schema_store.add_csv failed for %s (canonical=%s aliases=%s)", saved_path, canonical, aliases)
-                                        # fallback: attempt once without names (idempotent in SchemaStore)
                                         try:
+                                            logger.info("Attempting fallback schema_store.add_csv without names for %s", saved_path)
                                             schema_store.add_csv(saved_path)
                                             existing_meta = _find_store_meta_by_path(saved_path)
                                         except Exception:
-                                            logger.exception("schema_store.add_csv fallback failed for %s", saved_path)
+                                            logger.exception("schema_store.add_csv fallback also failed for %s", saved_path)
                                 else:
                                     if existing_meta:
                                         logger.debug("Path already registered in SchemaStore: %s", saved_path)
@@ -337,13 +372,11 @@ try:
                                 if existing_meta and isinstance(existing_meta, dict):
                                     ui_canonical = existing_meta.get("canonical") or existing_meta.get("friendly") or os.path.splitext(os.path.basename(saved_path))[0]
                                     aliases_from_store = existing_meta.get("aliases") or []
-                                    # ensure we use aliases from store if available
                                     if aliases_from_store:
                                         aliases = aliases_from_store
                                 else:
                                     ui_canonical = canonical
 
-                                # ensure canonical present in aliases list and register UI labels
                                 aliases = [a for a in (aliases or []) if a]
                                 if ui_canonical and ui_canonical not in aliases:
                                     aliases.insert(0, ui_canonical)
@@ -353,14 +386,29 @@ try:
                                     label = f"{alias} — {orig_name}"
                                     _ensure_label_registered(label, saved_path)
 
-                                # store path->canonical mapping (prefer authoritative)
                                 st.session_state["csv_path_to_table"][saved_path] = ui_canonical
                                 logger.info("Registered schema for %s (canonical=%s, aliases=%s)", saved_path, ui_canonical, aliases)
-                    except Exception:
+
+                                # === Auto-select newly uploaded CSV label in sidebar multiselect ===
+                                try:
+                                    if aliases:
+                                        new_label = f"{aliases[0]} — {orig_name}"
+                                        selected = st.session_state.get("selected_csvs_sidebar", []) or []
+                                        if new_label not in selected:
+                                            selected.append(new_label)
+                                            st.session_state["selected_csvs_sidebar"] = selected
+                                            logger.info("Auto-selected uploaded CSV in sidebar multiselect: %s", new_label)
+                                    # request a rerun so the multiselect updates immediately
+                                    _safe_rerun()
+                                except Exception:
+                                    logger.exception("Failed to auto-select uploaded csv label in UI")
+
+                    except Exception as e:
                         logger.exception("Failed to auto-register schema for uploaded CSV")
+                        _render_exception_ui(e, hint=f"Failed to parse or register schema for {file.name}")
                 except Exception as e:
-                    st.error(f"Failed to save {file.name}: {e}")
-                    logger.exception("CSV upload failed")
+                    logger.exception("CSV upload failed for %s", getattr(file, "name", "<unknown>"))
+                    _render_exception_ui(e, hint=f"Failed to save {getattr(file, 'name', '<file>')}")
 
         # One-time sync from SchemaStore to session maps (idempotent)
         try:
@@ -368,7 +416,8 @@ try:
         except Exception:
             logger.exception("Failed to read schema_store metadata")
 
-        # Defensive fallback: include raw uploaded files (older behaviour)
+        # Defensive fallback: include raw uploaded files (older behavior)
+        uploaded_paths = []
         try:
             uploaded_paths = csv_loader.list_uploaded_csvs() if csv_loader else []
         except Exception:
@@ -380,7 +429,6 @@ try:
                 path = p if isinstance(p, str) else (p.get("path") or p.get("filepath") or p.get("file") or p.get("filename") or "")
                 if not path:
                     continue
-                # If the path is already known from SchemaStore or previous mappings, skip
                 if path in st.session_state["csv_path_to_table"]:
                     continue
                 table = os.path.splitext(os.path.basename(path))[0]
@@ -445,24 +493,27 @@ try:
 
                 if st.button("Sync schemas to UI (refresh labels)"):
                     try:
+                        t0 = time.time()
                         _sync_session_mappings_from_store()
                         st.success("Synced schema mappings from SchemaStore.")
+                        logger.info("Manual sync from SchemaStore completed in %.3fs", time.time() - t0)
                         _safe_rerun()
-                    except Exception:
+                    except Exception as e:
                         logger.exception("Schema sync failed")
-                        st.error("Schema sync failed; check logs.")
-            except Exception:
+                        _render_exception_ui(e, hint="Schema sync failed")
+            except Exception as e:
                 logger.exception("Failed to display Schema viewer")
-                st.write("Could not load schema metadata.")
+                _render_exception_ui(e, hint="Could not load schema metadata")
 
         st.markdown("---")
         if st.button("Refresh Conversations"):
             if history_store:
                 try:
                     st.session_state.conversations_meta = history_store.list_conversations()
-                except Exception:
+                    logger.debug("Refreshed conversations_meta")
+                except Exception as e:
                     logger.exception("Failed to refresh conversations_meta")
-                    st.error("Failed to refresh conversations list.")
+                    _render_exception_ui(e, hint="Failed to refresh conversations list")
             else:
                 st.error("History backend unavailable.")
             _safe_rerun()
@@ -480,8 +531,10 @@ try:
             if conv_id not in st.session_state.conversation_cache and history_store:
                 try:
                     st.session_state.conversation_cache[conv_id] = history_store.get_conversation(conv_id)
-                except Exception:
-                    st.error("Failed to load conversation. It may have been deleted.")
+                    logger.debug("Populated conversation cache for %s", conv_id)
+                except Exception as e:
+                    logger.exception("Failed to load conversation. It may have been deleted.")
+                    _render_exception_ui(e, hint="Failed to load conversation")
                     st.session_state.selected_conversation_id = None
 
         if not st.session_state.selected_conversation_id:
@@ -499,17 +552,20 @@ try:
                         st.session_state.conversation_cache[conv["id"]]["name"] = name_box
                         st.session_state.conversations_meta = history_store.list_conversations()
                         st.success("Renamed")
-                except Exception:
-                    st.error("Rename failed; see logs.")
+                        logger.info("Renamed conversation %s -> %s", conv["id"], name_box)
+                except Exception as e:
+                    logger.exception("Rename failed")
+                    _render_exception_ui(e, hint="Rename failed")
 
             if header_cols[1].button("Export"):
                 if history_store:
                     try:
                         path = history_store.export_conversation(conv["id"])
                         st.success(f"Exported to {path}")
-                    except Exception:
+                        logger.info("Exported conversation %s to %s", conv["id"], path)
+                    except Exception as e:
                         logger.exception("Export failed")
-                        st.error("Export failed; see logs.")
+                        _render_exception_ui(e, hint="Export failed")
                 else:
                     st.error("History backend unavailable.")
 
@@ -529,12 +585,13 @@ try:
                                 st.session_state.selected_conversation_id = None
                                 st.session_state.pop(delete_flag_key, None)
                                 st.success("Conversation deleted.")
+                                logger.info("Deleted conversation %s", conv["id"])
                                 _safe_rerun()
                             else:
                                 st.error("Conversation not found or could not be deleted.")
-                        except Exception:
-                            st.error("Delete failed; see logs.")
+                        except Exception as e:
                             logger.exception("Failed to delete conversation %s", conv.get("id"))
+                            _render_exception_ui(e, hint="Delete failed")
                     else:
                         st.error("History backend unavailable.")
                 if cf_col2.button("Cancel"):
@@ -572,6 +629,7 @@ try:
                                 try:
                                     st.json(meta)
                                 except Exception:
+                                    logger.exception("Failed to render message meta JSON")
                                     st.write(str(meta))
 
             st.markdown("---")
@@ -594,9 +652,10 @@ try:
                     if history_store:
                         try:
                             history_store.append_message(conv["id"], user_msg)
-                        except Exception:
-                            st.error("Failed to append user message; see logs.")
+                            logger.debug("Appended user message to history for conv=%s", conv["id"])
+                        except Exception as e:
                             logger.exception("append user message failed")
+                            _render_exception_ui(e, hint="Failed to append user message")
                     else:
                         logger.debug("HistoryStore not configured; skipping append_message for user_msg.")
 
@@ -616,17 +675,71 @@ try:
                         else:
                             selected_table_names.append(os.path.splitext(os.path.basename(p))[0])
 
+                    # === Guard: do not call agent when no table selected ===
+                    if not selected_table_names:
+                        try:
+                            # If there is exactly one available label, auto-select it for convenience.
+                            available_labels = list(st.session_state.get("csv_label_to_path", {}).keys())
+                            if len(available_labels) == 1:
+                                auto_label = available_labels[0]
+                                st.session_state["selected_csvs_sidebar"] = [auto_label]
+                                # compute table name from path mapping
+                                p = st.session_state["csv_label_to_path"].get(auto_label)
+                                t = st.session_state.get("csv_path_to_table", {}).get(p) if p else None
+                                if t:
+                                    selected_table_names = [t]
+                                else:
+                                    selected_table_names = [os.path.splitext(os.path.basename(p))[0]] if p else []
+                                st.warning("No CSV was selected — automatically using the only uploaded CSV for context.")
+                                logger.info("Auto-injected single available CSV label into selected_csvs_sidebar: %s", auto_label)
+                                # proceed to agent run with injected selection
+                            else:
+                                # Provide a friendly assistant message saying selection is required and abort the run.
+                                st.warning("No CSV selected. Please select one or more CSVs from the left sidebar before sending the query.")
+                                logger.warning("User attempted to run graph with no selected tables; aborting run.")
+                                # Build assistant message explaining what to do and persist it.
+                                assistant_content = "Please select a CSV in the left sidebar for schema context and try again."
+                                assistant_msg = {"role": "assistant", "content": assistant_content, "meta": {"error": "no_table_selected"}}
+                                if history_store:
+                                    try:
+                                        history_store.append_message(conv["id"], assistant_msg)
+                                        st.session_state.conversation_cache[conv["id"]] = history_store.get_conversation(conv["id"])
+                                        st.session_state.conversations_meta = history_store.list_conversations()
+                                    except Exception:
+                                        logger.exception("Failed to append assistant message for no_table_selected")
+                                else:
+                                    cache_conv = st.session_state.conversation_cache.get(conv.get("id"), {"messages": []})
+                                    cache_conv["messages"] = cache_conv.get("messages", []) + [user_msg, assistant_msg]
+                                    st.session_state.conversation_cache[conv.get("id")] = cache_conv
+                                _safe_rerun()
+                                # Abort this run (prevent calling the agent with no schema)
+                                st.stop()
+                        except Exception:
+                            logger.exception("Guard for missing selected tables failed")
+                            st.stop()
+
                     if not graph:
                         st.error("Agent unavailable. Check server logs.")
                         result = {"error": "agent unavailable"}
+                        logger.warning("User requested agent run but graph is unavailable")
                     else:
                         with st.spinner("Generating answer..."):
                             try:
+                                t0 = time.time()
+                                # Helpful debug: log session mappings if selected_table_names is empty (should not be here)
+                                if not selected_table_names:
+                                    logger.debug("No selected_table_names at run time. csv_label_to_path keys=%s, csv_path_to_table=%s",
+                                                 list(st.session_state.get("csv_label_to_path", {}).keys()),
+                                                 st.session_state.get("csv_path_to_table", {}))
+                                logger.info("Running graph.run for conversation=%s tables=%s", conv.get("id"), selected_table_names)
                                 # graph.run expected signature: graph.run(prompt, table_names, run_query=bool)
                                 result = graph.run(user_input.strip(), selected_table_names, run_query=execute_sql_checkbox)
+                                duration = time.time() - t0
+                                logger.info("Graph run completed in %.3fs", duration)
                             except Exception as e:
                                 logger.exception("Agent run failed")
                                 result = {"error": str(e)}
+                                _render_exception_ui(e, hint="Agent run failed")
 
                     # build assistant content safely
                     assistant_content = "No answer generated."
@@ -642,7 +755,8 @@ try:
                     # sanitize meta for storage
                     try:
                         sanitized_meta = _sanitize_for_history(result)
-                    except Exception:
+                    except Exception as e:
+                        logger.exception("Failed to sanitize result for history")
                         sanitized_meta = {"error": "failed to sanitize meta"}
 
                     if not isinstance(sanitized_meta, dict):
@@ -652,17 +766,17 @@ try:
                     if history_store:
                         try:
                             history_store.append_message(conv["id"], assistant_msg)
+                            logger.debug("Appended assistant message for conv=%s", conv["id"])
                             # refresh conversation in cache & meta list
                             st.session_state.conversation_cache[conv["id"]] = history_store.get_conversation(conv["id"])
                             st.session_state.conversations_meta = history_store.list_conversations()
                             st.session_state["__clear_user_input"] = True
                             _safe_rerun()
-                        except Exception:
-                            st.error("Failed to persist assistant message; see logs.")
+                        except Exception as e:
                             logger.exception("append assistant message failed")
+                            _render_exception_ui(e, hint="Failed to persist assistant message")
                     else:
                         logger.debug("HistoryStore not configured; skipping append_message for assistant_msg.")
-                        # still update in-memory cache so UI shows result immediately
                         cache_conv = st.session_state.conversation_cache.get(conv.get("id"), {"messages": []})
                         cache_conv["messages"] = cache_conv.get("messages", []) + [user_msg, assistant_msg]
                         st.session_state.conversation_cache[conv.get("id")] = cache_conv
@@ -675,9 +789,10 @@ try:
             if history_store:
                 try:
                     st.session_state.conversations_meta = history_store.list_conversations()
-                except Exception:
+                    logger.debug("Refreshed conversations_meta via UI button")
+                except Exception as e:
                     logger.exception("Failed to refresh conversations_meta")
-                    st.error("Failed to refresh conversations list.")
+                    _render_exception_ui(e, hint="Failed to refresh conversations list")
             else:
                 st.error("History backend unavailable.")
             _safe_rerun()
@@ -690,9 +805,10 @@ try:
                 with open(out_path, "w", encoding="utf-8") as f:
                     json.dump(all_meta, f, ensure_ascii=False, indent=2)
                 st.success(f"Exported to {out_path}")
-            except Exception:
+                logger.info("Exported all conversations to %s", out_path)
+            except Exception as e:
                 logger.exception("Failed to export all conversations")
-                st.error("Export failed; see logs.")
+                _render_exception_ui(e, hint="Export failed")
         st.markdown("---")
         st.info("Developer: raw logs are available in the server console. Use 'Show details' in message to reveal SQL/raw LLM output.")
 
@@ -702,9 +818,15 @@ try:
     try:
         if history_store:
             st.session_state.conversations_meta = history_store.list_conversations()
+            logger.debug("Refreshed conversations_meta at end of request")
     except Exception:
         logger.exception("Failed to refresh conversations_meta at end of request")
 
 except Exception as e:
     logger.exception("Top-level error in app.py")
-    st.error(f"An internal error occurred while rendering the app: {e}")
+    try:
+        _render_exception_ui(e, hint="An internal error occurred while rendering the app")
+    except Exception:
+        # If rendering the UI fails, at least log and raise so server logs capture it
+        logger.exception("Also failed to render exception to UI")
+        raise

@@ -1,10 +1,8 @@
+# File: app/schema_store.py
 """
-SchemaStore: manage CSV schema metadata persisted to JSON.
-
-Behavior notes:
-- SchemaStore persists a mapping of canonical schema entries and alias-to-canonical map.
-- get_schema(name) returns a list of normalized column names (convenient for LLM prompt builders).
-- get_schema_entry(name) returns the full stored schema dict if callers need the complete metadata.
+SchemaStore: Centralized registry for CSV schemas with persistent JSON storage.
+...
+(kept same header docs)
 """
 from __future__ import annotations
 import os
@@ -12,6 +10,7 @@ import json
 import threading
 import uuid
 import re
+import sys
 from typing import List, Dict, Any, Optional, Tuple
 
 from app.logger import get_logger
@@ -21,14 +20,27 @@ from app.csv_loader import load_csv_metadata
 logger = get_logger("schema_store")
 
 
+# ----------------------------------------------------------------------
+# Utility Functions
+# ----------------------------------------------------------------------
+
+
 def _ensure_dir(path: str) -> None:
+    """Ensure directory exists before file write operations."""
     if path:
         os.makedirs(path, exist_ok=True)
 
 
 def _atomic_write(path: str, data: Any) -> None:
+    """
+    Atomic JSON write:
+    - Write to <file>.tmp
+    - fsync()
+    - Safely replace original
+    """
     dirpath = os.path.dirname(path) or "."
     _ensure_dir(dirpath)
+
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -37,255 +49,362 @@ def _atomic_write(path: str, data: Any) -> None:
             os.fsync(f.fileno())
         except Exception:
             pass
+
     os.replace(tmp, path)
 
 
 def _normalize(name: Optional[str]) -> str:
-    """Normalize names to lowercase with underscores (deterministic)."""
+    """Normalize names: lowercase, keep only alnum+underscore, compress repeats."""
     if not name:
         return ""
-    s = str(name)
-    # keep alnum and underscore; replace others with underscore
-    s = re.sub(r"[^\w]", "_", s)
-    s = re.sub(r"_+", "_", s)
-    s = s.strip("_").lower()
-    return s or name.lower()
+    s = re.sub(r"[^\w]", "_", str(name))
+    s = re.sub(r"_+", "_", s).strip("_").lower()
+    return s or str(name).lower()
 
 
 def _short_uuid() -> str:
+    """8-char UUID suffix used to avoid canonical collisions."""
     return uuid.uuid4().hex[:8]
+
+
+# ----------------------------------------------------------------------
+# SchemaStore Class
+# ----------------------------------------------------------------------
 
 
 class SchemaStore:
     """
-    Thread-safe schema store. Persists schemas to disk.
-
-    Stored structure:
-    {
-      "schemas": {
-         "<canonical>": {
-             "canonical": "<canonical>",
-             "aliases": ["orig_filename", "orig_table_name", ...],
-             "path": "<csv_path>",
-             "columns": ["Raw Header 1", ...],
-             "columns_normalized": ["raw_header_1", ...],
-             "meta": { ... full metadata from load_csv_metadata ... }
-         }, ...
-      },
-      "alias_map": {
-         "<alias_normalized>": "<canonical>",
-         ...
-      }
-    }
+    Manages a persistent set of CSV schemas.
+    Stored structure and behavior as described in header.
     """
 
     def __init__(self, store_path: Optional[str] = None):
-        default_dir = os.path.join(os.getcwd(), "data")
-        self.store_path = store_path or os.path.join(default_dir, "schema_store.json")
-        _ensure_dir(os.path.dirname(self.store_path) or ".")
-        self._lock = threading.RLock()
-        self._schemas: Dict[str, Dict[str, Any]] = {}
-        self._alias_map: Dict[str, str] = {}
-        self._load()
+        try:
+            default_dir = os.path.join(os.getcwd(), "data")
+            self.store_path = store_path or os.path.join(default_dir, "schema_store.json")
 
-    # ---------- persistence ----------
+            _ensure_dir(os.path.dirname(self.store_path))
+            self._lock = threading.RLock()
+
+            self._schemas: Dict[str, Dict[str, Any]] = {}
+            self._alias_map: Dict[str, str] = {}
+
+            self._load()
+        except Exception as e:
+            logger.exception("SchemaStore initialization failed")
+            raise CustomException(e, sys)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
     def _load(self) -> None:
+        """Load schema_store.json into memory."""
         with self._lock:
-            if os.path.exists(self.store_path):
-                try:
-                    with open(self.store_path, "r", encoding="utf-8") as f:
-                        d = json.load(f)
-                    self._schemas = d.get("schemas", {}) or {}
-                    self._alias_map = d.get("alias_map", {}) or {}
-                except Exception as e:
-                    logger.exception("Failed to load SchemaStore (%s), starting empty: %s", self.store_path, e)
-                    self._schemas = {}
-                    self._alias_map = {}
+            if not os.path.exists(self.store_path):
+                return
+            try:
+                with open(self.store_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._schemas = data.get("schemas", {}) or {}
+                self._alias_map = data.get("alias_map", {}) or {}
+            except Exception as e:
+                logger.exception(
+                    "Failed to load SchemaStore (%s). Resetting. Error: %s", self.store_path, e
+                )
+                self._schemas = {}
+                self._alias_map = {}
 
     def _save(self) -> None:
+        """Persist all schemas to disk."""
         with self._lock:
-            _atomic_write(self.store_path, {"schemas": self._schemas, "alias_map": self._alias_map})
+            _atomic_write(
+                self.store_path,
+                {
+                    "schemas": self._schemas,
+                    "alias_map": self._alias_map,
+                },
+            )
 
-    # ---------- registration ----------
+    # ------------------------------------------------------------------
+    # Registration
+    # ------------------------------------------------------------------
+
     def register_from_csv(self, csv_path: str) -> str:
         """
-        Load metadata using load_csv_metadata and register the schema.
+        Extract metadata using load_csv_metadata() and register as schema.
         Returns canonical name.
         """
         try:
             meta = load_csv_metadata(csv_path)
         except Exception as e:
-            logger.exception("Failed to load CSV metadata for %s", csv_path)
-            raise CustomException(e)
+            logger.exception("CSV metadata load failed: %s", csv_path)
+            raise CustomException(e, sys)
 
-        # prefer canonical_name if provided by loader else derive from filename
-        suggested = meta.get("canonical_name") or _normalize(os.path.splitext(os.path.basename(csv_path))[0])
+        suggested = meta.get("canonical_name") or _normalize(
+            os.path.splitext(os.path.basename(csv_path))[0]
+        )
         return self.register(suggested, meta)
 
     def register(self, canonical: str, meta: Dict[str, Any]) -> str:
         """
-        Register a schema dict (meta should include 'columns' and 'columns_normalized' optional).
-        Returns canonical key used (may be suffixed to avoid collision).
+        Register schema metadata.
+        Auto-normalizes canonical name.
+        Avoids conflicts using UUID suffix if paths differ.
         """
         with self._lock:
-            c = _normalize(canonical)
-            # extract columns (raw) and normalized
-            columns_raw: List[str] = meta.get("columns", []) or []
-            if meta.get("columns_normalized"):
-                columns_norm = [ _normalize(x) for x in meta["columns_normalized"] ]
-            else:
-                columns_norm = [ _normalize(x) for x in columns_raw ]
+            try:
+                c = _normalize(canonical)
 
-            aliases: List[str] = []
-            # include provided aliases, original name, table_name if present
-            for a in meta.get("aliases", []) or []:
-                if a:
-                    aliases.append(str(a))
-            if meta.get("original_name"):
-                aliases.append(str(meta["original_name"]))
-            if meta.get("table_name"):
-                aliases.append(str(meta["table_name"]))
+                # Validate metadata fields
+                columns_raw: List[str] = meta.get("columns") or []
+                columns_norm: List[str] = [
+                    _normalize(col) for col in meta.get("columns_normalized", columns_raw)
+                ]
 
-            # ensure uniqueness of canonical key: if existing but different path, append short uuid
-            key = c
-            if key in self._schemas:
-                existing_path = self._schemas[key].get("path")
-                new_path = meta.get("path")
-                if existing_path and new_path and os.path.abspath(existing_path) != os.path.abspath(new_path):
-                    key = f"{c}_{_short_uuid()}"
+                aliases: List[str] = []
+                for a in meta.get("aliases", []) or []:
+                    if a:
+                        aliases.append(str(a))
+                if meta.get("original_name"):
+                    aliases.append(str(meta["original_name"]))
+                if meta.get("table_name"):
+                    aliases.append(str(meta["table_name"]))
 
-            schema_entry = {
-                "canonical": key,
-                "aliases": list(dict.fromkeys([_normalize(a) for a in aliases if a])),  # normalized aliases
-                "path": meta.get("path"),
-                "columns": columns_raw,
-                "columns_normalized": columns_norm,
-                "meta": meta
-            }
+                # de-dup and normalize aliases for storage
+                normalized_aliases = []
+                for a in aliases:
+                    n = _normalize(a)
+                    if n and n not in normalized_aliases:
+                        normalized_aliases.append(n)
 
-            self._schemas[key] = schema_entry
+                key = c
+                if key in self._schemas:  # collision check
+                    old_path = self._schemas[key].get("path")
+                    new_path = meta.get("path")
+                    if old_path and new_path and os.path.abspath(old_path) != os.path.abspath(new_path):
+                        key = f"{c}_{_short_uuid()}"
 
-            # update alias map
-            for a in schema_entry["aliases"]:
-                self._alias_map[a] = key
-            # also map canonical itself
-            self._alias_map[_normalize(key)] = key
+                schema_entry = {
+                    "canonical": key,
+                    "aliases": normalized_aliases,
+                    "path": os.path.abspath(meta.get("path")) if meta.get("path") else meta.get("path"),
+                    "columns": columns_raw,
+                    "columns_normalized": columns_norm,
+                    "meta": meta,
+                }
 
-            self._save()
-            logger.info("SchemaStore: registered %s (cols=%d)", key, len(columns_norm))
-            return key
+                self._schemas[key] = schema_entry
+
+                # Update alias map
+                for a in schema_entry["aliases"]:
+                    self._alias_map[a] = key
+
+                # Canonical also acts as alias
+                self._alias_map[_normalize(key)] = key
+
+                self._save()
+                logger.info("Schema registered: %s (cols=%d)", key, len(columns_norm))
+                return key
+            except Exception as e:
+                logger.exception("SchemaStore.register failed")
+                raise CustomException(e, sys)
+
+    # ------------------------------------------------------------------
+    # Unregister
+    # ------------------------------------------------------------------
 
     def unregister(self, name_or_alias: str) -> bool:
-        """
-        Remove a registered schema by canonical or alias.
-        Returns True if removed.
-        """
+        """Remove schema entry and associated aliases."""
         with self._lock:
             can = self.get_table_canonical(name_or_alias)
             if not can:
                 return False
-            # remove schema
-            if can in self._schemas:
-                del self._schemas[can]
-            # remove alias map entries pointing to this canonical
-            to_rm = [k for k, v in list(self._alias_map.items()) if v == can]
-            for k in to_rm:
-                del self._alias_map[k]
+
+            self._schemas.pop(can, None)
+
+            for alias, target in list(self._alias_map.items()):
+                if target == can:
+                    self._alias_map.pop(alias, None)
+
             self._save()
-            logger.info("SchemaStore: unregistered %s", can)
+            logger.info("Schema unregistered: %s", can)
             return True
 
-    # ---------- lookup & helpers ----------
+    # ------------------------------------------------------------------
+    # Lookup Methods
+    # ------------------------------------------------------------------
+
     def has_table(self, name_or_alias: str) -> bool:
         return bool(self.get_table_canonical(name_or_alias))
 
     def get_table_canonical(self, name_or_alias: Optional[str]) -> Optional[str]:
+        """Normalize alias and resolve canonical key."""
         if not name_or_alias:
             return None
-        n = _normalize(name_or_alias)
-        with self._lock:
-            return self._alias_map.get(n)
+        return self._alias_map.get(_normalize(name_or_alias))
 
     def get_schema_entry(self, name_or_alias: str) -> Optional[Dict[str, Any]]:
-        """
-        Return the full stored schema entry (dict) for the canonical name or alias.
-        """
+        """Return full metadata dict (entry) for canonical or alias."""
         can = self.get_table_canonical(name_or_alias)
-        if not can:
+        return self._schemas.get(can) if can else None
+
+    # Backwards-compatible 'get' / 'get_entry' methods used by other modules:
+    def get_entry(self, name_or_alias: str) -> Optional[Dict[str, Any]]:
+        return self.get_schema_entry(name_or_alias)
+
+    def get(self, name_or_alias: str) -> Optional[Dict[str, Any]]:
+        return self.get_schema_entry(name_or_alias)
+
+    def get_metadata(self, name_or_alias: str) -> Optional[Dict[str, Any]]:
+        return self.get_schema_entry(name_or_alias)
+
+    def get_path(self, name_or_alias: str) -> Optional[str]:
+        """Return absolute CSV path for the table if present."""
+        entry = self.get_schema_entry(name_or_alias)
+        if not entry:
             return None
-        return self._schemas.get(can)
+        p = entry.get("path") or entry.get("meta", {}).get("path")
+        if p:
+            try:
+                return os.path.abspath(p)
+            except Exception:
+                return p
+        return None
+
+    def get_csv_path(self, name_or_alias: str) -> Optional[str]:
+        return self.get_path(name_or_alias)
+
+    def get_file_path(self, name_or_alias: str) -> Optional[str]:
+        return self.get_path(name_or_alias)
 
     def get_schema(self, name_or_alias: str) -> List[str]:
-        """
-        Return the list of normalized column names for the given table (canonical or alias).
-        This is what LLM prompt builders and other call-sites expect.
-        """
+        """Return normalized column names only."""
         entry = self.get_schema_entry(name_or_alias)
-        if not entry:
-            return []
-        return entry.get("columns_normalized", []) or []
+        return entry.get("columns_normalized", []) if entry else []
 
     def get_sample_rows(self, name_or_alias: str) -> List[Dict[str, Any]]:
-        """
-        Return the sample rows extracted from the CSV metadata (if available).
-        """
+        """Return sample rows for UI preview."""
         entry = self.get_schema_entry(name_or_alias)
-        if not entry:
-            return []
-        meta = entry.get("meta", {}) or {}
-        return meta.get("sample_rows", []) or []
+        return entry.get("meta", {}).get("sample_rows", []) if entry else []
 
     def list_tables(self) -> List[str]:
+        """List canonical table names."""
         with self._lock:
             return list(self._schemas.keys())
 
     def get_columns(self, name_or_alias: str) -> List[str]:
-        """
-        Alias for get_schema (keeps compatibility with older callers).
-        """
         return self.get_schema(name_or_alias)
 
     def has_column(self, table_name_or_alias: str, column_name_or_alias: str) -> bool:
         cols = set(self.get_columns(table_name_or_alias))
         return _normalize(column_name_or_alias) in cols
 
-    def validate_table_and_columns(self, table_name: str, columns: Optional[List[str]]) -> Tuple[bool, List[str], List[str]]:
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate_table_and_columns(
+        self, table_name: str, columns: Optional[List[str]]
+    ) -> Tuple[bool, List[str], List[str]]:
         """
-        Validate existence of table and columns. Returns:
-          (ok, missing_tables, missing_columns)
-        - missing_tables: list with table_name if it doesn't exist, else []
-        - missing_columns: list of columns not found (using normalized names)
+        Validate existence of:
+        - table
+        - columns
+        Returns:
+            (ok, missing_tables, missing_columns)
         """
         missing_tables: List[str] = []
         missing_columns: List[str] = []
 
         can = self.get_table_canonical(table_name)
         if not can:
-            missing_tables.append(table_name)
-            return False, missing_tables, columns or []
+            return False, [table_name], columns or []
 
         if not columns:
             return True, [], []
 
-        cols_norm = set(self.get_columns(can))
+        defined = set(self.get_columns(can))
         for col in columns:
-            if _normalize(col) not in cols_norm:
+            if _normalize(col) not in defined:
                 missing_columns.append(col)
 
-        ok = len(missing_columns) == 0
-        return ok, missing_tables, missing_columns
+        return len(missing_columns) == 0, [], missing_columns
+
+    # ------------------------------------------------------------------
+    # Tools
+    # ------------------------------------------------------------------
 
     def dump(self) -> Dict[str, Any]:
+        """Return full JSON-serializable dataset."""
         with self._lock:
             return {"schemas": self._schemas, "alias_map": self._alias_map}
 
     def clear(self) -> None:
+        """Erase everything (dev only)."""
         with self._lock:
-            self._schemas = {}
-            self._alias_map = {}
+            self._schemas.clear()
+            self._alias_map.clear()
             try:
                 if os.path.exists(self.store_path):
                     os.remove(self.store_path)
             except Exception:
                 pass
             logger.info("SchemaStore cleared")
+
+    # -------------------------
+    # Backwards-compatible helpers used by app.py
+    # -------------------------
+    def add_csv(self, path: str, csv_name: Optional[str] = None, aliases: Optional[List[str]] = None) -> str:
+        """
+        Backwards-compatible wrapper used by app.py.
+        """
+        try:
+            meta = load_csv_metadata(path)
+        except Exception as e:
+            logger.exception("add_csv: failed to load metadata for %s", path)
+            raise CustomException(e, sys)
+
+        # allow provided overrides
+        if csv_name:
+            meta["canonical_name"] = csv_name
+        if aliases:
+            meta_aliases = list(meta.get("aliases") or [])
+            for a in aliases:
+                if a and a not in meta_aliases:
+                    meta_aliases.append(a)
+            meta["aliases"] = meta_aliases
+
+        meta["path"] = path
+
+        key = self.register(
+            meta.get("canonical_name")
+            or csv_name
+            or os.path.splitext(os.path.basename(path))[0],
+            meta,
+        )
+        return key
+
+    def list_csvs_meta(self) -> List[Dict[str, Any]]:
+        """
+        Return a list of schema metadata entries suitable for UI consumption.
+        """
+        out: List[Dict[str, Any]] = []
+        with self._lock:
+            for key, entry in self._schemas.items():
+                try:
+                    friendly = entry.get("meta", {}).get("friendly") or entry.get("canonical") or key
+                    obj = {
+                        "key": key,
+                        "canonical": entry.get("canonical", key),
+                        "path": entry.get("path"),
+                        "aliases": entry.get("aliases", []) or [],
+                        "columns": entry.get("columns", []) or [],
+                        "columns_normalized": entry.get("columns_normalized", []) or [],
+                        "sample_rows": entry.get("meta", {}).get("sample_rows", []) or [],
+                        "friendly": friendly,
+                    }
+                    out.append(obj)
+                except Exception:
+                    logger.exception("list_csvs_meta: failed to format schema entry %s", key)
+        return out
