@@ -1,4 +1,6 @@
-#app\database.py
+# app/database.py
+from __future__ import annotations
+
 import os
 import sys
 import time
@@ -13,141 +15,128 @@ from app import config
 
 logger = get_logger("database")
 
-# ---------------------------
-# Module-level connection cache
-# ---------------------------
+# ============================================================
+# Module-level DuckDB connection cache
+# ============================================================
 _conn: Optional[duckdb.DuckDBPyConnection] = None
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _sanitize_table_name(name: str) -> str:
+# ============================================================
+# Identifier sanitization (🔥 CRITICAL FIX)
+# ============================================================
+def sanitize_table_name(canonical_name: str) -> str:
     """
-    Ensure table name is a safe DuckDB identifier:
-    - only letters, digits and underscores
-    - cannot start with digit (prefix with t_ if it does)
-    - lowercased for consistency
+    Convert canonical table name → valid DuckDB identifier.
+
+    Rules:
+    - only [a-z0-9_]
+    - lowercased
+    - cannot start with digit → prefix with `t_`
+    - empty names become `t_table`
+
+    Examples
+    --------
+    "2023_sales"   -> "t_2023_sales"
+    "Sales Data"   -> "sales_data"
+    "1-table.csv"  -> "t_1_table_csv"
     """
-    if not isinstance(name, str) or not name:
-        raise ValueError("Invalid table name")
-    # replace non-alnum/_ with underscore
-    sanitized = re.sub(r"[^0-9a-zA-Z_]", "_", name)
-    sanitized = sanitized.lower()
-    if sanitized[0].isdigit():
-        sanitized = f"t_{sanitized}"
-    return sanitized
+    if not isinstance(canonical_name, str) or not canonical_name.strip():
+        return "t_table"
+
+    name = canonical_name.strip()
+    name = re.sub(r"[^0-9a-zA-Z_]", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_").lower()
+
+    if not name:
+        name = "table"
+
+    if name[0].isdigit():
+        name = f"t_{name}"
+
+    return name
 
 
-def _normalize_sql_quotes_for_duckdb(sql: str) -> List[Tuple[str, str]]:
+# ============================================================
+# SQL normalization helpers
+# ============================================================
+def _normalize_sql_variants(sql: str) -> List[Tuple[str, str]]:
     """
-    Produce candidate normalized SQLs to try against DuckDB.
-    Returns a list of tuples (label, sql_variant) in the order they should be tried.
-    - 'original': original SQL
-    - 'backticks_to_double': replace `...` with "..."
-    - 'remove_quotes': remove both ` and " entirely
+    DuckDB is picky about quoting.
+    Try multiple variants safely.
     """
-    variants = []
-    try:
-        variants.append(("original", sql))
-        if "`" in sql:
-            v1 = sql.replace("`", '"')
-            variants.append(("backticks_to_double", v1))
-        # always include a no-quotes variant as a last resort
-        v2 = re.sub(r'[`\"]', "", sql)
-        if v2 != sql:
-            variants.append(("remove_quotes", v2))
-    except Exception:
-        variants = [("original", sql)]
+    variants = [("original", sql)]
+
+    if "`" in sql:
+        variants.append(("backticks_to_double", sql.replace("`", '"')))
+
+    stripped = re.sub(r"[`\"]", "", sql)
+    if stripped != sql:
+        variants.append(("remove_quotes", stripped))
+
     return variants
 
 
-# regex to extract simple table names after FROM/JOIN/INTO
-_TABLE_NAME_RE = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([A-Za-z0-9_`\"]+)", flags=re.IGNORECASE)
+_TABLE_REF_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z0-9_`\"]+)",
+    flags=re.IGNORECASE,
+)
 
 
-def _extract_tables_from_sql(sql: str) -> List[str]:
-    """Extract candidate table identifiers from simple SQL. Returns raw identifiers (may include quotes/backticks)."""
-    if not sql:
-        return []
-    found = []
-    for m in _TABLE_NAME_RE.finditer(sql):
+def _extract_table_refs(sql: str) -> List[str]:
+    """Extract raw table references from SQL."""
+    tables: List[str] = []
+    for m in _TABLE_REF_RE.finditer(sql):
         raw = m.group(1)
-        if not raw:
-            continue
-        # strip quotes/backticks
-        raw_clean = raw.strip().strip('"').strip("`")
-        if raw_clean:
-            found.append(raw_clean)
-    # preserve order, uniquify
-    return list(dict.fromkeys(found))
+        if raw:
+            tables.append(raw.strip("`\""))
+    return list(dict.fromkeys(tables))
 
 
-def _duckdb_has_table(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
-    try:
-        rows = con.execute("SHOW TABLES").fetchall()
-        names = {r[0].lower() for r in rows}
-        return table_name.lower() in names
-    except Exception:
-        try:
-            rows = con.execute("SELECT table_name FROM information_schema.tables").fetchall()
-            names = {r[0].lower() for r in rows}
-            return table_name.lower() in names
-        except Exception:
-            return False
+def _duckdb_has_table(con: duckdb.DuckDBPyConnection, table: str) -> bool:
+    rows = con.execute("SHOW TABLES").fetchall()
+    return table.lower() in {r[0].lower() for r in rows}
 
 
-# ---------------------------
-# Connection Management
-# ---------------------------
+# ============================================================
+# Connection management
+# ============================================================
 def get_connection() -> duckdb.DuckDBPyConnection:
-    """
-    Return a singleton DuckDB connection, file-backed at config.DATABASE_PATH.
-
-    Returns
-    -------
-    duckdb.DuckDBPyConnection
-    """
     global _conn
     try:
-        db_path = getattr(config, "DATABASE_PATH", None) or os.path.join(os.getcwd(), "data", "text_to_sql.db")
+        db_path = getattr(config, "DATABASE_PATH", None) or os.path.join(
+            os.getcwd(), "data", "text_to_sql.duckdb"
+        )
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
         if _conn is None:
-            logger.info("Opening DuckDB connection at %s", db_path)
-            # use read_only=False to allow CREATE OR REPLACE TABLE for CSV loads
+            logger.info("Opening DuckDB connection: %s", db_path)
             _conn = duckdb.connect(database=db_path, read_only=False)
+
         return _conn
     except Exception as e:
-        logger.exception("Failed to get DuckDB connection")
+        logger.exception("DuckDB connection failed")
         raise CustomException(e, sys)
 
 
 def close_connection() -> None:
-    """
-    Close the module-level DuckDB connection if it exists.
-    Useful for cleanup in tests or shutdown.
-    """
     global _conn
-    try:
-        if _conn:
-            try:
-                _conn.close()
-                logger.info("DuckDB connection closed")
-            except Exception as inner:
-                logger.warning("Error closing DuckDB connection: %s", inner)
-            finally:
-                _conn = None
-    except Exception as e:
-        logger.exception("Failed to close DuckDB connection")
+    if _conn:
+        try:
+            _conn.close()
+        finally:
+            _conn = None
 
 
-# ---------------------------
+# ============================================================
 # SQL Safety
-# ---------------------------
-_DISALLOWED_KEYWORDS = (
+# ============================================================
+_DISALLOWED = (
     "DROP",
     "DELETE",
+    "UPDATE",
+    "INSERT",
     "ALTER",
+    "TRUNCATE",
     "ATTACH",
     "DETACH",
     "PRAGMA",
@@ -155,226 +144,156 @@ _DISALLOWED_KEYWORDS = (
     "COPY",
     "CALL",
     "EXECUTE",
-    # Keep CREATE blocked for user SQL; we will perform controlled CREATEs when auto-loading CSVs.
     "CREATE",
 )
 
 
-def _is_safe_sql(sql: str, read_only: bool) -> Tuple[bool, Optional[str]]:
-    """
-    Heuristic check for unsafe SQL queries.
-
-    Returns
-    -------
-    Tuple[bool, Optional[str]]: (is_safe, offending_keyword_or_none)
-    """
-    if not read_only:
-        return True, None
-    upper_sql = sql.upper()
-    for kw in _DISALLOWED_KEYWORDS:
-        if kw in upper_sql:
+def _is_safe_sql(sql: str) -> Tuple[bool, Optional[str]]:
+    upper = sql.upper()
+    for kw in _DISALLOWED:
+        if kw in upper:
             return False, kw
     return True, None
 
 
-# ---------------------------
-# CSV Loading
-# ---------------------------
-def load_csv_table(path: str, table_name: str, force_reload: bool = False) -> None:
+# ============================================================
+# CSV loading (🔥 FIXED)
+# ============================================================
+def load_csv_table(
+    csv_path: str,
+    canonical_name: str,
+    *,
+    force_reload: bool = False,
+) -> str:
     """
-    Load a CSV into DuckDB as a table.
-
-    Parameters
-    ----------
-    path : str
-        Path to CSV file.
-    table_name : str
-        DuckDB table name (canonical). This will be sanitized.
-    force_reload : bool
-        Replace table if exists.
-    """
-    try:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"CSV file not found: {path}")
-
-        con = get_connection()
-        sanitized = _sanitize_table_name(table_name)
-
-        # skip load if exists (unless forced)
-        if _duckdb_has_table(con, sanitized) and not force_reload:
-            logger.info("Table %s exists. Skipping load (force_reload=False).", sanitized)
-            return
-
-        # Use read_csv_auto which detects csv format; escape single quotes in path
-        safe_path = path.replace("'", "''")
-        # Create or replace a view to avoid permanently duplicating data in DB file.
-        sql = f"CREATE OR REPLACE VIEW {sanitized} AS SELECT * FROM read_csv_auto('{safe_path}')"
-        logger.info("Loading CSV into view %s: %s", sanitized, path)
-        con.execute(sql)
-        logger.info("CSV loaded into view %s", sanitized)
-    except Exception as e:
-        logger.exception("Failed to load CSV into DuckDB for path=%s table=%s", path, table_name)
-        raise CustomException(e, sys)
-
-
-def ensure_tables_loaded(table_map: Dict[str, str], force_reload: bool = False) -> None:
-    """
-    Ensure all tables in table_map (canonical_table_name -> csv_path) are loaded into DuckDB.
-    """
-    try:
-        for canonical, path in table_map.items():
-            sanitized = _sanitize_table_name(canonical)
-            load_csv_table(path, sanitized, force_reload=force_reload)
-    except Exception as e:
-        logger.exception("Failed ensuring tables loaded")
-        raise
-
-
-# ---------------------------
-# Query Execution
-# ---------------------------
-def execute_query(
-    sql: str,
-    read_only: Union[bool, Dict[str, Any]] = True,
-    as_dataframe: bool = False,
-) -> Tuple[Any, List[str], Dict[str, Any]]:
-    """
-    Execute a SQL query safely.
-
-    Parameters
-    ----------
-    sql : str
-        SQL to run.
-    read_only : bool | dict
-        If a dict mapping canonical_table_name->metadata is provided, the function will
-        attempt to auto-load referenced CSVs before executing the SQL.
-    as_dataframe : bool
-        Return a pandas DataFrame when True (if pandas available).
+    Load CSV into DuckDB using a sanitized physical name.
 
     Returns
     -------
-    Tuple[result, columns, metadata]
+    str
+        Physical DuckDB table/view name
+    """
+    try:
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(csv_path)
+
+        con = get_connection()
+        physical_name = sanitize_table_name(canonical_name)
+
+        if _duckdb_has_table(con, physical_name) and not force_reload:
+            logger.info("Table %s already exists", physical_name)
+            return physical_name
+
+        safe_path = csv_path.replace("'", "''")
+
+        sql = f"""
+        CREATE OR REPLACE VIEW {physical_name} AS
+        SELECT *
+        FROM read_csv_auto(
+            '{safe_path}',
+            all_varchar=true,
+            null_padding=true,
+            ignore_errors=true
+        )
+        """
+
+        logger.info("Loading CSV %s → %s", csv_path, physical_name)
+        con.execute(sql)
+
+        return physical_name
+
+    except Exception as e:
+        logger.exception("CSV load failed")
+        raise CustomException(e, sys)
+
+
+def ensure_tables_loaded(
+    table_map: Dict[str, str],
+    *,
+    force_reload: bool = False,
+) -> Dict[str, str]:
+    """
+    canonical_name -> csv_path
+    returns canonical_name -> physical_table_name
+    """
+    resolved: Dict[str, str] = {}
+    for canonical, path in table_map.items():
+        physical = load_csv_table(
+            path,
+            canonical,
+            force_reload=force_reload,
+        )
+        resolved[canonical] = physical
+    return resolved
+
+
+# ============================================================
+# Query execution
+# ============================================================
+def execute_query(
+    sql: str,
+    *,
+    table_map: Optional[Dict[str, str]] = None,
+    read_only: bool = True,
+    as_dataframe: bool = False,
+) -> Tuple[Any, List[str], Dict[str, Any]]:
+    """
+    Execute SQL safely with automatic CSV loading.
     """
     start = time.time()
+
     try:
-        # Basic safety check (read-only mode). If read_only is a mapping, still treat SQL as read-only.
-        safe, bad_kw = _is_safe_sql(sql, True if isinstance(read_only, dict) or read_only else True)
-        if not safe:
-            msg = f"Disallowed SQL keyword in read-only mode: {bad_kw}"
-            logger.warning(msg)
-            raise PermissionError(msg)
+        if read_only:
+            safe, bad = _is_safe_sql(sql)
+            if not safe:
+                raise PermissionError(f"Blocked keyword: {bad}")
 
         con = get_connection()
 
-        # If read_only provides schema metadata mapping, attempt to auto-load referenced CSVs
-        if isinstance(read_only, dict):
-            try:
-                referenced = _extract_tables_from_sql(sql)
-                # Build a map canonical->path for referenced tables only
-                to_load: Dict[str, str] = {}
-                for tbl in referenced:
-                    # try exact key, then sanitized key variants
-                    if tbl in read_only:
-                        meta = read_only.get(tbl) or {}
-                        path = meta.get("path") or meta.get("csv_path") or meta.get("file") or meta.get("source")
-                        if path:
-                            to_load[tbl] = os.path.abspath(path)
-                            continue
-                    # try sanitized variant
-                    san = _sanitize_table_name(tbl)
-                    if san in read_only:
-                        meta = read_only.get(san) or {}
-                        path = meta.get("path") or meta.get("csv_path") or meta.get("file") or meta.get("source")
-                        if path:
-                            to_load[san] = os.path.abspath(path)
-                            continue
-                    # try case-insensitive match in keys
-                    for k in list(read_only.keys()):
-                        if k.lower() == tbl.lower() or _sanitize_table_name(k) == san:
-                            meta = read_only.get(k) or {}
-                            path = meta.get("path") or meta.get("csv_path") or meta.get("file") or meta.get("source")
-                            if path:
-                                to_load[k] = os.path.abspath(path)
-                                break
-                if to_load:
-                    logger.info("Auto-loading CSVs for referenced tables: %s", list(to_load.keys()))
-                    ensure_tables_loaded(to_load, force_reload=False)
-            except Exception:
-                logger.exception("Auto-registering referenced tables failed")
+        # Auto-load referenced tables
+        if table_map:
+            referenced = _extract_table_refs(sql)
+            to_load = {t: table_map[t] for t in referenced if t in table_map}
+            ensure_tables_loaded(to_load)
 
-        # Try variants: original -> backticks->double -> remove quotes
-        variants = _normalize_sql_quotes_for_duckdb(sql)
         last_exc = None
-        for label, candidate in variants:
+
+        for label, variant in _normalize_sql_variants(sql):
             try:
-                logger.debug("Attempting SQL execute variant=%s", label)
-                logger.info("Executing SQL (read_only=%s): %s", isinstance(read_only, dict) or read_only, candidate)
-                res = con.execute(candidate)
+                logger.debug("Executing SQL variant=%s", label)
+                cur = con.execute(variant)
+                rows = cur.fetchall()
+                columns = [c[0] for c in cur.description] if cur.description else []
 
-                # Column names (duckdb cursor description)
-                try:
-                    columns = [c[0] for c in res.description] if res.description else []
-                except Exception:
-                    columns = []
-
-                rows = res.fetchall()
-                runtime = time.time() - start
-                meta = {"rowcount": len(rows), "runtime": runtime}
+                meta = {
+                    "rowcount": len(rows),
+                    "runtime": time.time() - start,
+                }
 
                 if as_dataframe:
-                    try:
-                        import pandas as pd
-                        df = pd.DataFrame(rows, columns=columns)
-                        logger.info("Query returned %d rows in %.3fs (variant=%s)", len(rows), runtime, label)
-                        return df, columns, meta
-                    except Exception:
-                        logger.warning("pandas not available or conversion failed; returning list of rows instead")
-                        return rows, columns, meta
+                    import pandas as pd
+                    return pd.DataFrame(rows, columns=columns), columns, meta
 
-                logger.info("Query returned %d rows in %.3fs (variant=%s)", len(rows), runtime, label)
                 return rows, columns, meta
 
             except Exception as e:
-                # record and try next variant
-                logger.debug("Variant %s failed: %s", label, str(e))
                 last_exc = e
-                continue
 
-        # if we reach here all variants failed
-        logger.error("All SQL execute variants failed. original_sql=%s", sql)
-        raise CustomException(
-            RuntimeError(f"Failed to execute SQL after normalization attempts. last_error={last_exc}"),
-            sys,
-        )
+        raise RuntimeError(f"All SQL variants failed: {last_exc}")
 
-    except CustomException:
-        raise
     except Exception as e:
-        logger.exception("Failed to execute query")
+        logger.exception("Query execution failed")
         raise CustomException(e, sys)
 
 
-# ---------------------------
-# Table Utilities
-# ---------------------------
-def table_exists(table_name: str) -> bool:
-    """Check if a table exists in DuckDB (sanitized name)."""
-    try:
-        con = get_connection()
-        sanitized = _sanitize_table_name(table_name)
-        tables = {r[0].lower() for r in con.execute("SHOW TABLES").fetchall()}
-        return sanitized.lower() in tables
-    except Exception as e:
-        logger.exception("Failed to check table existence")
-        raise CustomException(e, sys)
+# ============================================================
+# Table utilities
+# ============================================================
+def table_exists(canonical_name: str) -> bool:
+    con = get_connection()
+    return _duckdb_has_table(con, sanitize_table_name(canonical_name))
 
 
 def list_tables() -> List[str]:
-    """List all tables in DuckDB."""
-    try:
-        con = get_connection()
-        tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
-        return tables
-    except Exception as e:
-        logger.exception("Failed to list tables")
-        raise CustomException(e, sys)
+    con = get_connection()
+    return [r[0] for r in con.execute("SHOW TABLES").fetchall()]

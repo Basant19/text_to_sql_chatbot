@@ -1,7 +1,11 @@
+# app/history_sql.py
 """
 SQLite-first HistoryStore with conversation/message model (ChatGPT-style).
 
-See module docstring in your repo for full design rationale.
+Compatibility note:
+ - Tests (and older code) expect a helper named `_safe_json_dumps` to be available
+   at module level. That function is implemented here as a thin wrapper around
+   json.dumps using the same safe-serialization logic as the HistoryStore.
 """
 
 import os
@@ -20,11 +24,16 @@ import app.config as config_module
 logger = get_logger("history_store")
 
 
+# -----------------------
+# JSON serialization helpers
+# -----------------------
 def _make_json_serializable(obj: Any) -> Any:
     """
     Convert objects to JSON-serializable forms.
+    Re-used by HistoryStore._serialize and the module-level compatibility helper.
     """
     try:
+        # Prefer to handle LangChain message objects if available
         from langchain.schema import AIMessage, HumanMessage, SystemMessage  # type: ignore
         if isinstance(obj, (AIMessage, HumanMessage, SystemMessage)):
             return {
@@ -32,6 +41,7 @@ def _make_json_serializable(obj: Any) -> Any:
                 "content": getattr(obj, "content", str(obj)),
             }
     except Exception:
+        # langchain not available or import failed — ignore
         pass
 
     if obj is None or isinstance(obj, (str, int, float, bool)):
@@ -70,6 +80,25 @@ def _make_json_serializable(obj: Any) -> Any:
         return repr(obj)
 
 
+def _safe_json_dumps(obj: Any) -> str:
+    """
+    Compatibility helper expected by some tests: safely dump `obj` to JSON
+    using the same default serializer used by HistoryStore.
+    Returns a JSON string (ensure_ascii=False).
+    """
+    try:
+        return json.dumps(obj, default=_make_json_serializable, ensure_ascii=False)
+    except Exception:
+        # As a last-resort fallback, convert to str()
+        try:
+            return json.dumps(str(obj), ensure_ascii=False)
+        except Exception:
+            return json.dumps({"error": "failed to serialize object"}, ensure_ascii=False)
+
+
+# -----------------------
+# HistoryStore implementation
+# -----------------------
 class HistoryStore:
     """
     Conversation-first history store backed by SQLite.
@@ -180,6 +209,7 @@ class HistoryStore:
         return datetime.utcnow().isoformat() + "Z"
 
     def _serialize(self, obj: Any) -> str:
+        # Keep HistoryStore serialization consistent with module-level helper
         return json.dumps(obj, default=_make_json_serializable, ensure_ascii=False)
 
     def _deserialize(self, s: Optional[str]) -> Any:

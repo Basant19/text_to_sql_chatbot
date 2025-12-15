@@ -5,6 +5,7 @@ import sys
 import uuid
 import re
 import csv
+import hashlib
 from typing import Union, List, Dict, Any, Optional
 from app.logger import get_logger
 from app.exception import CustomException
@@ -35,13 +36,31 @@ def _sanitize_filename(name: str) -> str:
     return safe.strip().replace(" ", "_")
 
 
-def save_uploaded_csv(fileobj: Union[bytes, io.BytesIO, io.StringIO, str], filename: str, upload_dir: Optional[str] = None) -> str:
+def _compute_sha256_bytes(data: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest()
+
+
+def save_uploaded_csv(
+    fileobj: Union[bytes, io.BytesIO, io.StringIO, str],
+    filename: str,
+    upload_dir: Optional[str] = None,
+    *,
+    make_content_addressed: bool = True,
+) -> str:
     """
     Save uploaded CSV content to upload_dir and return the saved path.
-    fileobj may be:
-      - bytes or bytearray
-      - file-like object with .read()
-      - a path string (then file is copied)
+
+    Behavior:
+    - If make_content_addressed is True: compute SHA256 of the file bytes and
+      prefix filename with the short hash. If a file with the same hash+name
+      already exists and sizes match, reuse it (no re-write).
+    - Accepts:
+        - bytes / bytearray
+        - file-like object with .read()
+        - path string (file copy)
+    - Returns absolute path to saved file.
     """
     upload_dir = upload_dir or getattr(config, "UPLOAD_DIR", "./uploads")
     os.makedirs(upload_dir, exist_ok=True)
@@ -50,50 +69,105 @@ def save_uploaded_csv(fileobj: Union[bytes, io.BytesIO, io.StringIO, str], filen
     if not safe_name.lower().endswith(".csv"):
         safe_name += ".csv"
 
-    dest_path = os.path.join(upload_dir, f"{uuid.uuid4().hex}_{safe_name}")
-
     try:
-        # bytes-like
-        if isinstance(fileobj, (bytes, bytearray)):
-            with open(dest_path, "wb") as f:
-                f.write(fileobj)
-        # path-like string: copy file contents
-        elif isinstance(fileobj, str) and os.path.exists(fileobj):
-            with open(fileobj, "rb") as src, open(dest_path, "wb") as dst:
-                while True:
-                    chunk = src.read(8192)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-        # file-like with read()
+        # Normalize into bytes
+        data_bytes: Optional[bytes] = None
+
+        # If fileobj is a path string, read bytes from that file
+        if isinstance(fileobj, str) and os.path.exists(fileobj):
+            with open(fileobj, "rb") as f:
+                data_bytes = f.read()
+
+        # Bytes-like
+        elif isinstance(fileobj, (bytes, bytearray)):
+            data_bytes = bytes(fileobj)
+
+        # File-like object with read()
         elif hasattr(fileobj, "read"):
+            # Try to rewind if possible
+            try:
+                fileobj.seek(0)
+            except Exception:
+                pass
+
             content = fileobj.read()
-            if isinstance(content, bytes):
-                with open(dest_path, "wb") as f:
-                    f.write(content)
+            # If the read returned text, encode; if bytes, use directly
+            if isinstance(content, str):
+                data_bytes = content.encode("utf-8")
+            elif isinstance(content, (bytes, bytearray)):
+                data_bytes = bytes(content)
             else:
-                # treat as text
-                with open(dest_path, "w", newline="", encoding="utf-8") as f:
-                    f.write(str(content))
+                # Fallback to str conversion
+                data_bytes = str(content).encode("utf-8")
+
         else:
             raise ValueError("Unsupported file object provided to save_uploaded_csv")
 
+        if data_bytes is None:
+            raise ValueError("No data read from file object")
+
+        # Compute short sha prefix for filename if requested
+        if make_content_addressed:
+            full_hash = _compute_sha256_bytes(data_bytes)
+            short_hash = full_hash[:32]
+            out_name = f"{short_hash}_{safe_name}"
+        else:
+            out_name = f"{uuid.uuid4().hex}_{safe_name}"
+
+        dest_path = os.path.join(upload_dir, out_name)
+
+        # If file already exists with same size, assume identical and reuse
+        if os.path.exists(dest_path):
+            try:
+                if os.path.getsize(dest_path) == len(data_bytes):
+                    logger.debug("save_uploaded_csv: reusing existing file %s", dest_path)
+                    return os.path.abspath(dest_path)
+            except Exception:
+                # fall through to re-write
+                logger.debug("save_uploaded_csv: failed to stat existing file; will overwrite", exc_info=True)
+
+        # Write atomically
+        tmp = dest_path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data_bytes)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, dest_path)
+
         logger.info("Saved uploaded CSV to %s", dest_path)
-        return dest_path
+        return os.path.abspath(dest_path)
     except Exception as e:
         logger.exception("Failed to save uploaded CSV")
         raise CustomException(e, sys)
 
 
 def _normalize_table_name_from_filename(filename: str) -> str:
+    """
+    Returns a DuckDB-safe physical table name.
+
+    RULES:
+    - Always lowercase
+    - Always prefix with `t_`
+    - Never start with a digit
+    - Deterministic for same filename
+    """
     stem = os.path.splitext(os.path.basename(filename))[0]
-    # If the filename has a uuid suffix inserted by save_uploaded_csv, strip it (e.g. name_abcdef12)
-    m = re.match(r"^(.+?)_[0-9a-fA-F]{8,32}$", stem)
-    candidate = m.group(1) if m else stem
-    candidate = _sanitize_filename(candidate)
-    if candidate.isdigit():
-        candidate = f"t_{candidate}"
-    return candidate.lower()
+
+    # Strip hash suffix added by save_uploaded_csv
+    m = re.match(r"^(.+?)_[0-9a-fA-F]{8,64}$", stem)
+    base = m.group(1) if m else stem
+
+    base = _sanitize_filename(base).lower()
+
+    # Collapse multiple underscores
+    base = re.sub(r"_+", "_", base).strip("_")
+
+    # 🚨 ALWAYS prefix with t_
+    return f"t_{base}"
+
 
 
 def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
@@ -193,6 +267,7 @@ def load_csv_metadata(path: str, sample_rows: int = 5) -> Dict[str, Any]:
                     continue
                 row_count += 1
                 if len(samples) < sample_rows:
+                    # pad or truncate to header length
                     values = list(row) + [None] * (len(headers) - len(row))
                     values = values[: len(headers)]
                     row_dict = {headers[i]: values[i] for i in range(len(headers))}
@@ -237,14 +312,49 @@ class CSVLoader:
         self.splitter = None
         if _USE_TEXT_SPLITTER:
             # Instantiate the splitter per LangChain docs.
-            # Example usage:
-            #   text_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=0)
-            #   texts = text_splitter.split_text(document)
             self.splitter = RecursiveCharacterTextSplitter(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
 
     def save_csv(self, file) -> str:
+        """
+        Save an uploaded file-like / bytes / path. Will return a content-addressed
+        path (SHA-prefixed) to avoid duplicate copies on disk.
+        """
         filename = getattr(file, "name", None) or f"upload_{uuid.uuid4().hex}.csv"
-        return save_uploaded_csv(file, filename, upload_dir=self.upload_dir)
+
+        # If file is a file-like, read bytes then call save_uploaded_csv to ensure
+        # consistent hashing. For streamlit UploadedFile, .read() returns bytes.
+        try:
+            # If file is a path string, hand off directly (save_uploaded_csv will read it)
+            if isinstance(file, str) and os.path.exists(file):
+                return save_uploaded_csv(file, filename, upload_dir=self.upload_dir, make_content_addressed=True)
+
+            # If file has read(), use it but ensure we don't consume original if caller still needs it.
+            if hasattr(file, "read"):
+                try:
+                    file.seek(0)
+                except Exception:
+                    pass
+                content = file.read()
+                # If the object returned text instead of bytes, encode:
+                if isinstance(content, str):
+                    content = content.encode("utf-8")
+                # create BytesIO to pass to save_uploaded_csv (so we don't depend on original file object lifetime)
+                bio = io.BytesIO(content)
+                try:
+                    bio.name = filename
+                except Exception:
+                    pass
+                return save_uploaded_csv(bio, filename, upload_dir=self.upload_dir, make_content_addressed=True)
+
+            # Bytes-like
+            if isinstance(file, (bytes, bytearray)):
+                return save_uploaded_csv(bytes(file), filename, upload_dir=self.upload_dir, make_content_addressed=True)
+
+            # Fallback: try to stringify
+            return save_uploaded_csv(str(file).encode("utf-8"), filename, upload_dir=self.upload_dir, make_content_addressed=True)
+        except Exception as e:
+            logger.exception("CSVLoader.save_csv failed")
+            raise CustomException(e, sys)
 
     def list_uploaded_csvs(self) -> List[str]:
         try:
@@ -265,8 +375,6 @@ class CSVLoader:
 
         Accepts a list of file paths (to CSV files), calls load_csv_metadata on each,
         and returns a list of metadata dicts (one per input path).
-
-        - paths: list of filesystem paths to CSV files
         """
         out_meta: List[Dict[str, Any]] = []
         for p in paths or []:
@@ -284,22 +392,10 @@ class CSVLoader:
                 logger.exception("load_and_extract: failed to extract metadata for %s", p)
         return out_meta
 
-
     def load_and_chunk_csv(self, path: str) -> List[Dict[str, Any]]:
         """
         Reads CSV using delimiter/header detected by load_csv_metadata, splits long text cells into chunks,
         returns list of chunks with metadata.
-
-        Each chunk: {
-            "text": <chunk_text>,
-            "meta": {
-                "table": <table_name>,
-                "canonical": <canonical_name>,
-                "row": <row_index>,
-                "column": <column_name>,
-                "original": <original_cell_value>
-            }
-        }
         """
         try:
             metadata = load_csv_metadata(path)
@@ -362,13 +458,6 @@ class CSVLoader:
     def chunk_and_index(self, path: str, vector_search_client=None, id_prefix: Optional[str] = None) -> List[str]:
         """
         Convenience helper: chunk CSV and optionally upsert chunks into a VectorSearch client.
-
-        - vector_search_client: an object exposing upsert_documents(list_of_docs) where each doc is:
-            {"id": <id>, "text": <text>, "meta": {...}}
-          If None, this method returns chunks but does not index.
-
-        - id_prefix: optional prefix to use for doc ids.
-        Returns list of document ids that were upserted (or an empty list if vector_search_client is None).
         """
         chunks = self.load_and_chunk_csv(path)
         docs = []

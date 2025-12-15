@@ -1,3 +1,4 @@
+#D:\text_to_sql_bot\tests\test_database.py
 import os
 import sys
 import tempfile
@@ -9,7 +10,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import pytest  # noqa: E402
-from app.database import get_connection, load_csv_table, execute_query, table_exists, list_tables  # noqa: E402
+from app.database import get_connection, load_csv_table, execute_query, table_exists, list_tables, close_connection  # noqa: E402
 from app.exception import CustomException  # noqa: E402
 from app import config  # noqa: E402
 from app.logger import get_logger  # noqa: E402
@@ -39,21 +40,29 @@ def test_connection_and_load_and_query(tmp_path, monkeypatch):
     csv_path = str(tmp_path / "people.csv")
     _write_sample_csv(csv_path)
 
-    # load into table
-    load_csv_table(csv_path, "people", force_reload=True)
-    assert table_exists("people") is True
+    try:
+        # load into table
+        load_csv_table(csv_path, "people", force_reload=True)
+        assert table_exists("people") is True
 
-    # run a simple query
-    rows, cols, meta = execute_query("SELECT COUNT(*) FROM people", read_only=True)
-    # Depending on how DuckDB returns counts, it's usually [(4,)]
-    assert isinstance(rows, list)
-    assert rows and rows[0][0] == 4
-    assert "COUNT" in cols[0].upper() or cols[0].lower().startswith("count")
+        # run a simple query
+        rows, cols, meta = execute_query("SELECT COUNT(*) FROM people", read_only=True)
+        # normalize the returned row value to an int and assert
+        assert isinstance(rows, list)
+        assert rows and int(rows[0][0]) == 4
+        assert "COUNT" in cols[0].upper() or cols[0].lower().startswith("count")
 
-    # select all rows
-    rows2, cols2, meta2 = execute_query("SELECT id, name, age FROM people ORDER BY id", read_only=True)
-    assert len(rows2) == 4
-    assert cols2 == ["id", "name", "age"]
+        # select all rows
+        rows2, cols2, meta2 = execute_query("SELECT id, name, age FROM people ORDER BY id", read_only=True)
+        assert len(rows2) == 4
+        # ensure columns normalized to expected names
+        assert [c.lower() for c in cols2] == ["id", "name", "age"]
+    finally:
+        # ensure DB connection closed so Windows can remove file
+        try:
+            close_connection()
+        except Exception:
+            pass
 
 
 def test_readonly_protects_destructive_sql(tmp_path, monkeypatch):
@@ -62,11 +71,18 @@ def test_readonly_protects_destructive_sql(tmp_path, monkeypatch):
 
     csv_path = str(tmp_path / "people.csv")
     _write_sample_csv(csv_path)
-    load_csv_table(csv_path, "people", force_reload=True)
 
-    with pytest.raises(CustomException):
-        # Drop should be rejected in read-only mode
-        execute_query("DROP TABLE people", read_only=True)
+    try:
+        load_csv_table(csv_path, "people", force_reload=True)
+
+        with pytest.raises(CustomException):
+            # Drop should be rejected in read-only mode
+            execute_query("DROP TABLE people", read_only=True)
+    finally:
+        try:
+            close_connection()
+        except Exception:
+            pass
 
 
 # ---------------- Standalone script runner ----------------
@@ -99,7 +115,7 @@ def _run_as_script():
 
         # run a simple query
         rows, cols, meta = execute_query("SELECT COUNT(*) FROM people", read_only=True)
-        if isinstance(rows, list) and rows and rows[0][0] == 4:
+        if isinstance(rows, list) and rows and int(rows[0][0]) == 4:
             print("✔ execute_query (COUNT): OK")
             successes += 1
         else:

@@ -6,12 +6,14 @@ This updated version:
  - Adds more defensive initialization for components (config, CSV loader, schema store, vector search, graph)
  - Improves session-state syncing with SchemaStore
  - Better error handling & logging around uploads, schema registration, and agent runs
+ - Adds dedupe / processed_upload_hashes session guard to avoid re-processing the same upload
  - Keeps the same user-facing layout and behavior while being resilient when optional backends are missing
 """
 import os
 import json
 import time
 import traceback
+import hashlib
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
@@ -157,6 +159,9 @@ st.session_state.setdefault("conversations_meta", [])
 st.session_state.setdefault("conversation_cache", {})
 st.session_state.setdefault("csv_label_to_path", {})   # label -> path
 st.session_state.setdefault("csv_path_to_table", {})   # path -> canonical table name
+
+# Track processed upload hashes this session to avoid re-processing on reruns
+st.session_state.setdefault("processed_upload_hashes", [])  # list of hex strings
 
 # If a previous run requested a rerun, try to rerun now
 if st.session_state.pop("_needs_rerun", False):
@@ -324,91 +329,195 @@ try:
         st.markdown("---")
         st.subheader("CSV Management")
         uploaded_files = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True)
+
+        # ============================
+        # NEW: dedupe-aware upload loop (with processed_upload_hashes guard)
+        # ============================
         if uploaded_files and csv_loader:
-            for file in uploaded_files:
+            for uploaded_file in uploaded_files:
                 try:
-                    saved_path = csv_loader.save_csv(file)
-                    st.success(f"Uploaded {file.name}")
-                    logger.info("Saved %s -> %s", file.name, saved_path)
-
-                    # try to extract metadata and register schema
+                    # Safely read bytes for hashing; many file types (Streamlit UploadedFile) support .read()
+                    uploaded_file_bytes = None
+                    sha256 = None
                     try:
-                        t0 = time.time()
-                        metadata_list = csv_loader.load_and_extract([saved_path])
-                        logger.debug("Extracted metadata for %s in %.3fs", saved_path, time.time() - t0)
-                        if metadata_list and isinstance(metadata_list, list):
-                            for meta in metadata_list:
-                                orig_name = os.path.basename(saved_path)
-                                canonical = None
-                                aliases = []
-                                if isinstance(meta, dict):
-                                    canonical = meta.get("canonical_name") or meta.get("table_name") or os.path.splitext(os.path.basename(saved_path))[0]
-                                    aliases = meta.get("aliases") or meta.get("alias") or []
-                                    orig_name = meta.get("original_name") or orig_name
-                                if not canonical:
-                                    canonical = os.path.splitext(os.path.basename(saved_path))[0]
+                        # ensure at start
+                        try:
+                            uploaded_file.seek(0)
+                        except Exception:
+                            pass
+                        uploaded_file_bytes = uploaded_file.read()
+                        if isinstance(uploaded_file_bytes, str):
+                            uploaded_file_bytes = uploaded_file_bytes.encode("utf-8")
+                        if isinstance(uploaded_file_bytes, (bytes, bytearray)):
+                            sha256 = hashlib.sha256(uploaded_file_bytes).hexdigest()
+                    except Exception:
+                        uploaded_file_bytes = None
+                        sha256 = None
 
-                                existing_meta = _find_store_meta_by_path(saved_path)
-                                if schema_store and not existing_meta:
-                                    try:
-                                        t_start = time.time()
-                                        store_key = schema_store.add_csv(saved_path, csv_name=canonical, aliases=aliases)
-                                        logger.info("schema_store.add_csv returned key=%s for path=%s (t=%.3fs)", store_key, saved_path, time.time()-t_start)
-                                        existing_meta = _find_store_meta_by_path(saved_path)
-                                    except Exception as e:
-                                        logger.exception("schema_store.add_csv failed for %s (canonical=%s aliases=%s)", saved_path, canonical, aliases)
-                                        try:
-                                            logger.info("Attempting fallback schema_store.add_csv without names for %s", saved_path)
-                                            schema_store.add_csv(saved_path)
-                                            existing_meta = _find_store_meta_by_path(saved_path)
-                                        except Exception:
-                                            logger.exception("schema_store.add_csv fallback also failed for %s", saved_path)
-                                else:
-                                    if existing_meta:
-                                        logger.debug("Path already registered in SchemaStore: %s", saved_path)
+                    # Skip if we've already processed this exact content this session
+                    if sha256 and sha256 in st.session_state.get("processed_upload_hashes", []):
+                        st.info(f"Skipping previously processed upload: {uploaded_file.name}")
+                        logger.debug("Skipping upload; already processed in session hash=%s name=%s", sha256, uploaded_file.name)
+                        continue
 
-                                # Determine canonical to use in UI mapping (prefer authoritative store meta)
-                                ui_canonical = None
-                                if existing_meta and isinstance(existing_meta, dict):
-                                    ui_canonical = existing_meta.get("canonical") or existing_meta.get("friendly") or os.path.splitext(os.path.basename(saved_path))[0]
-                                    aliases_from_store = existing_meta.get("aliases") or []
-                                    if aliases_from_store:
-                                        aliases = aliases_from_store
-                                else:
-                                    ui_canonical = canonical
+                    # check SchemaStore entries by file hash first (if SchemaStore stores hashes in meta)
+                    existing_meta = None
+                    try:
+                        if schema_store and sha256:
+                            for entry in schema_store.list_csvs_meta() or []:
+                                meta = entry.get("meta") or {}
+                                if meta.get("file_hash") == sha256:
+                                    existing_meta = entry
+                                    break
+                    except Exception:
+                        logger.exception("schema_store search by file_hash failed")
 
-                                aliases = [a for a in (aliases or []) if a]
-                                if ui_canonical and ui_canonical not in aliases:
-                                    aliases.insert(0, ui_canonical)
-                                for alias in aliases:
-                                    if not alias:
-                                        continue
-                                    label = f"{alias} — {orig_name}"
-                                    _ensure_label_registered(label, saved_path)
+                    # If not found by hash, check if any schema already points to a path with same filename
+                    if not existing_meta and schema_store:
+                        try:
+                            for entry in schema_store.list_csvs_meta() or []:
+                                p = entry.get("path") or ""
+                                if p and os.path.basename(p) == uploaded_file.name:
+                                    existing_meta = entry
+                                    break
+                        except Exception:
+                            logger.exception("schema_store filename search failed")
 
-                                st.session_state["csv_path_to_table"][saved_path] = ui_canonical
-                                logger.info("Registered schema for %s (canonical=%s, aliases=%s)", saved_path, ui_canonical, aliases)
-
-                                # === Auto-select newly uploaded CSV label in sidebar multiselect ===
+                    if existing_meta:
+                        # We already have this file registered (or same content). Don't save again.
+                        saved_path = existing_meta.get("path")
+                        st.success(f"Skipped upload — already registered: {uploaded_file.name}")
+                        logger.info("Duplicate upload detected for %s -> existing canonical=%s path=%s",
+                                    uploaded_file.name, existing_meta.get("canonical"), saved_path)
+                        # mark processed so future reruns skip
+                        if sha256:
+                            processed = st.session_state.setdefault("processed_upload_hashes", [])
+                            if sha256 not in processed:
+                                processed.append(sha256)
+                                st.session_state["processed_upload_hashes"] = processed
+                    else:
+                        # Not found: save file. Use bytes we may have already read, to avoid re-reading stream
+                        try:
+                            if uploaded_file_bytes is not None:
+                                from io import BytesIO
+                                uploaded_file_io = BytesIO(uploaded_file_bytes)
                                 try:
-                                    if aliases:
-                                        new_label = f"{aliases[0]} — {orig_name}"
-                                        selected = st.session_state.get("selected_csvs_sidebar", []) or []
-                                        if new_label not in selected:
-                                            selected.append(new_label)
-                                            st.session_state["selected_csvs_sidebar"] = selected
-                                            logger.info("Auto-selected uploaded CSV in sidebar multiselect: %s", new_label)
-                                    # request a rerun so the multiselect updates immediately
-                                    _safe_rerun()
+                                    uploaded_file_io.name = uploaded_file.name
                                 except Exception:
-                                    logger.exception("Failed to auto-select uploaded csv label in UI")
+                                    pass
+                                saved_path = csv_loader.save_csv(uploaded_file_io)
+                            else:
+                                try:
+                                    uploaded_file.seek(0)
+                                except Exception:
+                                    pass
+                                saved_path = csv_loader.save_csv(uploaded_file)
+                        except Exception:
+                            try:
+                                uploaded_file.seek(0)
+                                saved_path = csv_loader.save_csv(uploaded_file)
+                            except Exception as e:
+                                logger.exception("CSV save failed for %s", getattr(uploaded_file, "name", "<unknown>"))
+                                _render_exception_ui(e, hint=f"Failed to save {getattr(uploaded_file, 'name', '<file>')}")
+                                continue
 
+                        st.success(f"Uploaded {uploaded_file.name}")
+                        logger.info("Saved %s -> %s", uploaded_file.name, saved_path)
+
+                        # mark processed hash to avoid re-processing on reruns
+                        if sha256:
+                            processed = st.session_state.setdefault("processed_upload_hashes", [])
+                            if sha256 not in processed:
+                                processed.append(sha256)
+                                st.session_state["processed_upload_hashes"] = processed
+
+                    # attempt to extract metadata and register in SchemaStore if not present
+                    try:
+                        # If we already have an existing_meta, use that; else run metadata extraction + register.
+                        if existing_meta:
+                            ui_canonical = existing_meta.get("canonical") or os.path.splitext(os.path.basename(saved_path))[0]
+                            aliases = existing_meta.get("aliases") or []
+                        else:
+                            try:
+                                t0 = time.time()
+                                metadata_list = csv_loader.load_and_extract([saved_path])
+                                logger.debug("Extracted metadata for %s in %.3fs", saved_path, time.time() - t0)
+                            except Exception:
+                                metadata_list = None
+
+                            canonical = os.path.splitext(os.path.basename(saved_path))[0]
+                            aliases = []
+                            if metadata_list and isinstance(metadata_list, list) and metadata_list:
+                                meta = metadata_list[0]
+                                canonical = meta.get("canonical_name") or meta.get("table_name") or canonical
+                                aliases = meta.get("aliases") or meta.get("alias") or []
+                                if sha256:
+                                    meta["file_hash"] = sha256
+                                meta["path"] = saved_path
+                            else:
+                                meta = {"path": saved_path, "original_name": uploaded_file.name}
+                                if sha256:
+                                    meta["file_hash"] = sha256
+
+                            if schema_store:
+                                try:
+                                    t_start = time.time()
+                                    store_key = schema_store.add_csv(saved_path, csv_name=canonical, aliases=aliases)
+                                    logger.info("schema_store.add_csv returned key=%s for path=%s (t=%.3fs)",
+                                                store_key, saved_path, time.time() - t_start)
+                                    ui_entry = _find_store_meta_by_path(saved_path) or {}
+                                    ui_canonical = ui_entry.get("canonical") or canonical
+                                    aliases = ui_entry.get("aliases") or aliases
+                                except Exception:
+                                    logger.exception("schema_store.add_csv failed for %s (canonical=%s aliases=%s)",
+                                                     saved_path, canonical, aliases)
+                                    try:
+                                        schema_store.add_csv(saved_path)
+                                        ui_entry = _find_store_meta_by_path(saved_path) or {}
+                                        ui_canonical = ui_entry.get("canonical") or canonical
+                                        aliases = ui_entry.get("aliases") or aliases
+                                    except Exception:
+                                        logger.exception("Fallback schema_store.add_csv failed for %s", saved_path)
+                                        ui_canonical = canonical
+                            else:
+                                ui_canonical = canonical
+
+                        # Build or reuse alias list and create UI labels
+                        aliases = [a for a in (aliases or []) if a]
+                        if ui_canonical and ui_canonical not in aliases:
+                            aliases.insert(0, ui_canonical)
+                        orig_name = os.path.basename(saved_path) if saved_path else uploaded_file.name or "uploaded.csv"
+                        for alias in aliases:
+                            if not alias:
+                                continue
+                            label = f"{alias} — {orig_name}"
+                            _ensure_label_registered(label, saved_path)
+
+                        # maintain mapping path -> canonical in session state
+                        st.session_state["csv_path_to_table"][saved_path] = ui_canonical
+                        logger.info("Registered schema for %s (canonical=%s, aliases=%s)", saved_path, ui_canonical, aliases)
+
+                        # Auto-select newly uploaded CSV label in sidebar multiselect
+                        try:
+                            if aliases:
+                                new_label = f"{aliases[0]} — {orig_name}"
+                                selected = st.session_state.get("selected_csvs_sidebar", []) or []
+                                if new_label not in selected:
+                                    selected.append(new_label)
+                                    st.session_state["selected_csvs_sidebar"] = selected
+                                    logger.info("Auto-selected uploaded CSV in sidebar multiselect: %s", new_label)
+                            _safe_rerun()
+                        except Exception:
+                            logger.exception("Failed to auto-select uploaded csv label in UI")
                     except Exception as e:
                         logger.exception("Failed to auto-register schema for uploaded CSV")
-                        _render_exception_ui(e, hint=f"Failed to parse or register schema for {file.name}")
+                        _render_exception_ui(e, hint=f"Failed to parse or register schema for {uploaded_file.name}")
                 except Exception as e:
-                    logger.exception("CSV upload failed for %s", getattr(file, "name", "<unknown>"))
-                    _render_exception_ui(e, hint=f"Failed to save {getattr(file, 'name', '<file>')}")
+                    logger.exception("CSV upload failed for %s", getattr(uploaded_file, "name", "<unknown>"))
+                    _render_exception_ui(e, hint=f"Failed to save {getattr(uploaded_file, 'name', '<file>')}")
+        # ============================
+        # end dedupe-aware upload loop
+        # ============================
 
         # One-time sync from SchemaStore to session maps (idempotent)
         try:
