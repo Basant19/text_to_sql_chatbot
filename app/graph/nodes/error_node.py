@@ -1,4 +1,4 @@
-#D:\text_to_sql_bot\app\graph\nodes\error_node.py
+# File: app/graph/nodes/error_node.py
 import sys
 import traceback
 from typing import Any, Dict, Optional
@@ -38,50 +38,38 @@ class ErrorNode:
             raise CustomException(e, sys)
 
     def _normalize_exception(self, exc: Any) -> Dict[str, Any]:
-        """Return a normalized dict with short message, details and stack trace (if available)."""
+        """Return a normalized dict with short message, details, and stack trace."""
         try:
-            short_msg = None
-            details = None
+            short_msg = "Error"
+            details = repr(exc)
+            trace_str = None
+            extra = {}
 
-            # If it's our CustomException, try to extract a friendly message
-            try:
-                if isinstance(exc, CustomException):
-                    short_msg = getattr(exc, "error_message", None) or getattr(exc, "message", None) or str(exc)
-                    details = repr(exc)
-                else:
-                    short_msg = str(exc) if exc is not None else "Unknown error"
-                    details = repr(exc)
-            except Exception:
-                short_msg = str(exc) if exc is not None else "Unknown error"
+            # Extract message and details
+            if exc is not None:
+                short_msg = getattr(exc, "error_message", None) or getattr(exc, "message", None) or str(exc)
                 details = repr(exc)
 
-            # Get trace if available
-            trace_str = None
+            # Extract traceback if possible
             try:
                 if isinstance(exc, BaseException):
                     trace_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                else:
-                    # If it's not an exception, we won't have a trace
-                    trace_str = None
             except Exception:
                 trace_str = None
 
-            # include any extra attributes (non-private) if present
-            extra = {}
+            # Include extra non-private attributes
             try:
                 if hasattr(exc, "__dict__"):
-                    d = {k: v for k, v in vars(exc).items() if not k.startswith("_") and k not in ("args", "__traceback__")}
-                    if d:
-                        extra = d
+                    extra = {k: v for k, v in vars(exc).items()
+                             if not k.startswith("_") and k not in ("args", "__traceback__")}
             except Exception:
                 extra = {}
 
-            result: Dict[str, Any] = {"error": short_msg or "Error", "details": details or short_msg, "trace": trace_str}
+            result: Dict[str, Any] = {"error": short_msg, "details": details, "trace": trace_str}
             if extra:
                 result["extra"] = extra
             return result
         except Exception as e:
-            # fallback
             logger.exception("ErrorNode._normalize_exception failed")
             return {"error": "Failed to normalize exception", "details": repr(e), "trace": None}
 
@@ -107,27 +95,26 @@ class ErrorNode:
             ctx = context or {}
             timings = ctx.get("timings", {}) if isinstance(ctx, dict) else {}
 
-            # Build normalized error dict for logs and developer debug
+            # Normalize exception
             norm = self._normalize_exception(exc)
             short_msg = norm.get("error") or "Error"
             details = norm.get("details")
             trace = norm.get("trace")
 
-            # Log with trace for observability
+            # Log full trace for observability
             if trace:
                 logger.error("ErrorNode caught exception at step=%s: %s\n%s", step, short_msg, trace)
             else:
                 logger.error("ErrorNode caught exception at step=%s: %s", step, short_msg)
 
-            # Build a concise user-facing formatted response
+            # Build user-facing message
             user_message = "An error occurred while processing your request."
             if step:
                 user_message += f" Step: {step}."
-            # include a short reason if available (keep it user-friendly)
             if short_msg and short_msg.lower() not in ("", "error"):
                 user_message += f" Reason: {short_msg}"
 
-            # Truncate trace for debug payload to avoid huge dumps
+            # Limit trace length for debug
             trace_preview = None
             try:
                 if trace:
@@ -150,7 +137,6 @@ class ErrorNode:
                 },
             }
 
-            # GraphBuilder-compatible error payload
             return {
                 "prompt": None,
                 "sql": None,
@@ -163,7 +149,7 @@ class ErrorNode:
             }
 
         except Exception as e:
-            # If normalization itself fails, return a minimal error payload
+            # Fallback if normalization fails
             fallback = {"error": "ErrorNode failed while handling another error", "details": repr(e)}
             logger.exception("ErrorNode.run failed while handling exception: %s", fallback)
             return {

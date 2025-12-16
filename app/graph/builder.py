@@ -1,223 +1,249 @@
-# app/graph/builder.py
+# File: app/graph/builder.py
+from __future__ import annotations
+
 import sys
 import time
 import inspect
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
+from app.tools import Tools
+
+from app.graph.nodes.retrieve_node import RetrieveNode
+from app.graph.nodes.generate_node import GenerateNode
+from app.graph.nodes.validate_node import ValidateNode
+from app.graph.nodes.execute_node import ExecuteNode
+from app.graph.nodes.context_node import ContextNode
+from app.graph.nodes.error_node import ErrorNode
+from app.graph.nodes.format_node import FormatNode  # 🔥 Ensure UI output
 
 logger = get_logger("graph_builder")
 
 
-def _try_call_run(node: Any, *args, **kwargs) -> Any:
-    ...
-    # (UNCHANGED – keep your existing implementation)
-    ...
+# ------------------------------------------------------------------
+# Safe node invocation helper
+# ------------------------------------------------------------------
+def _try_call_run(node: Any, **kwargs) -> Any:
+    """
+    Safely invoke a node by adapting to its actual run() signature.
+    Guarantees:
+    - Only parameters accepted by the node are passed
+    - Prevents "unexpected keyword argument" errors
+    - Prevents missing required arguments
+    """
+    if node is None:
+        return None
+
+    fn = getattr(node, "run", node)
+    if not callable(fn):
+        raise CustomException(f"Node {node} is not callable", sys)
+
+    try:
+        sig = inspect.signature(fn)
+        accepted = sig.parameters.keys()
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+        return fn(**filtered_kwargs)
+    except TypeError as e:
+        logger.exception("Signature mismatch in %s", node.__class__.__name__)
+        raise CustomException(f"{node.__class__.__name__} signature mismatch: {e}", sys)
+    except Exception as e:
+        logger.exception("Node execution failed: %s", node.__class__.__name__)
+        raise CustomException(f"{node.__class__.__name__} failed: {e}", sys)
 
 
 class GraphBuilder:
     """
-    Orchestrator wiring nodes into a linear flow:
-        context_node -> retrieve_node -> prompt_node -> generate_node ->
-        validate_node -> execute_node -> format_node
+    GraphBuilder
+    ------------
+    Orchestrates the Text-to-SQL pipeline:
+
+        context -> retrieve -> generate -> validate -> execute -> format
+
+    Guarantees:
+    - Nodes are invoked only with parameters they explicitly accept
+    - Schema metadata is always propagated
+    - Failures are returned as structured errors
+    - UI-ready output is always produced via FormatNode
     """
 
     def __init__(
         self,
-        context_node: Any,
-        retrieve_node: Any,
-        prompt_node: Any,
-        generate_node: Any,
-        validate_node: Any,
-        execute_node: Any,
-        format_node: Any,
+        *,
+        tools: Optional[Tools] = None,
+        context_node: Optional[Any] = None,
+        retrieve_node: Optional[Any] = None,
+        generate_node: Optional[Any] = None,
+        validate_node: Optional[Any] = None,
+        execute_node: Optional[Any] = None,
         error_node: Optional[Any] = None,
+        format_node: Optional[FormatNode] = None,
     ):
-        self.context_node = context_node
-        self.retrieve_node = retrieve_node
-        self.prompt_node = prompt_node
-        self.generate_node = generate_node
-        self.validate_node = validate_node
-        self.execute_node = execute_node
-        self.format_node = format_node
-        self.error_node = error_node
-        logger.info("GraphBuilder initialized")
+        self.tools = tools or Tools()
+
+        self.context_node = context_node or ContextNode(self.tools)
+        self.retrieve_node = retrieve_node or RetrieveNode(self.tools)
+        self.generate_node = generate_node or GenerateNode(self.tools, provider_client=self.tools.get_provider_client())
+        self.validate_node = validate_node or ValidateNode(self.tools)
+        self.execute_node = execute_node or ExecuteNode(self.tools)
+        self.error_node = error_node or ErrorNode()
+        self.format_node = format_node or FormatNode(pretty=True)  # 🔥 Always format for UI
+
+        logger.info("GraphBuilder initialized with FormatNode integration")
 
     # ------------------------------------------------------------------
-    # 🔑 NEW: schema normalization
+    # Factory
+    # ------------------------------------------------------------------
+    @classmethod
+    def build_default(cls) -> "GraphBuilder":
+        logger.info("Building default GraphBuilder")
+        try:
+            return cls()
+        except Exception as e:
+            logger.exception("GraphBuilder build failed")
+            raise CustomException(e, sys)
+
+    # ------------------------------------------------------------------
+    # Schema normalization
     # ------------------------------------------------------------------
     def _normalize_schemas(self, schemas: Any) -> Dict[str, Dict[str, Any]]:
-        """
-        Ensure schemas is always a canonical schema map:
-          { canonical_table_name -> metadata dict }
-
-        Accepts:
-          - Dict (already valid)
-          - List[str] (table names)
-        """
         if isinstance(schemas, dict):
             return schemas
 
         if isinstance(schemas, list):
-            # Attempt to resolve via SchemaStore
-            try:
-                from app.schema_store import SchemaStore
-                store = SchemaStore.get_instance()
-            except Exception as e:
-                raise CustomException(
-                    f"SchemaStore unavailable while normalizing schemas: {e}",
-                    sys,
-                )
+            from app.schema_store import SchemaStore
 
+            store = SchemaStore.get_instance()
             resolved: Dict[str, Dict[str, Any]] = {}
             for name in schemas:
                 meta = store.get(name)
                 if meta:
                     resolved[name] = meta
                 else:
-                    logger.warning(
-                        "GraphBuilder: schema '%s' not found in SchemaStore",
-                        name,
-                    )
-
+                    logger.warning("Schema not found: %s", name)
             return resolved
 
-        # Anything else is invalid
-        raise CustomException(
-            f"Invalid schemas type passed through graph: {type(schemas)}",
-            sys,
-        )
+        raise CustomException(f"Invalid schemas type: {type(schemas)}", sys)
 
-    def run(self, user_query: str, csv_names: list, run_query: bool = False) -> Dict[str, Any]:
-        start_all = time.time()
+    # ------------------------------------------------------------------
+    # Main entrypoint
+    # ------------------------------------------------------------------
+    def run(
+        self,
+        user_query: str,
+        schemas: Any,
+        *,
+        run_query: bool = True,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
+
+        start = time.time()
         timings: Dict[str, float] = {}
-
         result: Dict[str, Any] = {
-            "prompt": None,
             "sql": None,
+            "rows": [],
+            "columns": [],
+            "rowcount": 0,
             "valid": False,
-            "execution": None,
-            "formatted": None,
-            "raw": None,
             "error": None,
             "timings": timings,
         }
 
-        ctx_for_error = {"user_query": user_query, "csv_names": csv_names, "timings": timings}
-
         try:
-            # ----------------------------------------------------------
-            # context_node → schemas
-            # ----------------------------------------------------------
+            # 1️⃣ Normalize schemas
             t0 = time.time()
-            try:
-                raw_schemas = _try_call_run(self.context_node, csv_names)
-                schemas = self._normalize_schemas(raw_schemas)
-            except Exception as e:
-                return self._handle_error_node(e, ctx_for_error, step="context")
-            timings["context"] = time.time() - t0
+            schemas = self._normalize_schemas(schemas)
+            timings["schemas"] = time.time() - t0
+            logger.debug("Schemas resolved: %s", list(schemas.keys()))
 
-            logger.debug(
-                "GraphBuilder: normalized schemas keys=%s",
-                list(schemas.keys()),
-            )
-
-            # ----------------------------------------------------------
-            # retrieve_node
-            # ----------------------------------------------------------
+            # 2️⃣ Collect context
             t1 = time.time()
-            try:
-                retrieved = _try_call_run(self.retrieve_node, user_query, schemas)
-                if retrieved is None:
-                    retrieved = []
-            except Exception as e:
-                return self._handle_error_node(e, ctx_for_error, step="retrieve")
-            timings["retrieve"] = time.time() - t1
+            context_map = _try_call_run(self.context_node, csv_names=list(schemas.keys()))
+            timings["context"] = time.time() - t1
 
-            # ----------------------------------------------------------
-            # prompt_node
-            # ----------------------------------------------------------
+            # 3️⃣ Retrieve context
             t2 = time.time()
-            try:
-                prompt_ret = _try_call_run(self.prompt_node, user_query, schemas, retrieved)
-                prompt_text = (
-                    prompt_ret.get("prompt")
-                    if isinstance(prompt_ret, dict)
-                    else str(prompt_ret)
-                )
-                result["prompt"] = prompt_ret
-            except Exception as e:
-                return self._handle_error_node(e, ctx_for_error, step="prompt")
-            timings["prompt"] = time.time() - t2
+            retrieved = _try_call_run(
+                self.retrieve_node,
+                query=user_query,
+                schemas=schemas,
+                top_k=top_k,
+            ) or []
+            timings["retrieve"] = time.time() - t2
 
-            # ----------------------------------------------------------
-            # generate_node
-            # ----------------------------------------------------------
+            # 4️⃣ Generate SQL
             t3 = time.time()
-            try:
-                gen = _try_call_run(self.generate_node, prompt_text, schemas, retrieved)
-            except Exception as e:
-                return self._handle_error_node(e, ctx_for_error, step="generate")
+            gen = _try_call_run(
+                self.generate_node,
+                query=user_query,
+                schemas=schemas,
+                retrieved=retrieved,
+                context_map=context_map,
+            )
             timings["generate"] = time.time() - t3
 
-            raw = gen.get("raw") if isinstance(gen, dict) else gen
             sql = gen.get("sql") if isinstance(gen, dict) else str(gen)
-            result["raw"] = raw
             result["sql"] = sql
 
-            # ----------------------------------------------------------
-            # validate_node
-            # ----------------------------------------------------------
+            # 5️⃣ Validate SQL
             t4 = time.time()
-            try:
-                val = _try_call_run(self.validate_node, sql, schemas)
-            except Exception as e:
-                return self._handle_error_node(e, ctx_for_error, step="validate")
+            val = _try_call_run(self.validate_node, sql=sql, schemas=schemas)
             timings["validate"] = time.time() - t4
 
             if isinstance(val, dict):
-                sql = val.get("sql", sql)
                 result["valid"] = bool(val.get("valid", False))
-                result["sql"] = sql
+                sql = val.get("sql", sql)
             else:
                 result["valid"] = bool(val)
+            result["sql"] = sql
 
-            # ----------------------------------------------------------
-            # execute_node (FIXED: schemas guaranteed valid)
-            # ----------------------------------------------------------
-            execution_result = None
+            # 6️⃣ Execute SQL (read-only)
+            exec_out = {}
             if run_query and result["valid"]:
                 t5 = time.time()
-                try:
-                    execution_result = _try_call_run(self.execute_node, sql, schemas)
-                except Exception as e:
-                    ctx_for_error.update({"sql": sql})
-                    return self._handle_error_node(e, ctx_for_error, step="execute")
+                exec_out = _try_call_run(
+                    self.execute_node,
+                    sql=sql,
+                    table_schemas=schemas,
+                    read_only=True,
+                ) or {}
                 timings["execute"] = time.time() - t5
-                result["execution"] = execution_result
 
-            # ----------------------------------------------------------
-            # format_node
-            # ----------------------------------------------------------
+                result["rows"] = exec_out.get("rows", [])
+                result["columns"] = exec_out.get("columns", [])
+                result["rowcount"] = exec_out.get("rowcount", 0)
+
+            # 7️⃣ Format output for UI
             t6 = time.time()
-            try:
-                formatted = _try_call_run(
-                    self.format_node, sql, schemas, retrieved, execution_result, raw
-                )
-            except Exception as e:
-                return self._handle_error_node(e, ctx_for_error, step="format")
+            formatted = _try_call_run(
+                self.format_node,
+                sql=sql,
+                schemas=schemas,
+                retrieved=retrieved,
+                execution=exec_out,
+                raw=gen,
+            )
             timings["format"] = time.time() - t6
-            result["formatted"] = formatted
 
-            timings["total"] = time.time() - start_all
+            # Merge formatted output into result
+            if isinstance(formatted, dict):
+                result.update(formatted)
+
+            timings["total"] = time.time() - start
             logger.info(
-                "GraphBuilder: run complete valid=%s total=%.3fs",
+                "Graph run complete | valid=%s | total=%.3fs",
                 result["valid"],
                 timings["total"],
             )
+
             return result
 
         except Exception as e:
-            logger.exception("GraphBuilder.run encountered unexpected error")
-            return self._handle_error_node(e, ctx_for_error, step="run")
+            # Use ErrorNode to normalize the exception
+            timings["total"] = time.time() - start
+            try:
+                return self.error_node.run(e, step="graph_run", context={"timings": timings})
+            except Exception:
+                # Fallback minimal payload
+                logger.exception("GraphBuilder.run failed and ErrorNode failed")
+                return {**result, "error": str(e), "timings": timings}

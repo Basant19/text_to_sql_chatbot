@@ -1,5 +1,6 @@
-# app/graph/nodes/retrieve_node.py
+# File: app/graph/nodes/retrieve_node.py
 from __future__ import annotations
+
 import sys
 import logging
 from typing import List, Dict, Any, Optional
@@ -12,8 +13,11 @@ logger = get_logger("retrieve_node")
 LOG = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 def _normalize_result(item: Any) -> Dict[str, Any]:
-    """Normalize a single vector search hit into a dict."""
+    """Normalize a single vector search hit into a consistent dict."""
     try:
         if isinstance(item, dict):
             return {
@@ -25,9 +29,19 @@ def _normalize_result(item: Any) -> Dict[str, Any]:
 
         if isinstance(item, (list, tuple)):
             if len(item) >= 4:
-                return {"id": item[0], "score": item[1], "text": item[2], "meta": item[3]}
+                return {
+                    "id": item[0],
+                    "score": item[1],
+                    "text": item[2],
+                    "meta": item[3],
+                }
             if len(item) == 3:
-                return {"id": item[0], "score": item[1], "text": item[2], "meta": {}}
+                return {
+                    "id": item[0],
+                    "score": item[1],
+                    "text": item[2],
+                    "meta": {},
+                }
 
         return {
             "id": getattr(item, "id", None),
@@ -37,72 +51,99 @@ def _normalize_result(item: Any) -> Dict[str, Any]:
         }
     except Exception:
         LOG.debug("Failed to normalize vector result", exc_info=True)
-        return {"id": None, "score": None, "text": str(item), "meta": {}}
+        return {
+            "id": None,
+            "score": None,
+            "text": str(item),
+            "meta": {},
+        }
 
 
+# ------------------------------------------------------------------
+# Retrieve Node
+# ------------------------------------------------------------------
 class RetrieveNode:
     """
     RetrieveNode
     ------------
     Responsibilities:
-      - Perform vector search (optional)
-      - NEVER destroy schema metadata
-      - Enrich schemas with retrieved context when available
-      - Pass schemas through unchanged if vector search is disabled
+      - Perform optional vector search for schema/context grounding
+      - NEVER mutate or drop schema metadata
+      - Fully keyword-callable for GraphBuilder / LangGraph
     """
 
     def __init__(self, tools: Optional[Tools] = None, vector_client: Optional[Any] = None):
         try:
             self._tools = tools or Tools()
+            # Prefer explicit vector client, otherwise use Tools-provided one
             self._vector_client = vector_client or getattr(self._tools, "_vector_search", None)
         except Exception as e:
             logger.exception("RetrieveNode initialization failed")
             raise CustomException(e, sys)
 
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
     def run(
         self,
-        query: str,
-        schemas: Dict[str, Dict[str, Any]],
+        *,
+        query: Optional[str] = None,
+        schemas: Optional[Dict[str, Dict[str, Any]]] = None,
         top_k: int = 5,
     ) -> List[Dict[str, Any]]:
         """
+        Keyword-only execution method.
+
         Parameters
         ----------
         query : str
-            User query
+            User natural-language query
         schemas : dict
-            Canonical schema map (MUST NOT be lost)
+            Canonical schema map (must not be lost)
         top_k : int
-            Number of vector results
+            Number of vector search results
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            List of normalized context chunks
         """
 
+        # ------------------------------
+        # Defensive validation
+        # ------------------------------
         if not query:
+            LOG.warning("RetrieveNode called without query; skipping retrieval")
             return []
 
-        if not isinstance(schemas, dict):
+        if not schemas or not isinstance(schemas, dict):
             LOG.warning(
-                "RetrieveNode received non-dict schemas (%s); skipping enrichment",
+                "RetrieveNode received invalid schemas (%s); skipping enrichment",
                 type(schemas),
             )
             return []
 
         # --------------------------------------------------------------
-        # If no vector search client → DO NOT break schema propagation
+        # Vector search disabled → do NOT break the pipeline
         # --------------------------------------------------------------
         client = self._vector_client
         if not client:
-            LOG.info("RetrieveNode: vector search disabled; passing schemas through")
+            LOG.info("RetrieveNode: vector search disabled; no context retrieved")
             return []
 
-        # Normalize top_k
+        # --------------------------------------------------------------
+        # Sanitize top_k
+        # --------------------------------------------------------------
         try:
             top_k = int(top_k)
             top_k = min(max(top_k, 1), 50)
         except Exception:
             top_k = 5
 
+        # --------------------------------------------------------------
+        # Execute vector search
+        # --------------------------------------------------------------
         results: List[Any] = []
-
         try:
             if hasattr(client, "search"):
                 results = client.search(query, top_k=top_k)
@@ -117,9 +158,10 @@ class RetrieveNode:
             LOG.exception("RetrieveNode vector search failed: %s", e)
             return []
 
-        normalized: List[Dict[str, Any]] = []
-        for it in list(results)[:top_k]:
-            normalized.append(_normalize_result(it))
+        # --------------------------------------------------------------
+        # Normalize results
+        # --------------------------------------------------------------
+        normalized: List[Dict[str, Any]] = [_normalize_result(it) for it in list(results)[:top_k]]
 
         LOG.info(
             "RetrieveNode: retrieved %d context chunks (top_k=%d)",

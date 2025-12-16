@@ -1,11 +1,10 @@
-# app/database.py
 from __future__ import annotations
 
 import os
 import sys
 import time
 import re
-from typing import List, Tuple, Any, Dict, Optional, Union
+from typing import List, Tuple, Any, Dict, Optional
 
 import duckdb
 
@@ -18,13 +17,13 @@ logger = get_logger("database")
 # ============================================================
 # Module-level DuckDB connection cache
 # ============================================================
-_conn: Optional[duckdb.DuckDBPyConnection] = None
+_CONN: Optional[duckdb.DuckDBPyConnection] = None
 
 
 # ============================================================
-# Identifier sanitization (🔥 CRITICAL FIX)
+# Identifier sanitization (CRITICAL)
 # ============================================================
-def sanitize_table_name(canonical_name: str) -> str:
+def _sanitize_table_name(canonical_name: str) -> str:
     """
     Convert canonical table name → valid DuckDB identifier.
 
@@ -33,12 +32,6 @@ def sanitize_table_name(canonical_name: str) -> str:
     - lowercased
     - cannot start with digit → prefix with `t_`
     - empty names become `t_table`
-
-    Examples
-    --------
-    "2023_sales"   -> "t_2023_sales"
-    "Sales Data"   -> "sales_data"
-    "1-table.csv"  -> "t_1_table_csv"
     """
     if not isinstance(canonical_name, str) or not canonical_name.strip():
         return "t_table"
@@ -57,78 +50,40 @@ def sanitize_table_name(canonical_name: str) -> str:
 
 
 # ============================================================
-# SQL normalization helpers
-# ============================================================
-def _normalize_sql_variants(sql: str) -> List[Tuple[str, str]]:
-    """
-    DuckDB is picky about quoting.
-    Try multiple variants safely.
-    """
-    variants = [("original", sql)]
-
-    if "`" in sql:
-        variants.append(("backticks_to_double", sql.replace("`", '"')))
-
-    stripped = re.sub(r"[`\"]", "", sql)
-    if stripped != sql:
-        variants.append(("remove_quotes", stripped))
-
-    return variants
-
-
-_TABLE_REF_RE = re.compile(
-    r"\b(?:FROM|JOIN)\s+([A-Za-z0-9_`\"]+)",
-    flags=re.IGNORECASE,
-)
-
-
-def _extract_table_refs(sql: str) -> List[str]:
-    """Extract raw table references from SQL."""
-    tables: List[str] = []
-    for m in _TABLE_REF_RE.finditer(sql):
-        raw = m.group(1)
-        if raw:
-            tables.append(raw.strip("`\""))
-    return list(dict.fromkeys(tables))
-
-
-def _duckdb_has_table(con: duckdb.DuckDBPyConnection, table: str) -> bool:
-    rows = con.execute("SHOW TABLES").fetchall()
-    return table.lower() in {r[0].lower() for r in rows}
-
-
-# ============================================================
 # Connection management
 # ============================================================
 def get_connection() -> duckdb.DuckDBPyConnection:
-    global _conn
+    global _CONN
+
     try:
-        db_path = getattr(config, "DATABASE_PATH", None) or os.path.join(
-            os.getcwd(), "data", "text_to_sql.duckdb"
-        )
+        db_path = getattr(config, "DATABASE_PATH", None)
+        if not db_path:
+            db_path = os.path.join(os.getcwd(), "data", "text_to_sql.duckdb")
+
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-        if _conn is None:
+        if _CONN is None:
             logger.info("Opening DuckDB connection: %s", db_path)
-            _conn = duckdb.connect(database=db_path, read_only=False)
+            _CONN = duckdb.connect(database=db_path, read_only=False)
 
-        return _conn
+        return _CONN
+
     except Exception as e:
-        logger.exception("DuckDB connection failed")
+        logger.exception("Failed to open DuckDB connection")
         raise CustomException(e, sys)
 
 
 def close_connection() -> None:
-    global _conn
-    if _conn:
+    global _CONN
+    if _CONN:
         try:
-            _conn.close()
+            _CONN.close()
         finally:
-            _conn = None
+            _CONN = None
 
 
 # ============================================================
-# SQL Safety
+# SQL Safety (last line of defense)
 # ============================================================
 _DISALLOWED = (
     "DROP",
@@ -145,19 +100,49 @@ _DISALLOWED = (
     "CALL",
     "EXECUTE",
     "CREATE",
+    "MERGE",
+    "REPLACE",
 )
 
 
-def _is_safe_sql(sql: str) -> Tuple[bool, Optional[str]]:
+def _validate_read_only_sql(sql: str) -> None:
     upper = sql.upper()
     for kw in _DISALLOWED:
-        if kw in upper:
-            return False, kw
-    return True, None
+        if re.search(rf"\b{kw}\b", upper):
+            raise PermissionError(f"Blocked SQL keyword: {kw}")
 
 
 # ============================================================
-# CSV loading (🔥 FIXED)
+# DuckDB helpers
+# ============================================================
+def _duckdb_has_table(
+    con: duckdb.DuckDBPyConnection,
+    physical_name: str,
+) -> bool:
+    rows = con.execute("SHOW TABLES").fetchall()
+    return physical_name.lower() in {r[0].lower() for r in rows}
+
+
+_TABLE_REF_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z0-9_\"`]+)",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_table_refs(sql: str) -> List[str]:
+    """
+    Extract raw (canonical) table references from SQL.
+    """
+    found: List[str] = []
+    for m in _TABLE_REF_RE.finditer(sql):
+        raw = m.group(1)
+        if raw:
+            found.append(raw.strip("`\""))
+    return list(dict.fromkeys(found))
+
+
+# ============================================================
+# CSV loading (STABLE + IDEMPOTENT)
 # ============================================================
 def load_csv_table(
     csv_path: str,
@@ -166,7 +151,7 @@ def load_csv_table(
     force_reload: bool = False,
 ) -> str:
     """
-    Load CSV into DuckDB using a sanitized physical name.
+    Load CSV into DuckDB as a VIEW using a sanitized physical name.
 
     Returns
     -------
@@ -178,10 +163,10 @@ def load_csv_table(
             raise FileNotFoundError(csv_path)
 
         con = get_connection()
-        physical_name = sanitize_table_name(canonical_name)
+        physical_name = _sanitize_table_name(canonical_name)
 
         if _duckdb_has_table(con, physical_name) and not force_reload:
-            logger.info("Table %s already exists", physical_name)
+            logger.debug("DuckDB table already exists: %s", physical_name)
             return physical_name
 
         safe_path = csv_path.replace("'", "''")
@@ -191,9 +176,9 @@ def load_csv_table(
         SELECT *
         FROM read_csv_auto(
             '{safe_path}',
-            all_varchar=true,
-            null_padding=true,
-            ignore_errors=true
+            all_varchar = true,
+            null_padding = true,
+            ignore_errors = true
         )
         """
 
@@ -203,7 +188,7 @@ def load_csv_table(
         return physical_name
 
     except Exception as e:
-        logger.exception("CSV load failed")
+        logger.exception("Failed to load CSV")
         raise CustomException(e, sys)
 
 
@@ -213,10 +198,18 @@ def ensure_tables_loaded(
     force_reload: bool = False,
 ) -> Dict[str, str]:
     """
+    Ensure all canonical tables are loaded.
+
+    Input
+    -----
     canonical_name -> csv_path
-    returns canonical_name -> physical_table_name
+
+    Output
+    ------
+    canonical_name -> physical_table_name
     """
     resolved: Dict[str, str] = {}
+
     for canonical, path in table_map.items():
         physical = load_csv_table(
             path,
@@ -224,65 +217,54 @@ def ensure_tables_loaded(
             force_reload=force_reload,
         )
         resolved[canonical] = physical
+
     return resolved
 
 
 # ============================================================
-# Query execution
+# Query execution (FINAL EXECUTION LAYER)
 # ============================================================
 def execute_query(
     sql: str,
     *,
-    table_map: Optional[Dict[str, str]] = None,
     read_only: bool = True,
     as_dataframe: bool = False,
 ) -> Tuple[Any, List[str], Dict[str, Any]]:
     """
-    Execute SQL safely with automatic CSV loading.
+    Execute SQL against DuckDB.
+
+    Assumes:
+    - canonical → physical rewrite already happened
+    - required tables already loaded
     """
     start = time.time()
 
     try:
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError("SQL must be a non-empty string")
+
         if read_only:
-            safe, bad = _is_safe_sql(sql)
-            if not safe:
-                raise PermissionError(f"Blocked keyword: {bad}")
+            _validate_read_only_sql(sql)
 
         con = get_connection()
+        cur = con.execute(sql)
 
-        # Auto-load referenced tables
-        if table_map:
-            referenced = _extract_table_refs(sql)
-            to_load = {t: table_map[t] for t in referenced if t in table_map}
-            ensure_tables_loaded(to_load)
+        rows = cur.fetchall()
+        columns = [c[0] for c in cur.description] if cur.description else []
 
-        last_exc = None
+        meta = {
+            "rowcount": len(rows),
+            "runtime": round(time.time() - start, 4),
+        }
 
-        for label, variant in _normalize_sql_variants(sql):
-            try:
-                logger.debug("Executing SQL variant=%s", label)
-                cur = con.execute(variant)
-                rows = cur.fetchall()
-                columns = [c[0] for c in cur.description] if cur.description else []
+        if as_dataframe:
+            import pandas as pd
+            return pd.DataFrame(rows, columns=columns), columns, meta
 
-                meta = {
-                    "rowcount": len(rows),
-                    "runtime": time.time() - start,
-                }
-
-                if as_dataframe:
-                    import pandas as pd
-                    return pd.DataFrame(rows, columns=columns), columns, meta
-
-                return rows, columns, meta
-
-            except Exception as e:
-                last_exc = e
-
-        raise RuntimeError(f"All SQL variants failed: {last_exc}")
+        return rows, columns, meta
 
     except Exception as e:
-        logger.exception("Query execution failed")
+        logger.exception("DuckDB query execution failed")
         raise CustomException(e, sys)
 
 
@@ -291,7 +273,7 @@ def execute_query(
 # ============================================================
 def table_exists(canonical_name: str) -> bool:
     con = get_connection()
-    return _duckdb_has_table(con, sanitize_table_name(canonical_name))
+    return _duckdb_has_table(con, _sanitize_table_name(canonical_name))
 
 
 def list_tables() -> List[str]:
