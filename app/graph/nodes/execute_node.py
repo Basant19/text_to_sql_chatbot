@@ -4,8 +4,8 @@ from __future__ import annotations
 import sys
 import time
 import re
-import logging
 import os
+import logging
 from typing import Dict, Any, Optional
 
 from app.logger import get_logger
@@ -16,51 +16,84 @@ logger = get_logger("execute_node")
 LOG = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
-# Read-only SQL safety patterns
+# Mutating SQL keywords (STATEMENTS, not functions)
 # ------------------------------------------------------------------
-_READONLY_DISALLOWED = [
-    r"\bDROP\b",
-    r"\bDELETE\b",
-    r"\bUPDATE\b",
-    r"\bINSERT\b",
-    r"\bALTER\b",
-    r"\bTRUNCATE\b",
-    r"\bCREATE\b",
-    r"\bATTACH\b",
-    r"\bDETACH\b",
-    r"\bREPLACE\b",
-    r"\bMERGE\b",
-]
+_MUTATING_KEYWORDS = {
+    "DROP",
+    "DELETE",
+    "UPDATE",
+    "INSERT",
+    "ALTER",
+    "TRUNCATE",
+    "CREATE",
+    "MERGE",
+    "CALL",
+    "EXEC",
+    "EXECUTE",
+    "VACUUM",
+    "ATTACH",
+    "DETACH",
+    "PRAGMA",
+    "COPY",
+}
+
+_ALLOWED_START = {"SELECT", "WITH", "EXPLAIN"}
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
-def _sanitize_sql(sql: str) -> str:
+def _normalize_sql(sql: str) -> str:
     """
-    Normalize SQL safely:
-      - strip whitespace
-      - remove trailing semicolons
-      - collapse repeated spaces
+    Normalize SQL safely (no semantic changes).
     """
     sql = (sql or "").strip()
-    sql = re.sub(r";+\s*$", "", sql)
-    sql = re.sub(r"\s+", " ", sql)
+    sql = re.sub(r";+\s*$", "", sql)     # trailing semicolons
+    sql = re.sub(r"\s+", " ", sql)       # collapse whitespace
     return sql
 
 
-def _is_read_only_sql(sql: str) -> bool:
+def _first_keyword(sql: str) -> Optional[str]:
     """
-    Return True if SQL is read-only and safe to execute.
+    Extract the first SQL keyword.
+    """
+    match = re.match(r"^\s*([A-Z]+)", sql, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else None
+
+
+def _contains_mutation(sql: str) -> bool:
+    """
+    Detect mutating SQL statements safely.
+
+    Notes:
+    - Token-based
+    - Ignores string literals
+    - Does NOT block REPLACE() function
+    """
+    # Remove quoted strings to avoid false positives
+    scrubbed = re.sub(r"'[^']*'|\"[^\"]*\"", "", sql)
+
+    tokens = re.findall(r"\b[A-Z_]+\b", scrubbed.upper())
+
+    for tok in tokens:
+        if tok in _MUTATING_KEYWORDS:
+            return True
+
+    return False
+
+
+def _is_read_only(sql: str) -> bool:
+    """
+    Final read-only gate.
     """
     if not sql:
         return False
 
-    if not re.match(r"^\s*(SELECT|WITH)\b", sql, flags=re.IGNORECASE):
+    first = _first_keyword(sql)
+    if first not in _ALLOWED_START:
         return False
 
-    for patt in _READONLY_DISALLOWED:
-        if re.search(patt, sql, flags=re.IGNORECASE):
-            return False
+    if _contains_mutation(sql):
+        return False
 
     return True
 
@@ -71,27 +104,34 @@ def _is_read_only_sql(sql: str) -> bool:
 class ExecuteNode:
     """
     ExecuteNode
-    -----------
+    ===========
 
-    Responsibilities:
-      - Enforce strict read-only SQL execution
-      - Resolve canonical table names → CSV paths
-      - Execute SQL via Tools.execute_sql
-      - Return normalized execution payload for Graph/FormatNode
+    Final execution authority.
+
+    Enforces:
+      - Read-only SQL
+      - CSV-backed execution
+      - Single execution path (Tools)
+
+    NEVER:
+      - Generates SQL
+      - Mutates data
+      - Silently modifies queries
     """
 
     def __init__(
         self,
         tools: Optional[Tools] = None,
+        *,
         default_limit: Optional[int] = None,
     ):
         try:
-            self._tools = tools or Tools()
-            self._default_limit = default_limit
+            self.tools = tools or Tools()
+            self.default_limit = default_limit
 
             LOG.info(
                 "ExecuteNode initialized | default_limit=%s",
-                self._default_limit,
+                self.default_limit,
             )
 
         except Exception as e:
@@ -99,7 +139,7 @@ class ExecuteNode:
             raise CustomException(e, sys)
 
     # ------------------------------------------------------------------
-    # Run (Graph-safe, keyword-only)
+    # Graph entrypoint
     # ------------------------------------------------------------------
     def run(
         self,
@@ -111,70 +151,88 @@ class ExecuteNode:
         as_dataframe: bool = False,
     ) -> Dict[str, Any]:
         """
-        Execute validated SQL safely.
+        Execute SQL safely.
 
-        Returns:
-          {
-            "rows": list | DataFrame,
+        Return contract:
+        {
+            "valid": bool,
+            "sql": str,
+            "rows": list,
             "columns": list,
             "rowcount": int,
+            "error": Optional[str],
             "meta": dict
-          }
+        }
         """
+        start_time = time.time()
 
-        # --------------------------------------------------------------
-        # Guard: SQL presence
-        # --------------------------------------------------------------
         if not sql or not isinstance(sql, str):
-            LOG.warning("ExecuteNode.run called with empty or invalid SQL")
+            LOG.warning("ExecuteNode called with empty SQL")
             return {
+                "valid": False,
+                "sql": "",
                 "rows": [],
                 "columns": [],
                 "rowcount": 0,
-                "meta": {"reason": "empty_sql"},
+                "error": "empty_sql",
+                "meta": {},
             }
 
-        sql = _sanitize_sql(sql)
+        sql = _normalize_sql(sql)
 
-        # --------------------------------------------------------------
-        # Enforce read-only SQL
-        # --------------------------------------------------------------
-        if read_only and not _is_read_only_sql(sql):
-            LOG.error("Blocked non read-only SQL execution: %s", sql)
-            raise CustomException("Blocked non read-only SQL", sys)
+        LOG.info("ExecuteNode received SQL: %s", sql)
 
-        effective_limit = limit if limit is not None else self._default_limit
+        # --------------------------------------------------
+        # Hard safety gate (executor-level)
+        # --------------------------------------------------
+        if read_only and not _is_read_only(sql):
+            LOG.error("Blocked non-read-only SQL: %s", sql)
+            return {
+                "valid": False,
+                "sql": sql,
+                "rows": [],
+                "columns": [],
+                "rowcount": 0,
+                "error": "non_read_only_sql",
+                "meta": {
+                    "reason": "mutating_or_invalid_statement",
+                },
+            }
 
-        # --------------------------------------------------------------
-        # Build table_map: canonical_name → absolute csv_path
-        # --------------------------------------------------------------
+        effective_limit = limit if limit is not None else self.default_limit
+
+        # --------------------------------------------------
+        # Resolve table → CSV paths
+        # --------------------------------------------------
         table_map: Dict[str, str] = {}
+
         if table_schemas:
-            for canonical, meta in table_schemas.items():
+            for table, meta in table_schemas.items():
                 if not isinstance(meta, dict):
                     continue
+
                 path = meta.get("path") or meta.get("csv_path")
                 if not path:
                     continue
+
                 abs_path = os.path.abspath(path)
                 if not os.path.exists(abs_path):
                     LOG.warning(
-                        "CSV path missing for table '%s': %s",
-                        canonical,
+                        "Missing CSV for table '%s': %s",
+                        table,
                         abs_path,
                     )
                     continue
-                table_map[canonical] = abs_path
 
-        LOG.debug("ExecuteNode resolved table_map: %s", table_map)
+                table_map[table] = abs_path
 
-        # --------------------------------------------------------------
-        # Execute SQL via Tools
-        # --------------------------------------------------------------
-        start_time = time.time()
+        LOG.debug("Resolved table_map=%s", table_map)
 
+        # --------------------------------------------------
+        # Execute (single authority)
+        # --------------------------------------------------
         try:
-            result = self._tools.execute_sql(
+            result = self.tools.execute_sql(
                 sql=sql,
                 table_map=table_map or None,
                 read_only=read_only,
@@ -182,22 +240,15 @@ class ExecuteNode:
                 as_dataframe=as_dataframe,
             )
 
-            runtime = time.time() - start_time
+            rows = result.get("rows", []) or []
+            columns = result.get("columns", []) or []
+            meta = result.get("meta", {}) or {}
 
-            # ----------------------------------------------------------
-            # Normalize executor output
-            # ----------------------------------------------------------
-            rows = result.get("rows", []) if isinstance(result, dict) else []
-            columns = result.get("columns", []) if isinstance(result, dict) else []
-            rowcount = result.get(
-                "rowcount",
-                len(rows) if isinstance(rows, list) else None,
-            )
+            runtime = round(time.time() - start_time, 4)
 
-            meta = result.get("meta", {}) if isinstance(result, dict) else {}
             meta.update(
                 {
-                    "runtime_sec": round(runtime, 4),
+                    "runtime_sec": runtime,
                     "read_only": read_only,
                     "limit": effective_limit,
                     "tables_used": list(table_map.keys()),
@@ -205,20 +256,41 @@ class ExecuteNode:
             )
 
             LOG.info(
-                "ExecuteNode success | rows=%s | time=%.3fs",
-                rowcount,
+                "ExecuteNode success | rows=%d | time=%.3fs",
+                len(rows),
                 runtime,
             )
 
             return {
+                "valid": True,
+                "sql": sql,
                 "rows": rows,
                 "columns": columns,
-                "rowcount": rowcount,
+                "rowcount": meta.get("rowcount", len(rows)),
+                "error": None,
                 "meta": meta,
             }
 
-        except CustomException:
-            raise
+        except CustomException as ce:
+            LOG.exception("SQL execution failed")
+            return {
+                "valid": False,
+                "sql": sql,
+                "rows": [],
+                "columns": [],
+                "rowcount": 0,
+                "error": str(ce),
+                "meta": {},
+            }
+
         except Exception as e:
-            LOG.exception("ExecuteNode.run failed")
-            raise CustomException(e, sys)
+            LOG.exception("Unexpected executor failure")
+            return {
+                "valid": False,
+                "sql": sql,
+                "rows": [],
+                "columns": [],
+                "rowcount": 0,
+                "error": str(e),
+                "meta": {},
+            }

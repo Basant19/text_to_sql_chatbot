@@ -7,27 +7,18 @@ from typing import List, Dict, Any, Optional
 
 from app.logger import get_logger
 from app.exception import CustomException
-from app import schema_store, sql_executor, config
+from app.schema_store import SchemaStore
+from app import sql_executor, config
 from app.langsmith_client import LangSmithClient
 from app.utils import build_prompt
 
-# Optional VectorSearch singleton
+logger = get_logger("llm_flow")
+
+# Optional VectorSearch
 try:
     from app.vector_search import get_instance as get_vector_search_instance
 except Exception:
     get_vector_search_instance = None  # type: ignore
-
-# Optional embedding provider
-_EMBEDDING_FN_PROVIDER = None
-try:
-    from app import tools
-
-    if hasattr(tools, "get_embedding_fn"):
-        _EMBEDDING_FN_PROVIDER = tools.get_embedding_fn
-    elif hasattr(tools, "embedding_fn"):
-        _EMBEDDING_FN_PROVIDER = lambda: tools.embedding_fn
-except Exception:
-    _EMBEDDING_FN_PROVIDER = None
 
 # Optional LangGraph agent
 try:
@@ -35,231 +26,244 @@ try:
 except Exception:
     LangGraphAgent = None  # type: ignore
 
-logger = get_logger("llm_flow")
+
+# ============================================================
+# Intent Routing
+# ============================================================
+def route_intent(user_input: str) -> str:
+    """
+    Decide how to route user input.
+
+    Returns
+    -------
+    str
+        One of: "sql", "chat"
+
+    Heuristics
+    ----------
+    - Mentions of tables, columns, data → SQL
+    - "summarize", "explain", "describe" → RAG / chat
+    - Default → chat
+    """
+    if not user_input:
+        return "chat"
+
+    text = user_input.lower()
+
+    sql_signals = [
+        "select",
+        "count",
+        "average",
+        "sum",
+        "group by",
+        "order by",
+        "from ",
+        "join ",
+        "table",
+        "column",
+        "rows",
+    ]
+
+    if any(sig in text for sig in sql_signals):
+        return "sql"
+
+    return "chat"
 
 
-# ------------------------------------------------------------------
-# VectorSearch bootstrap (safe)
-# ------------------------------------------------------------------
+# ============================================================
+# VectorSearch bootstrap (lazy & safe)
+# ============================================================
 def _init_vector_search():
+    """
+    Lazily initialize VectorSearch.
+
+    This function:
+    - MUST NOT raise
+    - MUST NOT mutate global state
+    """
     if get_vector_search_instance is None:
-        logger.info("VectorSearch not available")
+        logger.debug("VectorSearch not available")
         return None
 
     try:
-        embedding_fn = None
-        if _EMBEDDING_FN_PROVIDER:
-            ef = _EMBEDDING_FN_PROVIDER()
-            if callable(ef):
-                embedding_fn = ef
-
-        dim = getattr(
-            __import__("app.tools", fromlist=[""]), "EMBEDDING_DIM", None
+        return get_vector_search_instance(
+            index_path=getattr(
+                config,
+                "FAISS_INDEX_PATH",
+                "./faiss/index.faiss",
+            )
         )
-
-        kwargs = {
-            "embedding_fn": embedding_fn,
-            "index_path": getattr(config, "FAISS_INDEX_PATH", "./faiss/index.faiss"),
-        }
-        if dim:
-            kwargs["dim"] = dim
-
-        return get_vector_search_instance(**kwargs)
-
     except Exception:
         logger.exception("VectorSearch initialization failed")
         return None
 
 
-# ------------------------------------------------------------------
-# Main entrypoint
-# ------------------------------------------------------------------
-def generate_sql_from_query(
-    user_query: str,
-    csv_names: List[str],
+# ============================================================
+# MAIN ENTRYPOINT
+# ============================================================
+def handle_user_query(
+    *,
+    user_input: str,
+    csv_names: Optional[List[str]] = None,
     run_query: bool = False,
     top_k: int = 5,
     langsmith_client: Optional[LangSmithClient] = None,
     use_langgraph: bool = True,
-    few_shot: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """
-    Orchestrates:
-      - Schema loading
-      - Vector retrieval (RAG)
-      - SQL generation (LangGraph or direct)
-      - Optional execution
+    Unified LLM entrypoint for UI and API.
+
+    This function handles:
+    - SQL generation & execution
+    - Document summarization (RAG)
+    - General chat
+
+    Returns (normalized)
+    --------------------
+    {
+        "route": "sql" | "chat",
+        "sql": Optional[str],
+        "execution": Optional[dict],
+        "text": Optional[str],
+        "error": Optional[str],
+        "meta": dict
+    }
     """
+
     start_time = time.time()
+    route = route_intent(user_input)
+
+    logger.info("Routing user query | route=%s", route)
 
     try:
-        # --------------------------------------------------------------
-        # LangSmith (observability only, never required)
-        # --------------------------------------------------------------
+        # --------------------------------------------------
+        # Provider client (Gemini)
+        # --------------------------------------------------
+        from app.gemini_client import GeminiClient
+
+        gemini = GeminiClient()
+
+        # --------------------------------------------------
+        # LangSmith (optional)
+        # --------------------------------------------------
         try:
             langsmith_client = langsmith_client or LangSmithClient()
         except Exception:
             langsmith_client = None
-            logger.debug("LangSmith disabled")
 
-        # --------------------------------------------------------------
-        # Provider client (Gemini)
-        # --------------------------------------------------------------
-        provider_client = None
-        try:
-            from app.gemini_client import GeminiClient
+        # ==================================================
+        # CHAT / SUMMARIZATION PATH
+        # ==================================================
+        if route == "chat":
+            logger.debug("Handling general chat request")
 
-            api_key = getattr(config, "GEMINI_API_KEY", None) or getattr(
-                config, "GOOGLE_API_KEY", None
-            )
-            provider_client = GeminiClient(api_key=api_key) if api_key else GeminiClient()
-        except Exception:
-            logger.warning("GeminiClient unavailable")
-            provider_client = None
+            response = gemini.chat(user_input)
 
-        # --------------------------------------------------------------
+            return {
+                "route": "chat",
+                "sql": None,
+                "execution": None,
+                "text": response,
+                "error": None,
+                "meta": {
+                    "runtime_sec": round(time.time() - start_time, 4),
+                },
+            }
+
+        # ==================================================
+        # SQL / RAG PATH
+        # ==================================================
+        logger.debug("Handling SQL / RAG request")
+
+        csv_names = csv_names or []
+
         # Load schemas
-        # --------------------------------------------------------------
-        ss = schema_store.SchemaStore()
-        schemas_map: Dict[str, Dict[str, Any]] = {}
+        ss = SchemaStore.get_instance()
+        schemas: Dict[str, Dict[str, Any]] = {}
 
-        for name in csv_names or []:
-            schemas_map[name] = {
+        for name in csv_names:
+            schemas[name] = {
                 "columns": ss.get_schema(name) or [],
                 "sample_rows": ss.get_sample_rows(name) or [],
             }
 
-        if not schemas_map:
+        if not schemas:
             return {
-                "prompt": "",
-                "sql": "",
-                "valid": False,
+                "route": "sql",
+                "sql": None,
                 "execution": None,
+                "text": None,
                 "error": "No schemas available",
-                "raw": None,
+                "meta": {},
             }
 
-        # --------------------------------------------------------------
-        # Vector retrieval (RAG)
-        # --------------------------------------------------------------
+        # Vector retrieval (optional)
         retrieved_docs: List[Dict[str, Any]] = []
-        try:
-            vs = _init_vector_search()
-            if vs:
-                retrieved_docs = vs.search(user_query, top_k=top_k) or []
-        except Exception:
-            logger.exception("Vector search failed")
+        vs = _init_vector_search()
+        if vs:
+            try:
+                retrieved_docs = vs.search(user_input, top_k=top_k) or []
+            except Exception:
+                logger.exception("Vector search failed")
 
-        # --------------------------------------------------------------
-        # Prompt construction
-        # --------------------------------------------------------------
-        prompt_text = build_prompt(
-            user_query=user_query,
-            schemas=schemas_map,
+        # Build prompt
+        prompt = build_prompt(
+            user_query=user_input,
+            schemas=schemas,
             retrieved=retrieved_docs,
-            few_shot=few_shot,
         )
 
-        # --------------------------------------------------------------
-        # Trace start
-        # --------------------------------------------------------------
-        if langsmith_client:
-            try:
-                langsmith_client.trace_run(
-                    name="llm_flow.start",
-                    prompt=prompt_text,
-                    sql=None,
-                    metadata={"use_langgraph": use_langgraph},
-                )
-            except Exception:
-                pass
-
-        # --------------------------------------------------------------
-        # SQL generation
-        # --------------------------------------------------------------
+        # LangGraph preferred
         sql = ""
-        raw_response: Any = None
+        raw = None
 
-        try:
-            if use_langgraph and LangGraphAgent:
-                agent = LangGraphAgent(
-                    schema_map=schemas_map,
-                    retrieved_docs=retrieved_docs,
-                    few_shot=few_shot,
-                    provider_client=provider_client,
-                    langsmith_client=langsmith_client,
-                )
-                out = agent.run(user_query)
-
-                if isinstance(out, dict):
-                    sql = out.get("sql", "")
-                    raw_response = out
-                else:
-                    sql = str(out).strip()
-                    raw_response = out
-
+        if use_langgraph and LangGraphAgent:
+            agent = LangGraphAgent(
+                schema_map=schemas,
+                retrieved_docs=retrieved_docs,
+                provider_client=gemini,
+                langsmith_client=langsmith_client,
+            )
+            out = agent.run(user_input)
+            if isinstance(out, dict):
+                sql = (out.get("sql") or "").strip()
+                raw = out
             else:
-                if provider_client and hasattr(provider_client, "generate"):
-                    raw_response = provider_client.generate(
-                        prompt_text,
-                        model=getattr(config, "GEMINI_MODEL", "gemini-2.5-flash"),
-                        max_tokens=512,
-                    )
-                else:
-                    raw_response = {"text": ""}
+                sql = str(out).strip()
+                raw = out
+        else:
+            raw = gemini.generate(prompt)
+            sql = str(raw).strip()
 
-                if isinstance(raw_response, dict):
-                    sql = (raw_response.get("text") or "").strip()
-                else:
-                    sql = str(raw_response).strip()
-
-        except Exception as e:
-            logger.exception("SQL generation failed")
-            raw_response = {"error": str(e)}
-            sql = ""
-
-        # --------------------------------------------------------------
-        # Final trace
-        # --------------------------------------------------------------
-        if langsmith_client:
-            try:
-                langsmith_client.trace_run(
-                    name="llm_flow.complete",
-                    prompt=prompt_text,
-                    sql=sql or None,
-                )
-            except Exception:
-                pass
-
-        # --------------------------------------------------------------
-        # Validate & execute
-        # --------------------------------------------------------------
-        valid = bool(sql)
         execution = None
         error = None
 
-        if run_query and valid:
+        if run_query and sql:
             try:
                 execution = sql_executor.execute_sql(
-                    sql, read_only=True, limit=100
+                    sql,
+                    read_only=True,
+                    limit=100,
                 )
-            except CustomException as ce:
-                valid = False
-                error = str(ce)
+            except Exception as e:
+                error = str(e)
 
         logger.info(
-            "llm_flow finished in %.3fs (valid=%s)",
+            "llm_flow completed | route=sql | valid=%s | time=%.3fs",
+            bool(sql),
             time.time() - start_time,
-            valid,
         )
 
         return {
-            "prompt": prompt_text,
+            "route": "sql",
             "sql": sql,
-            "valid": valid,
             "execution": execution,
+            "text": None,
             "error": error,
-            "raw": raw_response,
+            "meta": {
+                "retrieved_docs": len(retrieved_docs),
+                "runtime_sec": round(time.time() - start_time, 4),
+            },
         }
 
     except Exception as e:

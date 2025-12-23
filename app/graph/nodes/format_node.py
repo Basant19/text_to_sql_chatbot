@@ -1,3 +1,6 @@
+# File: app/graph/nodes/format_node.py
+from __future__ import annotations
+
 import sys
 import json
 from typing import Any, Dict, List, Optional, Union
@@ -10,52 +13,97 @@ logger = get_logger("format_node")
 __all__ = ["FormatNode", "FormatAdapter"]
 
 
-def _safe_json_dumps(obj: Any, max_len: int = 500) -> str:
-    """Safely stringify objects with length limit."""
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def _safe_json(obj: Any, max_len: int = 800) -> str:
+    """
+    Safely stringify objects with truncation.
+
+    Guarantees:
+      - NEVER raises
+      - ALWAYS returns a string
+    """
     try:
-        s = json.dumps(obj, default=str, ensure_ascii=False)
+        text = json.dumps(obj, default=str, ensure_ascii=False)
     except Exception:
         try:
-            s = str(obj)
+            text = str(obj)
         except Exception:
-            s = "<unserializable>"
-    return s if len(s) <= max_len else s[:max_len] + "..."
+            return "<unserializable>"
+
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
 
 
+# ---------------------------------------------------------------------
+# FormatNode
+# ---------------------------------------------------------------------
 class FormatNode:
     """
     FormatNode
-    ----------
-    Final presentation layer for the Text-to-SQL pipeline.
+    ==========
 
-    Responsibilities:
-      - Normalize execution output
-      - Surface validation feedback
-      - Produce human-friendly text output
-      - Remain GraphBuilder-safe (keyword-only run signature)
+    Final presentation node in the graph.
+
+    HARD GUARANTEES
+    ---------------
+    - SQL is ALWAYS preserved
+    - rows are NEVER dropped (always list)
+    - columns are preserved if present
+    - formatted_text is UI-only (no row data)
     """
 
-    def __init__(self, pretty: bool = True):
+    def __init__(self, *, pretty: bool = True):
         self.pretty = bool(pretty)
-        logger.info("FormatNode initialized (pretty=%s)", self.pretty)
+        logger.info("FormatNode initialized | pretty=%s", self.pretty)
 
     # ------------------------------------------------------------------
     # Normalization helpers
     # ------------------------------------------------------------------
     def _normalize_execution(self, execution: Any) -> Dict[str, Any]:
-        """Normalize execution into {rows, rowcount, meta}."""
-        out: Dict[str, Any] = {"rows": None, "rowcount": None, "meta": {}}
+        """
+        Normalize execution output.
+
+        Returns:
+        {
+            "rows": list,
+            "columns": list,
+            "rowcount": int,
+            "meta": dict
+        }
+        """
+        out = {
+            "rows": [],
+            "columns": [],
+            "rowcount": 0,
+            "meta": {},
+        }
 
         if execution is None:
             return out
 
         if isinstance(execution, dict):
-            rows = execution.get("rows") or execution.get("data") or execution.get("results")
+            rows = execution.get("rows") or []
+            columns = execution.get("columns") or []
+
+            if not isinstance(rows, list):
+                rows = []
+
+            if not isinstance(columns, list):
+                columns = []
+
             out["rows"] = rows
-            out["rowcount"] = execution.get("rowcount") or (
-                len(rows) if isinstance(rows, list) else None
-            )
-            out["meta"] = {k: v for k, v in execution.items() if k not in ("rows", "data", "results")}
+            out["columns"] = columns
+            out["rowcount"] = len(rows)
+
+            # Everything else → meta
+            out["meta"] = {
+                k: v
+                for k, v in execution.items()
+                if k not in ("rows", "columns")
+            }
             return out
 
         if isinstance(execution, list):
@@ -63,36 +111,27 @@ class FormatNode:
             out["rowcount"] = len(execution)
             return out
 
-        out["meta"]["raw"] = execution
+        # Unknown type
+        out["meta"]["raw_execution"] = execution
         return out
 
-    def _extract_validation(self, obj: Any) -> Optional[Dict[str, Any]]:
-        """Extract validation payload from arbitrary dicts."""
-        if not isinstance(obj, dict):
+    def _extract_validation(self, source: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(source, dict):
             return None
 
-        candidates = [
-            obj,
-            obj.get("validation") if isinstance(obj.get("validation"), dict) else None,
-            obj.get("formatted") if isinstance(obj.get("formatted"), dict) else None,
-            obj.get("meta") if isinstance(obj.get("meta"), dict) else None,
-        ]
+        v = source.get("validation") if isinstance(source.get("validation"), dict) else source
 
-        for c in candidates:
-            if not isinstance(c, dict):
-                continue
-            if any(k in c for k in ("valid", "errors", "fixes", "suggested_sql", "suggestions")):
-                return {
-                    "valid": c.get("valid"),
-                    "errors": c.get("errors") or [],
-                    "fixes": c.get("fixes") or [],
-                    "suggested_sql": c.get("suggested_sql"),
-                    "suggestions": c.get("suggestions") or {},
-                }
-        return None
+        if not any(k in v for k in ("valid", "errors", "suggested_sql")):
+            return None
+
+        return {
+            "valid": bool(v.get("valid")),
+            "errors": v.get("errors") or [],
+            "suggested_sql": v.get("suggested_sql"),
+        }
 
     # ------------------------------------------------------------------
-    # GraphBuilder-safe entrypoint
+    # Graph entrypoint
     # ------------------------------------------------------------------
     def run(
         self,
@@ -103,27 +142,46 @@ class FormatNode:
         execution: Optional[Union[Dict[str, Any], List[Any]]] = None,
         raw: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        """
+        Final UI-safe output.
+
+        Returns:
+        {
+            "sql": str,
+            "rows": list,
+            "columns": list,
+            "formatted_text": str,
+            "meta": dict
+        }
+        """
         try:
             sql = (sql or "").strip()
             retrieved = retrieved if isinstance(retrieved, list) else []
 
-            payload: Dict[str, Any] = {"sql": sql}
+            payload: Dict[str, Any] = {
+                "sql": sql,
+                "rows": [],
+                "columns": [],
+                "formatted_text": "",
+            }
 
-            # Normalize execution
+            # --------------------------------------------------
+            # Normalize execution (🔥 CRITICAL FIX)
+            # --------------------------------------------------
             exec_norm = self._normalize_execution(execution)
-            rows = exec_norm.get("rows")
-            payload["rows"] = rows
+            payload["rows"] = exec_norm["rows"]
+            payload["columns"] = exec_norm["columns"]
 
-            # -----------------------------
-            # Meta block
-            # -----------------------------
+            # --------------------------------------------------
+            # Meta (debug-only)
+            # --------------------------------------------------
             meta: Dict[str, Any] = {}
 
-            if exec_norm.get("meta"):
+            if exec_norm["meta"]:
                 meta["execution_meta"] = exec_norm["meta"]
 
             validation = None
-            if exec_norm.get("meta"):
+            if exec_norm["meta"]:
                 validation = self._extract_validation(exec_norm["meta"])
             if not validation and raw is not None:
                 validation = self._extract_validation(raw)
@@ -131,74 +189,45 @@ class FormatNode:
             if validation:
                 meta["validation"] = validation
 
-            if raw is not None:
-                meta["raw_summary"] = _safe_json_dumps(raw, max_len=1000)
-
             if retrieved:
                 meta["retrieved_count"] = len(retrieved)
-                meta["retrieved_preview"] = [
-                    _safe_json_dumps(r.get("text") if isinstance(r, dict) else r, max_len=200)
-                    for r in retrieved[:3]
-                ]
 
-            # -----------------------------
-            # Explanation
-            # -----------------------------
-            explain_parts: List[str] = []
+            if raw is not None:
+                meta["raw_summary"] = _safe_json(raw)
+
+            # --------------------------------------------------
+            # Human-readable summary (NO ROW DATA)
+            # --------------------------------------------------
+            lines: List[str] = []
+
+            if sql:
+                lines.append("### 🧾 SQL Query Used")
+                lines.append(f"`{sql}`")
+
+            lines.append(f"### 📊 Rows Returned: {exec_norm['rowcount']}")
+
+            if validation:
+                if validation.get("valid"):
+                    lines.append("### ✅ Validation passed")
+                else:
+                    lines.append("### ❌ Validation failed")
+                    for err in validation.get("errors", []):
+                        lines.append(f"- {err}")
 
             if retrieved:
-                explain_parts.append(f"{len(retrieved)} retrieved document(s) used.")
-            if validation:
-                explain_parts.append(
-                    "Validation passed." if validation.get("valid") else "Validation failed."
-                )
-            if raw is not None:
-                explain_parts.append("Raw LLM output available.")
+                lines.append(f"### 📄 Context used: {len(retrieved)} document(s)")
 
-            if explain_parts:
-                payload["explain"] = " ".join(explain_parts)
-
-            # -----------------------------
-            # Human-readable output
-            # -----------------------------
-            if self.pretty:
-                lines: List[str] = []
-
-                if sql:
-                    lines.append(
-                        f"SQL used: {sql}" if len(sql) <= 240 else f"SQL (truncated): {sql[:240]}..."
-                    )
-
-                if rows is not None:
-                    preview = rows[:3] if isinstance(rows, list) else rows
-                    lines.append(f"Preview rows: {_safe_json_dumps(preview, max_len=400)}")
-                    lines.append(
-                        f"Returned rows: {exec_norm.get('rowcount') or 'unknown'}"
-                    )
-
-                if validation:
-                    if not validation.get("valid"):
-                        lines.append(f"Errors: {', '.join(map(str, validation.get('errors', [])))}")
-                        if validation.get("suggested_sql"):
-                            lines.append("Suggested SQL rewrite available.")
-                    else:
-                        lines.append("Validation: OK")
-
-                if payload.get("explain"):
-                    lines.append(f"Notes: {payload['explain']}")
-
-                payload["output"] = "\n".join(lines)
-            else:
-                payload["output"] = {
-                    "sql": sql,
-                    "rows": rows,
-                    "explain": payload.get("explain"),
-                }
+            payload["formatted_text"] = "\n\n".join(lines)
 
             if meta:
                 payload["meta"] = meta
 
-            logger.info("FormatNode completed (rows=%s)", exec_norm.get("rowcount"))
+            logger.info(
+                "FormatNode completed | sql_len=%d | rowcount=%d",
+                len(sql),
+                exec_norm["rowcount"],
+            )
+
             return payload
 
         except Exception as e:
@@ -206,9 +235,12 @@ class FormatNode:
             raise CustomException(e, sys)
 
 
+# ---------------------------------------------------------------------
+# Adapter (legacy safety)
+# ---------------------------------------------------------------------
 class FormatAdapter:
     """
-    Backward-compatible adapter for legacy pipelines.
+    Backward-compatible adapter.
     """
 
     def __init__(self, fmt_node: FormatNode):

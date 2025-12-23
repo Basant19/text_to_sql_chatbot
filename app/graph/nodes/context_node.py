@@ -1,312 +1,200 @@
-# File: app/graph/nodes/context_node.py
 from __future__ import annotations
+
+"""
+ContextNode
+===========
+
+Purpose
+-------
+ContextNode is the **memory boundary** of the Text-to-SQL system.
+
+It is the ONLY place where:
+- Conversation history is loaded
+- Conversational context is assembled
+- Follow-up SQL continuity is handled
+
+ARCHITECTURAL GUARANTEES
+-----------------------
+- UI NEVER passes history into graph.run()
+- GraphBuilder remains stateless
+- HistoryStore remains the source of truth
+- ContextNode is read-only during run()
+
+This node does NOT:
+- generate SQL
+- validate SQL
+- execute SQL
+
+This node DOES:
+- Load bounded conversation history
+- Expose prompt-safe context to downstream nodes
+- Track last successful SQL for follow-up questions
+"""
+
 import sys
-import os
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from app.logger import get_logger
 from app.exception import CustomException
 from app.tools import Tools
+from app.history_sql import HistoryStore
 
 logger = get_logger("context_node")
 LOG = logging.getLogger(__name__)
 
 
-def _canonical_name_from_input(inp: Optional[str]) -> str:
-    """
-    Derive a stable canonical-like token from an arbitrary input.
-    Accepts file paths, filenames, canonical names. Lowercases and strips extension.
-    """
-    if not inp:
-        return ""
-    try:
-        name = str(inp).strip()
-        name = os.path.basename(name)
-        name = os.path.splitext(name)[0]
-        name = "_".join(name.split()).lower()
-        return name
-    except Exception:
-        return str(inp).strip().lower()
-
-
 class ContextNode:
     """
-    Collect schema context for a list of CSV names.
+    ContextNode
+    -----------
 
-    Returns mapping:
-      canonical_table_key -> {
-          "columns": [...],
-          "sample_rows": [...],
-          "path": <abs path or None>,
-          "canonical": <key>
-      }
+    Lifecycle:
+        UI → HistoryStore → ContextNode → GenerateNode → ...
 
-    Behavior:
-      - Uses Tools.get_schema / Tools.get_sample_rows when available.
-      - Falls back to Tools._schema_store if present.
-      - Normalizes inputs to attempt tolerant lookups.
-      - Does not raise if a schema is missing; returns empty lists for that table.
+    Responsibilities:
+    - Load persisted conversation history
+    - Provide bounded conversational memory
+    - Track last successful SQL (ephemeral, per-session)
     """
 
-    def __init__(self, tools: Optional[Tools] = None, sample_limit: int = 3):
+    def __init__(
+        self,
+        tools: Optional[Tools] = None,
+        *,
+        max_history: int = 5,
+        history_store: Optional[HistoryStore] = None,
+    ):
         try:
-            self._tools = tools or Tools()
-            self._sample_limit = int(sample_limit)
+            self.tools = tools
+            self.max_history = max_history
+
+            # Stateful store (injected here, NEVER via UI)
+            self.history_store = history_store or HistoryStore()
+
+            # Ephemeral execution memory (NOT persisted)
+            self._last_successful_sql: Optional[str] = None
+            self._last_tables: Optional[List[str]] = None
+
+            LOG.info("ContextNode initialized | max_history=%d", max_history)
+
         except Exception as e:
-            logger.exception("Failed to initialize ContextNode")
+            logger.exception("ContextNode initialization failed")
             raise CustomException(e, sys)
 
     # ------------------------------------------------------------------
-    # SchemaStore helper
+    # Graph entrypoint (READ-ONLY)
     # ------------------------------------------------------------------
-    def _schema_store_keys(self) -> List[str]:
-        try:
-            ss = getattr(self._tools, "_schema_store", None)
-            if ss is None:
-                return []
-            for fn in ("list_keys", "list_tables", "get_all_tables", "keys"):
-                if hasattr(ss, fn):
-                    try:
-                        method = getattr(ss, fn)
-                        keys = method() if callable(method) else list(method)
-                        if isinstance(keys, (list, tuple)):
-                            return list(keys)
-                    except Exception:
-                        continue
-            if hasattr(ss, "schemas"):
-                try:
-                    return list(ss.schemas.keys())
-                except Exception:
-                    pass
-        except Exception:
-            LOG.debug("schema_store_keys retrieval failed", exc_info=True)
-        return []
-
-    # ------------------------------------------------------------------
-    # Fetch schema columns
-    # ------------------------------------------------------------------
-    def _try_get_schema(self, name: str) -> Optional[List[str]]:
-        try:
-            if hasattr(self._tools, "get_schema"):
-                cols = self._tools.get_schema(name)
-                if cols is not None:
-                    return list(cols)
-        except Exception:
-            LOG.debug("Tools.get_schema failed for: %s", name, exc_info=True)
-
-        try:
-            ss = getattr(self._tools, "_schema_store", None)
-            if ss is not None:
-                if hasattr(ss, "get_table_canonical"):
-                    can = ss.get_table_canonical(name)
-                    if can:
-                        cols = ss.get_schema(can)
-                        if cols:
-                            return list(cols)
-                cols = ss.get_schema(name)
-                if cols:
-                    return list(cols)
-        except Exception:
-            LOG.debug("Direct schema_store access failed for %s", name, exc_info=True)
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Fetch sample rows
-    # ------------------------------------------------------------------
-    def _try_get_samples(self, name: str) -> Optional[List[Dict[str, Any]]]:
-        try:
-            if hasattr(self._tools, "get_sample_rows"):
-                rows = self._tools.get_sample_rows(name)
-                if rows is not None:
-                    return list(rows)[: self._sample_limit]
-        except Exception:
-            LOG.debug("Tools.get_sample_rows failed for: %s", name, exc_info=True)
-
-        try:
-            ss = getattr(self._tools, "_schema_store", None)
-            if ss is not None:
-                if hasattr(ss, "get_table_canonical"):
-                    can = ss.get_table_canonical(name)
-                    if can:
-                        rows = ss.get_sample_rows(can)
-                        if rows:
-                            return list(rows)[: self._sample_limit]
-                rows = ss.get_sample_rows(name)
-                if rows:
-                    return list(rows)[: self._sample_limit]
-        except Exception:
-            LOG.debug("Direct schema_store sample access failed for %s", name, exc_info=True)
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Fetch CSV path
-    # ------------------------------------------------------------------
-    def _try_get_path_from_store(self, name: str) -> Optional[str]:
-        try:
-            ss = getattr(self._tools, "_schema_store", None)
-            if ss is None:
-                return None
-
-            # Try common getter names
-            for fn in ("get_path", "get_csv_path", "get_file", "get_file_path"):
-                if hasattr(ss, fn):
-                    try:
-                        p = getattr(ss, fn)(name)
-                        if p:
-                            return os.path.abspath(p)
-                    except Exception:
-                        continue
-
-            # Try generic metadata getters
-            for fn in ("get_entry", "get", "get_metadata", "get_schema_entry"):
-                if hasattr(ss, fn):
-                    try:
-                        entry = getattr(ss, fn)(name)
-                        if isinstance(entry, dict):
-                            for key in ("path", "csv_path", "file", "source"):
-                                if entry.get(key):
-                                    return os.path.abspath(entry.get(key))
-                    except Exception:
-                        continue
-
-            # Try dict-like access
-            if hasattr(ss, "schemas"):
-                try:
-                    s = getattr(ss, "schemas")
-                    if isinstance(s, dict) and name in s:
-                        entry = s.get(name)
-                        if isinstance(entry, dict):
-                            for key in ("path", "csv_path", "file", "source"):
-                                if entry.get(key):
-                                    return os.path.abspath(entry.get(key))
-                except Exception:
-                    pass
-
-            # Try canonical mapping
-            try:
-                if hasattr(ss, "get_table_canonical"):
-                    can = ss.get_table_canonical(name)
-                    if can and can != name:
-                        return self._try_get_path_from_store(can)
-            except Exception:
-                pass
-
-        except Exception:
-            LOG.debug("_try_get_path_from_store failed for %s", name, exc_info=True)
-        return None
-
-    # ------------------------------------------------------------------
-    # Main run
-    # ------------------------------------------------------------------
-    def run(self, csv_names: List[str]) -> Dict[str, Dict[str, Any]]:
+    def run(
+        self,
+        *,
+        conversation_id: Optional[str] = None,
+        csv_names: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """
-        Build schema context mapping for multiple CSVs / tables.
-        Returns:
-            canonical_table_key -> {"columns": [...], "sample_rows": [...], "path": <abs path>, "canonical": <key>}
+        Graph entrypoint.
+
+        Rules:
+        - MUST be side-effect free
+        - MUST NOT mutate internal state
+        - MUST NOT assume UI involvement
         """
         try:
-            out: Dict[str, Dict[str, Any]] = {}
-            if not csv_names:
-                return out
+            history: List[Dict[str, Any]] = []
 
-            normalized_inputs: List[str] = []
-            for raw in csv_names:
+            if conversation_id:
                 try:
-                    if isinstance(raw, dict):
-                        candidate = raw.get("canonical") or raw.get("name") or raw.get("path") or ""
-                    else:
-                        candidate = raw
-                    normalized_inputs.append(str(candidate))
+                    conv = self.history_store.get_conversation(conversation_id)
+                    messages = conv.get("messages", [])
+                    history = messages[-self.max_history :]
                 except Exception:
-                    normalized_inputs.append(str(raw))
+                    LOG.warning(
+                        "Conversation not found | id=%s",
+                        conversation_id,
+                    )
 
-            known_keys = set(self._schema_store_keys())
+            context: Dict[str, Any] = {
+                # Structural context
+                "available_tables": csv_names or [],
 
-            for raw in normalized_inputs:
-                try:
-                    if not raw:
-                        continue
-                    canonical_candidate = _canonical_name_from_input(raw)
+                # Conversational memory (prompt-safe)
+                "conversation_history": history,
 
-                    # Direct lookups
-                    cols = self._try_get_schema(raw)
-                    samples = self._try_get_samples(raw)
+                # Follow-up continuity (ephemeral)
+                "last_successful_sql": self._last_successful_sql,
+                "last_tables": self._last_tables,
+            }
 
-                    # Try canonical version
-                    if cols is None and canonical_candidate and canonical_candidate != raw:
-                        cols = self._try_get_schema(canonical_candidate)
-                        samples = samples or self._try_get_samples(canonical_candidate)
+            LOG.debug(
+                "ContextNode.run | conv=%s | history=%d | has_last_sql=%s",
+                conversation_id,
+                len(history),
+                bool(self._last_successful_sql),
+            )
 
-                    # Fuzzy/partial match against known keys
-                    if cols is None and known_keys:
-                        lower_raw = canonical_candidate.lower()
-                        for k in known_keys:
-                            if k.lower() == lower_raw:
-                                cols = self._try_get_schema(k)
-                                samples = samples or self._try_get_samples(k)
-                                if cols:
-                                    canonical_candidate = k
-                                    break
-                        if cols is None:
-                            for k in known_keys:
-                                if lower_raw in k.lower() or k.lower() in lower_raw:
-                                    cols = self._try_get_schema(k)
-                                    samples = samples or self._try_get_samples(k)
-                                    if cols:
-                                        canonical_candidate = k
-                                        break
-
-                    table_key = canonical_candidate or str(raw)
-
-                    # Prefer store canonical key
-                    try:
-                        ss = getattr(self._tools, "_schema_store", None)
-                        if ss and hasattr(ss, "get_table_canonical"):
-                            store_key = ss.get_table_canonical(raw) or ss.get_table_canonical(canonical_candidate)
-                            if store_key:
-                                table_key = store_key
-                                cols = cols or ss.get_schema(store_key) or []
-                                samples = samples or ss.get_sample_rows(store_key) or []
-                    except Exception:
-                        LOG.debug("Could not prefer store canonical key for %s", raw, exc_info=True)
-
-                    # CSV path
-                    path = None
-                    try:
-                        ss = getattr(self._tools, "_schema_store", None)
-                        if ss:
-                            path = self._try_get_path_from_store(table_key)
-                            if not path:
-                                path = self._try_get_path_from_store(raw) or self._try_get_path_from_store(canonical_candidate)
-                    except Exception:
-                        path = None
-
-                    out[table_key] = {
-                        "columns": cols or [],
-                        "sample_rows": (samples or [])[: self._sample_limit],
-                        "path": os.path.abspath(path) if path else None,
-                        "canonical": table_key,
-                    }
-
-                    if not cols:
-                        LOG.warning(
-                            "ContextNode: schema not found for '%s' (mapped->%s). Known keys: %s",
-                            raw,
-                            table_key,
-                            list(sorted(known_keys))[:30],
-                        )
-
-                except Exception:
-                    LOG.exception("ContextNode: failed for input %s", raw)
-                    key = _canonical_name_from_input(raw) or str(raw)
-                    out[key] = {"columns": [], "sample_rows": [], "path": None, "canonical": key}
-
-            LOG.debug("ContextNode.run completed for: %s -> keys=%s", csv_names, list(out.keys()))
-            return out
+            return context
 
         except Exception as e:
-            logger.exception("ContextNode.run failed unexpectedly")
+            logger.exception("ContextNode.run failed")
             raise CustomException(e, sys)
+
+    # ------------------------------------------------------------------
+    # Explicit mutation AFTER execution
+    # ------------------------------------------------------------------
+    def update(
+        self,
+        *,
+        user_query: str,
+        sql: Optional[str],
+        valid: bool,
+        tables_used: Optional[List[str]] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Persist successful execution context.
+
+        Called ONLY after:
+            ValidateNode → ExecuteNode succeed
+
+        This mutation is:
+        - Explicit
+        - Ephemeral
+        - Non-persistent
+        """
+        try:
+            if valid and sql:
+                self._last_successful_sql = sql
+                self._last_tables = tables_used or []
+
+                LOG.info(
+                    "Context updated | sql_len=%d | tables=%s",
+                    len(sql),
+                    self._last_tables,
+                )
+            else:
+                LOG.info("Context update skipped (invalid execution)")
+
+        except Exception:
+            LOG.exception("ContextNode.update failed")
+
+    # ------------------------------------------------------------------
+    # Follow-up SQL resolution helper
+    # ------------------------------------------------------------------
+    def resolve_base_sql(self, proposed_sql: Optional[str]) -> Optional[str]:
+        """
+        Resolve SQL base for follow-up questions.
+
+        Priority:
+        1. Newly proposed SQL
+        2. Last successful SQL
+        3. None
+        """
+        if proposed_sql:
+            return proposed_sql
+
+        if self._last_successful_sql:
+            LOG.info("Reusing last successful SQL for follow-up")
+            return self._last_successful_sql
+
+        LOG.warning("No base SQL available for follow-up")
+        return None

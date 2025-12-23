@@ -1,3 +1,51 @@
+# app/database.py
+"""
+Database Layer — DuckDB Execution Engine
+=======================================
+
+This module is the FINAL execution boundary for all SQL queries.
+
+────────────────────────────────────────────────────────────
+HARD CONTRACT (NON-NEGOTIABLE)
+────────────────────────────────────────────────────────────
+1. This layer NEVER sees canonical table names
+2. This layer NEVER rewrites SQL
+3. This layer NEVER guesses identifiers
+4. This layer NEVER inspects user intent
+
+All SQL reaching this layer MUST:
+- Be read-only (SELECT / WITH / EXPLAIN)
+- Reference ONLY runtime_table names
+- Have been validated and rewritten upstream
+- Target tables that are already loaded
+
+If SQL fails here → it is a SYSTEM ERROR (not user error).
+
+────────────────────────────────────────────────────────────
+RESPONSIBILITIES
+────────────────────────────────────────────────────────────
+✔ Manage DuckDB connection lifecycle
+✔ Load CSVs into DuckDB as runtime views
+✔ Enforce LAST-LINE read-only safety (statement-level)
+✔ Execute SQL and return structured results
+
+────────────────────────────────────────────────────────────
+ANTI-GOALS
+────────────────────────────────────────────────────────────
+✘ No SQL generation
+✘ No schema inference
+✘ No SQL rewriting
+✘ No retry logic
+✘ No UI / formatting logic
+
+────────────────────────────────────────────────────────────
+SECURITY MODEL
+────────────────────────────────────────────────────────────
+This layer blocks ONLY true mutating SQL statements.
+Read-only SQL functions (REPLACE, CAST, SUBSTR, etc.)
+are explicitly allowed.
+"""
+
 from __future__ import annotations
 
 import os
@@ -14,45 +62,25 @@ from app import config
 
 logger = get_logger("database")
 
-# ============================================================
-# Module-level DuckDB connection cache
-# ============================================================
+# ============================================================================
+# Process-wide DuckDB connection (INTENTIONAL SINGLETON)
+# ============================================================================
 _CONN: Optional[duckdb.DuckDBPyConnection] = None
 
 
-# ============================================================
-# Identifier sanitization (CRITICAL)
-# ============================================================
-def _sanitize_table_name(canonical_name: str) -> str:
-    """
-    Convert canonical table name → valid DuckDB identifier.
-
-    Rules:
-    - only [a-z0-9_]
-    - lowercased
-    - cannot start with digit → prefix with `t_`
-    - empty names become `t_table`
-    """
-    if not isinstance(canonical_name, str) or not canonical_name.strip():
-        return "t_table"
-
-    name = canonical_name.strip()
-    name = re.sub(r"[^0-9a-zA-Z_]", "_", name)
-    name = re.sub(r"_+", "_", name).strip("_").lower()
-
-    if not name:
-        name = "table"
-
-    if name[0].isdigit():
-        name = f"t_{name}"
-
-    return name
-
-
-# ============================================================
+# ============================================================================
 # Connection management
-# ============================================================
+# ============================================================================
 def get_connection() -> duckdb.DuckDBPyConnection:
+    """
+    Get or create the cached DuckDB connection.
+
+    Guarantees
+    ----------
+    - Exactly one DuckDB connection per process
+    - Connection reused across queries
+    - Thread-safe at DuckDB engine level
+    """
     global _CONN
 
     try:
@@ -63,116 +91,145 @@ def get_connection() -> duckdb.DuckDBPyConnection:
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
         if _CONN is None:
-            logger.info("Opening DuckDB connection: %s", db_path)
+            logger.info("Opening DuckDB connection | path=%s", db_path)
             _CONN = duckdb.connect(database=db_path, read_only=False)
 
         return _CONN
 
     except Exception as e:
-        logger.exception("Failed to open DuckDB connection")
+        logger.exception("Failed to initialize DuckDB connection")
         raise CustomException(e, sys)
 
 
 def close_connection() -> None:
+    """
+    Close the cached DuckDB connection (best-effort).
+
+    Safe to call multiple times.
+    """
     global _CONN
-    if _CONN:
+    if _CONN is not None:
         try:
+            logger.info("Closing DuckDB connection")
             _CONN.close()
         finally:
             _CONN = None
 
 
-# ============================================================
-# SQL Safety (last line of defense)
-# ============================================================
-_DISALLOWED = (
-    "DROP",
-    "DELETE",
-    "UPDATE",
-    "INSERT",
-    "ALTER",
-    "TRUNCATE",
-    "ATTACH",
-    "DETACH",
-    "PRAGMA",
-    "VACUUM",
-    "COPY",
-    "CALL",
-    "EXECUTE",
-    "CREATE",
-    "MERGE",
-    "REPLACE",
-)
+# ============================================================================
+# SQL Safety — LAST LINE OF DEFENSE
+# ============================================================================
+"""
+IMPORTANT
+---------
+This safety check is INTENTIONALLY MINIMAL and STATEMENT-BASED.
+
+- Semantic validation belongs in ValidateNode
+- This layer blocks ONLY true mutating SQL statements
+- SQL functions (REPLACE, CAST, etc.) are explicitly allowed
+"""
+
+# Explicit mutating SQL statements (case-insensitive)
+_MUTATING_PATTERNS = [
+    r"^\s*DELETE\s+FROM\b",
+    r"^\s*INSERT\s+INTO\b",
+    r"^\s*UPDATE\s+\w+\b",
+    r"^\s*DROP\s+TABLE\b",
+    r"^\s*ALTER\s+TABLE\b",
+    r"^\s*TRUNCATE\s+TABLE\b",
+    r"^\s*CREATE\s+TABLE\b",
+    r"^\s*CREATE\s+VIEW\b",
+    r"^\s*REPLACE\s+INTO\b",
+]
 
 
 def _validate_read_only_sql(sql: str) -> None:
-    upper = sql.upper()
-    for kw in _DISALLOWED:
-        if re.search(rf"\b{kw}\b", upper):
-            raise PermissionError(f"Blocked SQL keyword: {kw}")
+    """
+    Enforce read-only SQL at the FINAL execution boundary.
+
+    This function blocks ONLY true mutating SQL statements.
+    It DOES NOT block read-only SQL functions.
+
+    Parameters
+    ----------
+    sql : str
+
+    Raises
+    ------
+    PermissionError
+        If SQL attempts to mutate data
+    """
+    if not isinstance(sql, str):
+        raise PermissionError("SQL must be a string")
+
+    # Remove SQL comments
+    scrubbed = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
+    scrubbed = re.sub(r"/\*.*?\*/", "", scrubbed, flags=re.DOTALL)
+
+    for pattern in _MUTATING_PATTERNS:
+        if re.search(pattern, scrubbed, flags=re.IGNORECASE):
+            logger.error(
+                "Blocked mutating SQL detected | pattern=%s | sql=%s",
+                pattern,
+                sql.strip()[:200],
+            )
+            raise PermissionError(
+                "Mutating SQL statements are not allowed"
+            )
 
 
-# ============================================================
+# ============================================================================
 # DuckDB helpers
-# ============================================================
+# ============================================================================
 def _duckdb_has_table(
     con: duckdb.DuckDBPyConnection,
-    physical_name: str,
+    runtime_table: str,
 ) -> bool:
+    """
+    Check whether a runtime table/view exists in DuckDB.
+    """
     rows = con.execute("SHOW TABLES").fetchall()
-    return physical_name.lower() in {r[0].lower() for r in rows}
+    return runtime_table.lower() in {r[0].lower() for r in rows}
 
 
-_TABLE_REF_RE = re.compile(
-    r"\b(?:FROM|JOIN)\s+([A-Za-z0-9_\"`]+)",
-    flags=re.IGNORECASE,
-)
-
-
-def _extract_table_refs(sql: str) -> List[str]:
-    """
-    Extract raw (canonical) table references from SQL.
-    """
-    found: List[str] = []
-    for m in _TABLE_REF_RE.finditer(sql):
-        raw = m.group(1)
-        if raw:
-            found.append(raw.strip("`\""))
-    return list(dict.fromkeys(found))
-
-
-# ============================================================
-# CSV loading (STABLE + IDEMPOTENT)
-# ============================================================
+# ============================================================================
+# CSV loading (IDEMPOTENT, RUNTIME TABLES ONLY)
+# ============================================================================
 def load_csv_table(
-    csv_path: str,
-    canonical_name: str,
     *,
+    csv_path: str,
+    runtime_table: str,
     force_reload: bool = False,
 ) -> str:
     """
-    Load CSV into DuckDB as a VIEW using a sanitized physical name.
+    Load a CSV file into DuckDB as a VIEW.
 
-    Returns
-    -------
-    str
-        Physical DuckDB table/view name
+    Guarantees
+    ----------
+    - Uses runtime_table name verbatim
+    - Never infers schema
+    - Idempotent unless force_reload=True
     """
     try:
         if not os.path.exists(csv_path):
             raise FileNotFoundError(csv_path)
 
-        con = get_connection()
-        physical_name = _sanitize_table_name(canonical_name)
+        if not runtime_table:
+            raise ValueError("runtime_table must be provided")
 
-        if _duckdb_has_table(con, physical_name) and not force_reload:
-            logger.debug("DuckDB table already exists: %s", physical_name)
-            return physical_name
+        con = get_connection()
+
+        if _duckdb_has_table(con, runtime_table) and not force_reload:
+            logger.debug(
+                "DuckDB runtime table already exists | table=%s",
+                runtime_table,
+            )
+            return runtime_table
 
         safe_path = csv_path.replace("'", "''")
 
         sql = f"""
-        CREATE OR REPLACE VIEW {physical_name} AS
+        CREATE OR REPLACE VIEW {runtime_table} AS
         SELECT *
         FROM read_csv_auto(
             '{safe_path}',
@@ -182,48 +239,39 @@ def load_csv_table(
         )
         """
 
-        logger.info("Loading CSV %s → %s", csv_path, physical_name)
-        con.execute(sql)
+        logger.info(
+            "Loading CSV into DuckDB | csv=%s | runtime_table=%s",
+            csv_path,
+            runtime_table,
+        )
 
-        return physical_name
+        con.execute(sql)
+        return runtime_table
 
     except Exception as e:
-        logger.exception("Failed to load CSV")
+        logger.exception("Failed to load CSV into DuckDB")
         raise CustomException(e, sys)
 
 
 def ensure_tables_loaded(
-    table_map: Dict[str, str],
+    runtime_map: Dict[str, str],
     *,
     force_reload: bool = False,
-) -> Dict[str, str]:
+) -> None:
     """
-    Ensure all canonical tables are loaded.
-
-    Input
-    -----
-    canonical_name -> csv_path
-
-    Output
-    ------
-    canonical_name -> physical_table_name
+    Ensure all runtime tables exist in DuckDB.
     """
-    resolved: Dict[str, str] = {}
-
-    for canonical, path in table_map.items():
-        physical = load_csv_table(
-            path,
-            canonical,
+    for runtime_table, path in runtime_map.items():
+        load_csv_table(
+            csv_path=path,
+            runtime_table=runtime_table,
             force_reload=force_reload,
         )
-        resolved[canonical] = physical
-
-    return resolved
 
 
-# ============================================================
-# Query execution (FINAL EXECUTION LAYER)
-# ============================================================
+# ============================================================================
+# Query execution (FINAL EXECUTION BOUNDARY)
+# ============================================================================
 def execute_query(
     sql: str,
     *,
@@ -233,9 +281,11 @@ def execute_query(
     """
     Execute SQL against DuckDB.
 
-    Assumes:
-    - canonical → physical rewrite already happened
-    - required tables already loaded
+    ASSUMPTIONS (ENFORCED UPSTREAM)
+    -------------------------------
+    - SQL references ONLY runtime tables
+    - SQL passed ValidateNode
+    - Required tables are already loaded
     """
     start = time.time()
 
@@ -254,8 +304,14 @@ def execute_query(
 
         meta = {
             "rowcount": len(rows),
-            "runtime": round(time.time() - start, 4),
+            "runtime_sec": round(time.time() - start, 4),
         }
+
+        logger.info(
+            "DuckDB query executed | rows=%d | time=%.4fs",
+            meta["rowcount"],
+            meta["runtime_sec"],
+        )
 
         if as_dataframe:
             import pandas as pd
@@ -268,14 +324,20 @@ def execute_query(
         raise CustomException(e, sys)
 
 
-# ============================================================
-# Table utilities
-# ============================================================
-def table_exists(canonical_name: str) -> bool:
+# ============================================================================
+# Debug / inspection helpers (SAFE)
+# ============================================================================
+def table_exists(runtime_table: str) -> bool:
+    """
+    Check whether a runtime table exists.
+    """
     con = get_connection()
-    return _duckdb_has_table(con, _sanitize_table_name(canonical_name))
+    return _duckdb_has_table(con, runtime_table)
 
 
 def list_tables() -> List[str]:
+    """
+    List all runtime tables in DuckDB.
+    """
     con = get_connection()
     return [r[0] for r in con.execute("SHOW TABLES").fetchall()]

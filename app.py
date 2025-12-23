@@ -1,47 +1,49 @@
 #D:\text_to_sql_bot\app.py
-# app.py
 """
-Streamlit app entrypoint for Text-to-SQL Bot.
+Streamlit App Entrypoint — Text-to-SQL Bot (Conversational)
 
 Key guarantees:
-- SchemaStore is a strict singleton across reruns
-- GraphBuilder, nodes, and executor share the same SchemaStore
-- Clear user-visible warnings for generation / validation / execution errors
-- Deterministic CSV upload + schema sync
-- Results always render in UI
+- No one-shot execution (multi-turn chat supported)
+- st.stop() is NEVER used for normal flow (only fatal misconfig)
+- Chat history is persisted via HistoryStore
+- SchemaStore remains a strict singleton
+- Graph execution is stateless
+- SQL, rows, and errors are always user-visible
+- Rows are NEVER dropped in UI
 """
 
 from __future__ import annotations
 
 import os
-import json
-import time
 import traceback
 import hashlib
-from typing import Any, Optional
+from typing import Any, Dict
 
 import streamlit as st
 
-# MUST be first Streamlit call
+# Must be the first Streamlit call
 st.set_page_config(page_title="Text-to-SQL Bot", layout="wide")
 
+# ---------------------------------------------------------------------
+# Core imports
+# ---------------------------------------------------------------------
 from app.csv_loader import CSVLoader
 from app.schema_store import SchemaStore
 from app.vector_search import VectorSearch
 from app.graph.builder import GraphBuilder
 from app.history_sql import HistoryStore
 from app.logger import get_logger
+from app.tools import Tools
+from app.gemini_client import GeminiClient
 import app.config as config_module
 
 logger = get_logger("app")
 
-
 # ---------------------------------------------------------------------
-# Utility helpers
+# Helpers
 # ---------------------------------------------------------------------
-
-def _sanitize_for_history(obj: Any) -> Any:
-    """Make objects JSON / history safe."""
+def _sanitize(obj: Any) -> Any:
+    """Make objects JSON-safe for storage."""
     from datetime import datetime, date
 
     if obj is None or isinstance(obj, (str, int, float, bool)):
@@ -49,273 +51,277 @@ def _sanitize_for_history(obj: Any) -> Any:
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     if isinstance(obj, dict):
-        return {k: _sanitize_for_history(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_sanitize_for_history(v) for v in obj]
-    try:
-        return str(obj)
-    except Exception:
-        return repr(obj)
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return str(obj)
 
 
-def _safe_rerun() -> None:
-    """Streamlit-compatible rerun wrapper."""
-    rerun = getattr(st, "experimental_rerun", None)
-    if callable(rerun):
-        try:
-            rerun()
-            return
-        except Exception:
-            pass
-    st.session_state["_needs_rerun"] = True
-
-
-def _render_exception_ui(exc: Exception, hint: Optional[str] = None) -> None:
-    msg = f"{type(exc).__name__}: {exc}"
-    st.error(f"{hint} — {msg}" if hint else msg)
-    with st.expander("Show details"):
-        st.code("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+def _render_exception_ui(exc: Exception) -> None:
+    """Render a fatal exception safely in UI."""
+    st.error(f"{type(exc).__name__}: {exc}")
+    with st.expander("Details"):
+        st.code(
+            "".join(
+                traceback.format_exception(
+                    type(exc), exc, exc.__traceback__
+                )
+            )
+        )
 
 
 # ---------------------------------------------------------------------
-# Core initialization (SINGLETON SAFE)
+# Initialization (STRICT)
 # ---------------------------------------------------------------------
-logger.info("Initializing app components")
-
 config = config_module
 
+# ===============================
+# LLM Provider
+# ===============================
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    st.error("❌ GEMINI_API_KEY not set")
+    st.stop()
+
+llm = GeminiClient(
+    api_key=api_key,
+    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+)
+
+# ===============================
 # CSV Loader
-try:
-    csv_loader = CSVLoader()
-except Exception:
-    logger.exception("CSVLoader initialization failed")
-    csv_loader = None
+# ===============================
+csv_loader = CSVLoader()
 
-# SchemaStore singleton
-schema_store = None
-try:
-    schema_store = SchemaStore.get_instance()
-    SchemaStore.set_instance(schema_store)
-    logger.info("SchemaStore singleton ready")
-except Exception:
-    logger.exception("SchemaStore initialization failed")
+# ===============================
+# SchemaStore (STRICT SINGLETON)
+# ===============================
+schema_store = SchemaStore.get_instance()
+SchemaStore.set_instance(schema_store)
 
-# Vector search (optional)
+# ===============================
+# Vector Search (OPTIONAL)
+# ===============================
 try:
     vector_search = VectorSearch()
 except Exception:
-    logger.exception("VectorSearch init failed")
     vector_search = None
+    logger.warning("VectorSearch disabled")
 
-# Graph builder
-try:
-    graph = GraphBuilder.build_default()
-except Exception:
-    logger.exception("GraphBuilder initialization failed")
-    graph = None
+# ===============================
+# Tools (SHARED)
+# ===============================
+tools = Tools(
+    schema_store=schema_store,
+    vector_search=vector_search,
+    provider_client=llm,
+    config=config,
+)
 
-# History store
-try:
-    history_store = HistoryStore()
-except Exception:
-    logger.exception("HistoryStore init failed")
-    history_store = None
+# ===============================
+# Graph (STATELESS)
+# ===============================
+graph = GraphBuilder.build_default(tools=tools)
 
-logger.info("App initialization complete")
-
+# ===============================
+# History Store (STATEFUL)
+# ===============================
+history_store = HistoryStore()
 
 # ---------------------------------------------------------------------
-# Streamlit session defaults
+# Session defaults
 # ---------------------------------------------------------------------
 st.session_state.setdefault("selected_conversation_id", None)
-st.session_state.setdefault("conversations_meta", [])
-st.session_state.setdefault("conversation_cache", {})
-st.session_state.setdefault("csv_label_to_path", {})
-st.session_state.setdefault("csv_path_to_table", {})
 st.session_state.setdefault("processed_upload_hashes", [])
-
-if st.session_state.pop("_needs_rerun", False):
-    _safe_rerun()
-
+st.session_state.setdefault("selected_schemas", [])
+st.session_state.setdefault("rename_conv_id", None)
 
 # ---------------------------------------------------------------------
-# Sync UI mappings from SchemaStore
+# Core Query Handler
 # ---------------------------------------------------------------------
-def _sync_session_mappings_from_store() -> None:
-    if not schema_store:
-        return
+def handle_user_query(
+    *,
+    conv_id: str,
+    user_input: str,
+    schemas: list[str],
+) -> Dict[str, Any]:
+    """
+    Handle a single user query end-to-end.
+    """
+    logger.info("Handling user query (schemas=%s)", schemas)
 
-    st.session_state["csv_label_to_path"].clear()
-    st.session_state["csv_path_to_table"].clear()
+    history_store.append_message(
+        conv_id,
+        {"role": "user", "content": user_input},
+    )
 
-    for entry in schema_store.list_csvs_meta() or []:
-        path = entry.get("path")
-        if not path:
-            continue
-        canonical = entry.get("canonical") or entry.get("key")
-        aliases = entry.get("aliases") or []
-        orig = os.path.basename(path)
+    result = graph.run(
+        user_query=user_input,
+        schemas=schemas,
+        run_query=True,
+    )
 
-        names = [canonical] + [a for a in aliases if a and a != canonical]
-        for name in names:
-            label = f"{name} — {orig}"
-            st.session_state["csv_label_to_path"][label] = path
-            st.session_state["csv_path_to_table"][path] = canonical
+    history_store.append_message(
+        conv_id,
+        {
+            "role": "assistant",
+            "content": result.get("formatted_text", ""),
+            "meta": _sanitize(result),
+        },
+    )
+
+    return result
 
 
 # ---------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------
 try:
-    st.title("📊 Text-to-SQL Bot — Conversation Mode")
+    st.title("📊 Text-to-SQL Bot — Conversational SQL")
 
-    if history_store and not st.session_state["conversations_meta"]:
-        st.session_state["conversations_meta"] = history_store.list_conversations()
-
-    # ---------------- Sidebar ----------------
+    # ==========================================================
+    # Sidebar — Conversations
+    # ==========================================================
     with st.sidebar:
-        st.header("Conversations")
+        st.header("💬 Conversations")
 
-        if st.button("➕ New Conversation") and history_store:
-            conv = history_store.create_conversation(
-                name=f"Conversation {len(st.session_state['conversations_meta']) + 1}"
-            )
+        if st.button("➕ New Conversation", use_container_width=True):
+            conv = history_store.create_conversation("New Conversation")
             st.session_state["selected_conversation_id"] = conv["id"]
-            st.session_state["conversation_cache"][conv["id"]] = conv
-            st.session_state["conversations_meta"] = history_store.list_conversations()
-            _safe_rerun()
+            st.rerun()
 
-        for c in st.session_state["conversations_meta"]:
-            if st.button(c.get("name", "Conversation"), key=f"conv_{c['id']}"):
-                st.session_state["selected_conversation_id"] = c["id"]
-                if history_store:
-                    st.session_state["conversation_cache"][c["id"]] = history_store.get_conversation(c["id"])
-                _safe_rerun()
+        for c in history_store.list_conversations():
+            cols = st.columns([0.65, 0.15, 0.2])
+            with cols[0]:
+                if st.button(c["name"], key=f"open_{c['id']}", use_container_width=True):
+                    st.session_state["selected_conversation_id"] = c["id"]
+                    st.rerun()
+
+            with cols[1]:
+                if st.button("✏️", key=f"rename_{c['id']}"):
+                    st.session_state["rename_conv_id"] = c["id"]
+
+            with cols[2]:
+                if st.button("🗑️", key=f"delete_{c['id']}"):
+                    history_store.delete_conversation(c["id"])
+                    if st.session_state["selected_conversation_id"] == c["id"]:
+                        st.session_state["selected_conversation_id"] = None
+                    st.rerun()
+
+        # Rename UI
+        if st.session_state["rename_conv_id"]:
+            cid = st.session_state["rename_conv_id"]
+            conv = history_store.get_conversation(cid)
+            new_name = st.text_input(
+                "Rename conversation",
+                value=conv["name"],
+                key="rename_input",
+            )
+            if st.button("Save name"):
+                history_store.rename_conversation(cid, new_name)
+                st.session_state["rename_conv_id"] = None
+                st.rerun()
 
         st.markdown("---")
-        st.subheader("CSV Management")
+        st.subheader("📂 CSV Upload")
 
-        uploaded_files = st.file_uploader(
-            "Upload CSVs",
+        uploads = st.file_uploader(
+            "Upload CSV files",
             type=["csv"],
             accept_multiple_files=True,
         )
 
-        if uploaded_files and csv_loader:
-            for f in uploaded_files:
-                try:
-                    data = f.read()
-                    sha = hashlib.sha256(data).hexdigest()
+        if uploads:
+            for f in uploads:
+                raw = f.read()
+                sha = hashlib.sha256(raw).hexdigest()
+                if sha in st.session_state["processed_upload_hashes"]:
+                    continue
 
-                    if sha in st.session_state["processed_upload_hashes"]:
-                        continue
+                from io import BytesIO
 
-                    from io import BytesIO
-                    bio = BytesIO(data)
-                    bio.name = f.name
+                bio = BytesIO(raw)
+                bio.name = f.name
 
-                    path = csv_loader.save_csv(bio)
-                    st.success(f"Uploaded {f.name}")
+                path = csv_loader.save_csv(bio)
+                schema_store.add_csv(path)
+                st.session_state["processed_upload_hashes"].append(sha)
+                st.success(f"Uploaded {f.name}")
 
-                    if schema_store:
-                        schema_store.add_csv(path)
+    # ==========================================================
+    # Schema Selector
+    # ==========================================================
+    st.subheader("Available Schemas")
 
-                    st.session_state["processed_upload_hashes"].append(sha)
+    schemas = schema_store.list_csvs()
+    if not schemas:
+        st.info("Upload CSV files to enable querying.")
 
-                except Exception as e:
-                    logger.exception("CSV upload failed")
-                    _render_exception_ui(e, "Upload failed")
+    st.session_state["selected_schemas"] = st.multiselect(
+        "Schemas",
+        options=schemas,
+        default=st.session_state["selected_schemas"],
+    )
 
-        _sync_session_mappings_from_store()
+    st.markdown("---")
 
-        labels = sorted(st.session_state["csv_label_to_path"].keys())
-        st.multiselect(
-            "Select CSVs for context",
-            options=labels,
-            key="selected_csvs_sidebar",
-        )
-
-    # ---------------- Main Chat ----------------
-    if not st.session_state["selected_conversation_id"]:
-        st.info("Select or create a conversation from the sidebar.")
+    # ==========================================================
+    # Chat Area
+    # ==========================================================
+    conv_id = st.session_state["selected_conversation_id"]
+    if not conv_id:
+        st.info("Create or select a conversation.")
     else:
-        conv_id = st.session_state["selected_conversation_id"]
-        conv = st.session_state["conversation_cache"].get(conv_id, {})
+        conv = history_store.get_conversation(conv_id)
+        st.subheader(conv["name"])
 
-        st.subheader(conv.get("name", "Conversation"))
+        # Render full chat history
+        for msg in conv.get("messages", []):
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg["role"] == "assistant":
+                    sql = msg.get("meta", {}).get("sql")
+                    rows = msg.get("meta", {}).get("rows")
 
-        for m in conv.get("messages", []):
-            st.markdown(f"**{m.get('role', '').capitalize()}:** {m.get('content', '')}")
+                    if sql:
+                        st.code(sql, language="sql")
+                    if rows is not None:
+                        if rows:
+                            st.dataframe(rows)
+                        else:
+                            st.info("Query executed successfully, but returned 0 rows.")
 
-        user_input = st.text_area("Enter message", height=120)
+        # Chat input (true multi-turn)
+        user_input = st.chat_input("Ask a question")
 
-        if st.button("Send"):
-            if not user_input.strip():
-                st.warning("Please enter a message.")
-                st.stop()
+        if user_input:
+            if not st.session_state["selected_schemas"]:
+                st.warning("Select at least one schema.")
+            else:
+                with st.spinner("Thinking..."):
+                    result = handle_user_query(
+                        conv_id=conv_id,
+                        user_input=user_input.strip(),
+                        schemas=st.session_state["selected_schemas"],
+                    )
 
-            if history_store:
-                history_store.append_message(
-                    conv_id,
-                    {"role": "user", "content": user_input.strip(), "meta": {}}
-                )
+                with st.chat_message("assistant"):
+                    if result.get("error"):
+                        st.warning(result["error"])
 
-            selected_labels = st.session_state.get("selected_csvs_sidebar", [])
-            paths = [st.session_state["csv_label_to_path"].get(lbl) for lbl in selected_labels]
-            tables = [st.session_state["csv_path_to_table"].get(p) for p in paths if p]
+                    if result.get("sql"):
+                        st.code(result["sql"], language="sql")
 
-            if not tables:
-                st.warning("Select at least one CSV.")
-                st.stop()
-
-            if not graph:
-                st.error("Agent unavailable.")
-                st.stop()
-
-            with st.spinner("Generating answer..."):
-                result = graph.run(
-                    user_query=user_input.strip(),
-                    schemas=tables,
-                    run_query=True,
-                )
-
-                # -----------------------------
-                # User-visible warning handling
-                # -----------------------------
-                if isinstance(result, dict) and result.get("error"):
-                    st.warning(f"⚠️ Query failed: {result['error']}")
-                    logger.warning("User-visible error: %s", result["error"])
-                    st.stop()
-
-                # -----------------------------
-                # Render results to UI
-                # -----------------------------
-                rows = result.get("rows") or result.get("data")
-                formatted_text = result.get("formatted_text") or result.get("formatted", {}).get("text")
-
-                if rows:
-                    st.subheader("Query Result")
-                    st.dataframe(rows)
-                elif formatted_text:
-                    st.subheader("Result")
-                    st.text(formatted_text)
-                else:
-                    st.info("No results returned.")
-
-                assistant_msg = {
-                    "role": "assistant",
-                    "content": formatted_text or str(rows) or str(result),
-                    "meta": _sanitize_for_history(result),
-                }
-
-                if history_store:
-                    history_store.append_message(conv_id, assistant_msg)
-
-                st.session_state["conversation_cache"][conv_id] = history_store.get_conversation(conv_id)
-                st.session_state["conversations_meta"] = history_store.list_conversations()
-
-                _safe_rerun()
+                    if result.get("rows") is not None:
+                        if result["rows"]:
+                            st.dataframe(result["rows"])
+                        else:
+                            st.info(
+                                "Query executed successfully, but returned 0 rows."
+                            )
+                    elif result.get("formatted_text"):
+                        st.markdown(result["formatted_text"])
 
 except Exception as e:
-    logger.exception("Fatal app error")
-    _render_exception_ui(e, "Internal error")
+    logger.exception("Fatal UI error")
+    _render_exception_ui(e)

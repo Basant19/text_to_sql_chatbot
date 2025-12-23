@@ -1,3 +1,4 @@
+# app/sql_executor.py
 from __future__ import annotations
 
 import sys
@@ -12,8 +13,13 @@ from app import database
 logger = get_logger("sql_executor")
 
 # ------------------------------------------------------------------
-# SQL Safety (read-only mode)
+# SQL SAFETY (READ-ONLY)
 # ------------------------------------------------------------------
+# NOTE:
+# - SELECT is ALWAYS allowed
+# - WITH / CTE is allowed
+# - EXPLAIN is allowed
+# - Only state-mutating commands are blocked
 _READONLY_DISALLOWED = (
     "DROP",
     "DELETE",
@@ -30,19 +36,26 @@ _READONLY_DISALLOWED = (
     "CREATE",
     "MERGE",
     "REPLACE",
+    "TRUNCATE",
 )
 
 
 def _validate_sql(sql: str, read_only: bool) -> None:
     """
     Block dangerous SQL keywords when in read-only mode.
+    SELECT queries are ALWAYS allowed.
     """
     if not read_only:
         return
 
-    upper_sql = sql.upper()
+    upper = sql.upper()
+
+    # Allow EXPLAIN SELECT ...
+    if upper.lstrip().startswith(("SELECT", "WITH", "EXPLAIN")):
+        return
+
     for kw in _READONLY_DISALLOWED:
-        if re.search(rf"\b{kw}\b", upper_sql):
+        if re.search(rf"\b{kw}\b", upper):
             raise CustomException(
                 f"Disallowed SQL keyword in read-only mode: {kw}",
                 sys,
@@ -51,10 +64,12 @@ def _validate_sql(sql: str, read_only: bool) -> None:
 
 def _strip_trailing_semicolon(sql: str) -> str:
     """
-    Remove trailing semicolon (DuckDB subquery-safe).
+    DuckDB-safe SQL cleanup.
     """
-    sql = sql.rstrip()
-    return sql[:-1] if sql.endswith(";") else sql
+    sql = sql.strip()
+    if sql.endswith(";"):
+        return sql[:-1]
+    return sql
 
 
 def _rows_to_dicts(
@@ -62,41 +77,31 @@ def _rows_to_dicts(
     columns: List[str],
 ) -> List[Dict[str, Any]]:
     """
-    Convert rows + columns into list[dict].
+    Convert DB rows to list-of-dicts.
     """
     output: List[Dict[str, Any]] = []
-
-    for r in rows:
+    for row in rows:
         if columns:
-            output.append({col: val for col, val in zip(columns, r)})
+            output.append(dict(zip(columns, row)))
         else:
-            output.append({f"col{i}": val for i, val in enumerate(r)})
-
+            output.append({f"col{i}": v for i, v in enumerate(row)})
     return output
 
 
 # ------------------------------------------------------------------
-# Identifier rewriting (CRITICAL)
+# CANONICAL → PHYSICAL TABLE REWRITE
 # ------------------------------------------------------------------
 def _rewrite_sql_table_identifiers(
     sql: str,
     table_map: Dict[str, str],
 ) -> str:
     """
-    Rewrite canonical table identifiers in SQL to sanitized DuckDB
-    physical table names.
+    Rewrite canonical schema names → DuckDB physical tables.
 
     Handles:
-      - bare identifiers
-      - backticks:  `table`
-      - double quotes: "table"
-
-    Example:
-      FROM my-table
-      FROM `my-table`
-      FROM "my-table"
-
-      -> FROM t_my_table
+    - bare identifiers
+    - `backticks`
+    - "double quotes"
     """
     rewritten = sql
     mapping: Dict[str, str] = {}
@@ -112,47 +117,28 @@ def _rewrite_sql_table_identifiers(
 
         mapping[canonical] = physical
 
-    # Replace longest names first to avoid partial collisions
-    for canonical in sorted(mapping.keys(), key=len, reverse=True):
+    # Replace longest identifiers first
+    for canonical in sorted(mapping, key=len, reverse=True):
         physical = mapping[canonical]
         esc = re.escape(canonical)
 
-        # backticks
+        rewritten = re.sub(rf"`\s*{esc}\s*`", physical, rewritten, flags=re.I)
+        rewritten = re.sub(rf"\"\s*{esc}\s*\"", physical, rewritten, flags=re.I)
         rewritten = re.sub(
-            rf"`\s*{esc}\s*`",
+            rf"(?<![\w\.]){esc}(?![\w\.])",
             physical,
             rewritten,
-            flags=re.IGNORECASE,
-        )
-
-        # double quotes
-        rewritten = re.sub(
-            rf"\"\s*{esc}\s*\"",
-            physical,
-            rewritten,
-            flags=re.IGNORECASE,
-        )
-
-        # bare identifiers
-        rewritten = re.sub(
-            rf"(?<![A-Za-z0-9_\.]){esc}(?![A-Za-z0-9_\.])",
-            physical,
-            rewritten,
-            flags=re.IGNORECASE,
+            flags=re.I,
         )
 
     if rewritten != sql:
-        logger.debug(
-            "SQL identifier rewrite:\n  BEFORE: %s\n  AFTER : %s",
-            sql,
-            rewritten,
-        )
+        logger.debug("SQL rewrite\nBEFORE: %s\nAFTER : %s", sql, rewritten)
 
     return rewritten
 
 
 # ------------------------------------------------------------------
-# Main Executor
+# MAIN EXECUTOR
 # ------------------------------------------------------------------
 def execute_sql(
     sql: str,
@@ -163,24 +149,24 @@ def execute_sql(
     as_dataframe: bool = False,
 ) -> Dict[str, Any]:
     """
-    Execute SQL safely with canonical → physical table rewrite.
+    Safe, resume-proof SQL execution.
 
     Returns:
-      {
-        "rows": list[dict],
-        "columns": list[str],
-        "meta": {
-            "rowcount": int,
-            "runtime": float
+    {
+        rows: list[dict],
+        columns: list[str],
+        meta: {
+            rowcount: int,
+            runtime: float
         }
-      }
+    }
     """
-    start_time = time.time()
+    start = time.time()
 
     try:
-        # ----------------------------------------------------------
+        # -----------------------------
         # Guard clauses
-        # ----------------------------------------------------------
+        # -----------------------------
         if not isinstance(sql, str):
             raise CustomException("SQL must be a string", sys)
 
@@ -190,30 +176,32 @@ def execute_sql(
 
         _validate_sql(sql, read_only)
 
-        # ----------------------------------------------------------
-        # Load CSV-backed tables into DuckDB
-        # ----------------------------------------------------------
+        # -----------------------------
+        # ALWAYS reload tables (resume-safe)
+        # -----------------------------
         if table_map:
             database.ensure_tables_loaded(table_map)
 
+        # -----------------------------
+        # Normalize SQL
+        # -----------------------------
         exec_sql = _strip_trailing_semicolon(sql)
 
-        # ----------------------------------------------------------
-        # CRITICAL: rewrite canonical → physical table identifiers
-        # ----------------------------------------------------------
         if table_map:
             exec_sql = _rewrite_sql_table_identifiers(exec_sql, table_map)
 
-        # ----------------------------------------------------------
-        # Optional LIMIT wrapper (safe subquery)
-        # ----------------------------------------------------------
+        # -----------------------------
+        # Optional LIMIT wrapper
+        # -----------------------------
         if limit is not None:
             exec_sql = (
-                f"SELECT * FROM ({exec_sql}) AS _texttosql_sub "
+                "SELECT * FROM ("
+                f"{exec_sql}"
+                ") AS _text_to_sql_subquery "
                 f"LIMIT {int(limit)}"
             )
 
-        logger.info("Executing SQL (final): %s", exec_sql)
+        logger.info("Executing SQL: %s", exec_sql)
 
         rows_or_df, columns, meta = database.execute_query(
             exec_sql,
@@ -222,14 +210,15 @@ def execute_sql(
         )
 
         meta = meta or {}
-        runtime = meta.get("runtime", time.time() - start_time)
+        runtime = round(time.time() - start, 4)
 
-        # ----------------------------------------------------------
-        # Normalize output
-        # ----------------------------------------------------------
+        # -----------------------------
+        # Normalize rows
+        # -----------------------------
         if as_dataframe:
             try:
                 import pandas as pd
+
                 if isinstance(rows_or_df, pd.DataFrame):
                     rows = rows_or_df.to_dict(orient="records")
                 else:
@@ -244,7 +233,7 @@ def execute_sql(
             "columns": list(columns or []),
             "meta": {
                 "rowcount": meta.get("rowcount", len(rows)),
-                "runtime": round(runtime, 4),
+                "runtime": runtime,
             },
         }
 

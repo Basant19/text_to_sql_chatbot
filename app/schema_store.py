@@ -1,15 +1,50 @@
 # D:\text_to_sql_bot\app\schema_store.py
 """
-SchemaStore: Centralized registry for CSV schemas with persistent JSON storage.
+SchemaStore
+===========
 
-KEY DESIGN GUARANTEES (FIXED):
-1. Exactly ONE canonical table name per CSV
-2. Canonical name ALWAYS:
-   - human readable
-   - starts with a letter
-   - SQL-safe for LLMs
-3. Hashes / filenames are INTERNAL ONLY (never exposed as tables)
+Centralized, persistent registry for CSV-backed schemas used by the
+Text-to-SQL system.
+
+This module is the SINGLE SOURCE OF TRUTH for all dataset identities
+across UI, LLM reasoning, and SQL execution.
+
+----------------------------------------------------------------------
+NAMING MODEL (CRITICAL — DO NOT VIOLATE)
+----------------------------------------------------------------------
+
+Each dataset is represented by THREE distinct identifiers:
+
+1. display_name
+   - Human-readable
+   - UI-facing only
+   - Stable across restarts
+   - Example: "sales_data"
+
+2. canonical_name
+   - Internal logical identifier
+   - SQL-safe, deterministic
+   - Used ONLY inside the LangGraph / LLM reasoning layer
+   - NEVER executed in DuckDB
+   - NEVER exposed to UI
+
+3. runtime_table
+   - Physical DuckDB table/view name
+   - SQL-safe
+   - Used ONLY at execution time
+
+----------------------------------------------------------------------
+HARD GUARANTEES
+----------------------------------------------------------------------
+
+- Exactly ONE runtime_table per CSV
+- Canonical names NEVER reach DuckDB
+- UI NEVER sees canonical or runtime names
+- DuckDB NEVER sees display or canonical names
+- SchemaStore is thread-safe
+- SchemaStore is singleton-aware (explicit, no magic)
 """
+
 from __future__ import annotations
 
 import os
@@ -26,6 +61,7 @@ from app.exception import CustomException
 from app.csv_loader import load_csv_metadata
 
 logger = get_logger("schema_store")
+
 
 # ----------------------------------------------------------------------
 # Utilities
@@ -57,12 +93,7 @@ def _normalize(name: Optional[str]) -> str:
     return s
 
 
-def _safe_canonical(name: str) -> str:
-    """
-    Enforce SQL + LLM safe table name:
-    - normalized
-    - must start with a letter
-    """
+def _safe_sql_name(name: str) -> str:
     base = _normalize(name)
     if not base:
         base = f"table_{uuid.uuid4().hex[:6]}"
@@ -83,6 +114,12 @@ def _file_sha256(path: str, block_size: int = 65536) -> str:
     return h.hexdigest()
 
 
+def _display_name_from_filename(path: str) -> str:
+    name = os.path.splitext(os.path.basename(path))[0]
+    name = re.sub(r"^[a-f0-9]{8,}_", "", name)
+    return _normalize(name) or f"dataset_{_short_uuid()}"
+
+
 # ----------------------------------------------------------------------
 # SchemaStore
 # ----------------------------------------------------------------------
@@ -90,7 +127,13 @@ def _file_sha256(path: str, block_size: int = 65536) -> str:
 class SchemaStore:
     """
     Persistent registry of CSV schemas.
-    SINGLETON-AWARE (required by GraphBuilder & LangGraph).
+
+    Characteristics
+    ----------------
+    - Thread-safe
+    - Explicit singleton lifecycle
+    - Disk-backed (JSON)
+    - UI-safe API surface
     """
 
     _instance: Optional["SchemaStore"] = None
@@ -102,23 +145,39 @@ class SchemaStore:
 
     @classmethod
     def get_instance(cls) -> "SchemaStore":
+        """
+        Return the global SchemaStore singleton.
+
+        This is the DEFAULT and RECOMMENDED access path.
+        """
         with cls._instance_lock:
             if cls._instance is None:
-                try:
-                    base = os.path.join(os.getcwd(), "data")
-                    store_path = os.path.join(base, "schema_store.json")
-                    cls._instance = cls(store_path=store_path)
-                    logger.info("SchemaStore singleton created at %s", store_path)
-                except Exception as e:
-                    logger.exception("Failed to create SchemaStore singleton")
-                    raise CustomException(e, sys)
+                base = os.path.join(os.getcwd(), "data")
+                store_path = os.path.join(base, "schema_store.json")
+                cls._instance = cls(store_path=store_path)
+                logger.info("SchemaStore singleton created at %s", store_path)
             return cls._instance
 
     @classmethod
     def set_instance(cls, instance: "SchemaStore") -> None:
+        """
+        Explicitly inject a SchemaStore singleton.
+
+        Intended for:
+        - UI bootstrap
+        - Tests
+        - Controlled dependency injection
+
+        WARNING:
+        --------
+        Do NOT call this repeatedly in production code.
+        """
+        if not isinstance(instance, SchemaStore):
+            raise TypeError("set_instance expects a SchemaStore instance")
+
         with cls._instance_lock:
             cls._instance = instance
-            logger.info("SchemaStore singleton injected externally")
+            logger.info("SchemaStore singleton explicitly set")
 
     # ------------------------------------------------------------------
     # Init
@@ -129,12 +188,19 @@ class SchemaStore:
             base = os.path.join(os.getcwd(), "data")
             self.store_path = store_path or os.path.join(base, "schema_store.json")
             _ensure_dir(os.path.dirname(self.store_path))
+
             self._lock = threading.RLock()
+
+            # canonical_name -> schema entry
             self._schemas: Dict[str, Dict[str, Any]] = {}
-            self._alias_map: Dict[str, str] = {}
+
+            # display_name -> canonical_name
+            self._display_map: Dict[str, str] = {}
+
             self._load()
+            self._patch_missing_runtime_tables()
+
         except Exception as e:
-            logger.exception("SchemaStore init failed")
             raise CustomException(e, sys)
 
     # ------------------------------------------------------------------
@@ -149,135 +215,60 @@ class SchemaStore:
                 with open(self.store_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self._schemas = data.get("schemas", {}) or {}
-                self._alias_map = data.get("alias_map", {}) or {}
+                self._display_map = data.get("display_map", {}) or {}
             except Exception:
                 logger.exception("SchemaStore load failed, resetting")
                 self._schemas = {}
-                self._alias_map = {}
+                self._display_map = {}
 
     def _save(self) -> None:
         with self._lock:
             _atomic_write(
                 self.store_path,
-                {"schemas": self._schemas, "alias_map": self._alias_map},
+                {
+                    "schemas": self._schemas,
+                    "display_map": self._display_map,
+                },
             )
 
     # ------------------------------------------------------------------
-    # Registration (🔥 CORE FIX)
+    # Backward-compatibility patch
     # ------------------------------------------------------------------
 
-    def register_from_csv(self, csv_path: str) -> str:
-        meta = load_csv_metadata(csv_path)
+    def _patch_missing_runtime_tables(self) -> None:
+        """
+        Patch older schema entries missing `runtime_table`.
+        """
+        patched = False
 
-        filename = os.path.splitext(os.path.basename(csv_path))[0]
-        canonical = _safe_canonical(filename)
+        for canonical, entry in self._schemas.items():
+            if "runtime_table" not in entry:
+                display = entry.get("display") or canonical
+                runtime = _safe_sql_name(display)
+                entry["runtime_table"] = runtime
+                patched = True
+                logger.warning(
+                    "Patched missing runtime_table | canonical=%s runtime=%s",
+                    canonical,
+                    runtime,
+                )
 
-        meta["path"] = os.path.abspath(csv_path)
-        meta["canonical_name"] = canonical
-        meta["aliases"] = []  # aliases are NOT tables
-
-        return self.register(canonical, meta)
-
-    def register(self, canonical: str, meta: Dict[str, Any]) -> str:
-        with self._lock:
-            key = _safe_canonical(canonical)
-
-            # deduplicate same file
-            new_path = meta.get("path")
-            new_hash = meta.get("file_hash")
-            for k, entry in self._schemas.items():
-                if new_path and entry.get("path") == new_path:
-                    return k
-                if new_hash and entry.get("meta", {}).get("file_hash") == new_hash:
-                    entry["path"] = new_path
-                    self._save()
-                    return k
-
-            # handle name collision
-            if key in self._schemas:
-                key = f"{key}_{_short_uuid()}"
-
-            columns_raw = meta.get("columns") or []
-            columns_norm = [_normalize(c) for c in columns_raw]
-            meta["columns_normalized"] = columns_norm
-
-            entry = {
-                "canonical": key,
-                "aliases": [],
-                "path": new_path,
-                "columns": columns_raw,
-                "columns_normalized": columns_norm,
-                "meta": meta,
-            }
-
-            self._schemas[key] = entry
-            self._alias_map[key] = key  # ONLY canonical is valid
-
+        if patched:
             self._save()
-            logger.info("Schema registered: %s", key)
-            return key
 
     # ------------------------------------------------------------------
-    # Lookup
+    # Registration
     # ------------------------------------------------------------------
 
-    def get_table_canonical(self, name: Optional[str]) -> Optional[str]:
-        if not name:
-            return None
-        return self._alias_map.get(_normalize(name))
+    def add_csv(self, path: str) -> str:
+        """
+        Register a CSV file.
 
-    def get_schema_entry(self, name: str) -> Optional[Dict[str, Any]]:
-        can = self.get_table_canonical(name)
-        return self._schemas.get(can) if can else None
-
-    # Backward compatibility
-    get = get_entry = get_schema_entry
-    get_metadata = get_schema_entry
-
-    def get_path(self, name: str) -> Optional[str]:
-        entry = self.get_schema_entry(name)
-        return entry.get("path") if entry else None
-
-    get_csv_path = get_file_path = get_path
-
-    def get_schema(self, name: str) -> List[str]:
-        entry = self.get_schema_entry(name)
-        return entry.get("columns_normalized", []) if entry else []
-
-    def list_tables(self) -> List[str]:
-        with self._lock:
-            return list(self._schemas.keys())
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
-
-    def validate_table_and_columns(
-        self, table: str, columns: Optional[List[str]]
-    ) -> Tuple[bool, List[str], List[str]]:
-
-        can = self.get_table_canonical(table)
-        if not can:
-            return False, [table], columns or []
-
-        if not columns:
-            return True, [], []
-
-        defined = set(self.get_schema(can))
-        missing = [c for c in columns if _normalize(c) not in defined]
-
-        return not missing, [], missing
-
-    # ------------------------------------------------------------------
-    # CSV helpers (used by app.py)
-    # ------------------------------------------------------------------
-
-    def add_csv(
-        self,
-        path: str,
-        csv_name: Optional[str] = None,
-        aliases: Optional[List[str]] = None,
-    ) -> str:
+        Returns
+        -------
+        str
+            Canonical name of the dataset.
+        """
         meta = load_csv_metadata(path)
 
         abs_path = os.path.abspath(path)
@@ -288,28 +279,109 @@ class SchemaStore:
         except Exception:
             pass
 
-        canonical = _safe_canonical(csv_name or os.path.splitext(os.path.basename(path))[0])
-        meta["canonical_name"] = canonical
-        meta["aliases"] = []  # aliases intentionally ignored
+        display = _display_name_from_filename(abs_path)
+        canonical = _safe_sql_name(f"{display}_{_short_uuid()}")
+        runtime = _safe_sql_name(display)
 
-        return self.register(canonical, meta)
+        with self._lock:
+            if display in self._display_map:
+                return self._display_map[display]
+
+            columns_raw = meta.get("columns") or []
+            columns_norm = [_normalize(c) for c in columns_raw]
+
+            entry = {
+                "canonical": canonical,
+                "display": display,
+                "runtime_table": runtime,
+                "path": abs_path,
+                "columns": columns_raw,
+                "columns_normalized": columns_norm,
+                "meta": meta,
+            }
+
+            self._schemas[canonical] = entry
+            self._display_map[display] = canonical
+
+            self._save()
+            logger.info(
+                "Schema registered | display=%s canonical=%s runtime=%s",
+                display,
+                canonical,
+                runtime,
+            )
+
+            return canonical
+
+    # ------------------------------------------------------------------
+    # Lookup (CORE API)
+    # ------------------------------------------------------------------
+
+    def resolve_table(self, name: str) -> Optional[str]:
+        if not name:
+            return None
+        if name in self._schemas:
+            return name
+        return self._display_map.get(_normalize(name))
+
+    def get_schema_entry(self, name: str) -> Optional[Dict[str, Any]]:
+        can = self.resolve_table(name)
+        return self._schemas.get(can) if can else None
+
+    get = get_entry = get_metadata = get_schema_entry
+
+    def get_runtime_table(self, name: str) -> Optional[str]:
+        entry = self.get_schema_entry(name)
+        return entry.get("runtime_table") if entry else None
+
+    def get_csv_path(self, name: str) -> Optional[str]:
+        entry = self.get_schema_entry(name)
+        return entry.get("path") if entry else None
+
+    def get_schema(self, name: str) -> List[str]:
+        entry = self.get_schema_entry(name)
+        return entry.get("columns_normalized", []) if entry else []
+
+    # ------------------------------------------------------------------
+    # UI-safe methods
+    # ------------------------------------------------------------------
+
+    def list_csvs(self) -> List[str]:
+        with self._lock:
+            return sorted(self._display_map.keys())
 
     def list_csvs_meta(self) -> List[Dict[str, Any]]:
-        """
-        UI-safe listing:
-        ONE CSV → ONE schema option
-        """
         out = []
         with self._lock:
-            for k, e in self._schemas.items():
+            for display, canonical in self._display_map.items():
+                e = self._schemas.get(canonical, {})
                 out.append(
                     {
-                        "key": k,
-                        "canonical": k,
+                        "display": display,
+                        "canonical": canonical,
+                        "runtime_table": e.get("runtime_table"),
                         "path": e.get("path"),
                         "columns": e.get("columns", []),
-                        "columns_normalized": e.get("columns_normalized", []),
-                        "sample_rows": e.get("meta", {}).get("sample_rows", []),
                     }
                 )
         return out
+
+    # ------------------------------------------------------------------
+    # Validation helper
+    # ------------------------------------------------------------------
+
+    def validate_table_and_columns(
+        self, table: str, columns: Optional[List[str]]
+    ) -> Tuple[bool, List[str], List[str]]:
+
+        can = self.resolve_table(table)
+        if not can:
+            return False, [table], columns or []
+
+        if not columns:
+            return True, [], []
+
+        defined = set(self.get_schema(can))
+        missing = [c for c in columns if _normalize(c) not in defined]
+
+        return not missing, [], missing
