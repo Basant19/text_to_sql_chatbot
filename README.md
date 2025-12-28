@@ -1,4 +1,4 @@
-ext-to-SQL Bot (Graph-Driven, Safe by Design)
+text-to-SQL Bot (Graph-Driven, Safe by Design)
 
 A production-grade Text-to-SQL system that converts natural-language questions into safe, validated SQL over uploaded CSV files.
 
