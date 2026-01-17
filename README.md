@@ -20,49 +20,52 @@ The system is built using LangGraph, DuckDB, and Gemini (via LangChain), and fol
 
 ⚡ Deterministic fallbacks (no hard dependency on embeddings)
 
+🐳 Dockerized deployment (Python 3.11, Docker Compose)
+
 📂 Full Project Structure
 text-to-sql/
 ├── app/
 │   ├── __init__.py
-│   ├── logger.py              # Central logging
-│   ├── exception.py           # CustomException wrapper
-│   ├── gemini_client.py       # Gemini LLM abstraction
-│   ├── config.py              # Env + path configuration
-│   ├── database.py            # DuckDB connection layer
-│   ├── csv_loader.py          # CSV → DuckDB + metadata
-│   ├── schema_store.py        # SchemaStore (anti-hallucination)
-│   ├── vector_search.py       # Optional FAISS-based RAG
-│   ├── utils.py               # Shared helpers
-│   ├── sql_executor.py        # Read-only SQL execution
-│   ├── llm_flow.py            # Legacy / helper flows
-│   ├── langsmith_client.py    # Observability hooks
-│   ├── tools.py               # Tools injected into nodes
-│   ├── history_sql.py         # SQLite SQL history store
+│   ├── logger.py
+│   ├── exception.py
+│   ├── gemini_client.py
+│   ├── config.py
+│   ├── database.py
+│   ├── csv_loader.py
+│   ├── schema_store.py
+│   ├── vector_search.py
+│   ├── utils.py
+│   ├── sql_executor.py
+│   ├── llm_flow.py
+│   ├── langsmith_client.py
+│   ├── tools.py
+│   ├── history_sql.py
 │   └── graph/
-│       ├── builder.py         # GraphBuilder (LangGraph)
-│       ├── agent.py           # Agent wrapper
+│       ├── builder.py
+│       ├── agent.py
 │       └── nodes/
-│           ├── context_node.py
-│           ├── retrieve_node.py
-│           ├── prompt_node.py
 │           ├── generate_node.py
+│           ├── prompt_node.py
+│           ├── retrieve_node.py
 │           ├── validate_node.py
 │           ├── execute_node.py
+│           ├── summary_node.py
 │           ├── format_node.py
+│           ├── context_node.py
 │           └── error_node.py
-│
 ├── tests/
 │   ├── test_generate_node.py
 │   ├── test_execute_node.py
 │   ├── test_csv_loader.py
-│   └── test_history_sql.py
-│
-├── app.py                     # Streamlit UI entrypoint
+│   ├── test_history_sql.py
+│   └── test_summary_node.py
+├── app.py
 ├── requirements.txt
 ├── Dockerfile
+├── docker-compose.yml
+├── .dockerignore
 ├── .github/workflows/ci.yml
-├── PROJECT_REPORT.md
-└── README.md
+└── PROJECT_REPORT.md
 
 🧭 Overall Application Flow (Bird’s-Eye View)
 User (Streamlit UI)
@@ -79,9 +82,7 @@ Results shown in UI + SQL History stored
 The application is stateless per request, deterministic where possible, and safe by design.
 
 🚀 1️⃣ App Startup Flow (Cold Start)
-
 When you run:
-
 streamlit run app.py
 
 1.1 Configuration & Environment
@@ -120,7 +121,7 @@ Prevents LLM schema hallucination
 
 1.3 Vector Search (Optional RAG)
 
-Files
+File
 
 vector_search.py
 
@@ -128,7 +129,7 @@ Purpose
 
 Semantic retrieval for hints (columns, docs)
 
-Gracefully degrades to deterministic embeddings
+Gracefully degrades to deterministic behavior
 
 1.4 LLM & Tools Initialization
 
@@ -159,7 +160,6 @@ Wires nodes into a deterministic pipeline
 Stateless, reusable per request
 
 ⚙️ 2️⃣ Runtime Flow (User Query)
-
 Example user input:
 
 “Which app has the highest installs?”
@@ -251,7 +251,7 @@ Non-SELECT queries
 
 Forbidden tables
 
-Excessive limits
+Invalid SQL
 
 Invalid SQL → ErrorNode
 
@@ -323,7 +323,7 @@ File
 
 graph/nodes/error_node.py
 
-The graph never crashes — all failures are captured.
+The graph never crashes — all failures are captured and reported safely.
 
 🧠 4️⃣ Mental Model for Contributors
 
@@ -332,13 +332,8 @@ Think of this system as:
 “A compiler pipeline for SQL, driven by a graph, with LLMs acting only as a controlled code generator.”
 
 🧩 5️⃣ How to Add a New Node (Walkthrough)
-
-Adding a node is safe, explicit, and testable.
-
 Step 1: Create the Node File
-
-Example: graph/nodes/audit_node.py
-
+# graph/nodes/audit_node.py
 from typing import Dict, Any
 from app.logger import get_logger
 
@@ -354,11 +349,6 @@ class AuditNode:
         return {"audit_passed": True}
 
 Step 2: Register the Node in GraphBuilder
-
-File
-
-graph/builder.py
-
 from app.graph.nodes.audit_node import AuditNode
 
 audit_node = AuditNode()
@@ -369,8 +359,6 @@ graph.add_edge("audit", "execute")
 
 Step 3: Define Input / Output Contract
 
-Each node:
-
 Takes state: Dict[str, Any]
 
 Returns a partial update
@@ -378,11 +366,6 @@ Returns a partial update
 Must not mutate unrelated keys
 
 Step 4: Add Tests
-
-File
-
-tests/test_audit_node.py
-
 def test_audit_node():
     node = AuditNode()
     out = node.run({"sql": "SELECT 1"})
@@ -397,8 +380,6 @@ Initialization
 Run start
 
 Key decisions
-
-This keeps the pipeline observable and debuggable.
 
 🧪 Testing Philosophy
 
@@ -419,3 +400,68 @@ Deterministic inputs & outputs
 ✅ Easy extensibility
 
 ✅ Production-grade logging
+
+🐳 Docker & Deployment
+Prerequisites
+
+Docker
+
+Docker Compose
+
+Environment Setup
+
+Create .env:
+
+GOOGLE_API_KEY=your_api_key_here
+
+Build & Run (Recommended)
+docker-compose up --build
+
+
+Open:
+
+http://localhost:8501
+
+Stop Cleanly
+Ctrl + C
+docker-compose down
+
+Why Docker?
+
+Reproducible environment
+
+Python version pinned (3.11)
+
+One-command startup
+
+Safe isolation of dependencies
+
+Resume-grade deployment practice
+
+🧪 CI & Quality Gates
+
+GitHub Actions (.github/workflows/ci.yml)
+
+Runs:
+
+Unit tests
+
+Lint checks
+
+Prevents unsafe changes to core pipeline
+
+📌 Final Notes
+
+This project demonstrates:
+
+LLM safety engineering
+
+Graph-driven system design
+
+Production-ready deployment
+
+Testable, deterministic AI pipelines
+
+It is intentionally designed to be:
+
+Safe by default, debuggable by design, and extensible without fear.

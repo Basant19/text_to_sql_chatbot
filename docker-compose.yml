@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  text_to_sql_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: text_to_sql_chatbot
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    restart: unless-stopped
